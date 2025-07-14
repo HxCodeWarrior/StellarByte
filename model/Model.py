@@ -11,6 +11,7 @@ import math
 from typing import Optional, List, Tuple
 
 import torch
+import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
@@ -107,11 +108,11 @@ class ByteTransformer(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def _post_init_residual_scaling(self):
-        """DeepNet 建议：残差分支权重再小一个量级。"""
-        std_small = self.config.initializer_range / math.sqrt(2 * self.config.num_layers)
-        for name, param in self.named_parameters():
-            if name.endswith(".w3.weight") or name.endswith(".W_o.weight") or name.endswith(".lm_head.weight"):
-                nn.init.normal_(param, mean=0.0, std=std_small)
+        """DeepNorm + µParam Init"""
+        μ = 1.0 / math.sqrt(2 * self.config.num_layers)
+        for name, p in self.named_parameters():
+            if any(name.endswith(s) for s in (".w3.weight", ".W_o.weight", ".lm_head.weight")):
+                nn.init.normal_(p, mean=0.0, std=μ * self.config.initializer_range)
 
     # ------------------------------------------------------------------
     # 工具方法：清空 KV 缓存
@@ -119,6 +120,20 @@ class ByteTransformer(PreTrainedModel):
     def reset_cache(self):
         if self.kv_cache is not None:
             self.kv_cache.reset()
+    
+    def enable_gradient_checkpointing(self):
+        """为所有 DecoderLayer 打开 Torch Utils Checkpoint，加速训练"""
+        for layer in self.layers:
+            layer.enable_gradient_checkpointing = True
+        return self
+
+    def compile(self, mode: str = "default"):
+        """torch.compile wrapper"""
+        if not hasattr(torch, "compile"):
+            warnings.warn("当前 PyTorch 版本不支持 torch.compile，已跳过。")
+            return self
+        return torch.compile(self, mode=mode, fullgraph=False)
+
 
     # ------------------------------------------------------------------
     # HF 兼容的 Embedding getter / setter
@@ -148,29 +163,37 @@ class ByteTransformer(PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         """主前向函数，兼容 HF `CausalLMOutputWithPast` 输出格式。"""
+        use_cache = self.config.use_cache if use_cache is None else use_cache
 
         # ---- 1. 输入检查 ----
         if input_ids is None and inputs_embeds is None:
             raise ValueError("input_ids 与 inputs_embeds 必须至少提供一个！")
 
         # ---- 2. 词嵌入 ----
-        if inputs_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)   # [B,T,D]
-        else:
-            hidden_states = inputs_embeds
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds   # [B,T,D]
         hidden_states = self.embed_dropout(hidden_states)
 
         # ---- 3. 构造 Padding 掩码 ----
         additive_mask = None  # 经典 Attention 分支：-inf 掩码
         if attention_mask is not None:
+            # 获取历史缓存长度（KVCache）
+            past_len = self.kv_cache.length if self.kv_cache is not None else 0
+            total_len = past_len + attention_mask.size(1)
+
+            # 创建全1 mask 并拼接已有 mask
+            if past_len > 0:
+                past_mask = torch.ones(attention_mask.size(0), past_len, dtype=attention_mask.dtype, device=attention_mask.device)
+                attention_mask = torch.cat([past_mask, attention_mask], dim=1)
+
             additive_mask = (1.0 - attention_mask.to(hidden_states.dtype)) * torch.finfo(hidden_states.dtype).min
-            additive_mask = additive_mask[:, None, None, :]  # [B,1,1,T]
+            additive_mask = additive_mask[:, None, None, :]   # [B,1,1,Tk]
 
         # ---- 4. 逐层前向 ----
         hidden_states_list: List[torch.Tensor] = []
         if return_hidden_states:
             hidden_states_list.append(hidden_states)
-        for layer in self.layers:
+
+        for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, additive_mask=additive_mask)
             if return_hidden_states:
                 hidden_states_list.append(hidden_states)
@@ -209,8 +232,9 @@ class ByteTransformer(PreTrainedModel):
         max_new_tokens: int = 100,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
         stop_token_id: Optional[int] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         自回归文本生成
@@ -220,60 +244,85 @@ class ByteTransformer(PreTrainedModel):
             max_new_tokens: 最大生成token数
             temperature: 温度参数控制随机性
             top_k: top-k采样参数
+            top_p: top-p采样参数
             stop_token_id: 停止生成token ID
             attention_mask: 注意力掩码
+            use_caceh: 是否使用KVCache
             
         Returns:
             生成的token序列 [batch_size, new_seq_len]
         """
         self.eval()
         self.reset_cache()
+        use_kv = self.kv_cache is not None and self.config.use_cache
         
         # 初始化生成序列
+        prefix_len = input_ids.size(1)
         generated = input_ids.clone()
         batch_size = input_ids.size(0)
         
         # 处理初始输入
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        
-        # 生成循环
-        for _ in range(max_new_tokens):
-            # 前向传播获取logits
-            outputs = self(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
-            next_token_logits = outputs.logits[:, -1, :]
-            
+
+        # -------------------------------------------------------------
+        # 1. 预热阶段：一次性把前缀送进去，填满 KV‑Cache
+        # -------------------------------------------------------------
+        outputs = self(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=use_kv,
+        )
+        next_token_logits = outputs.logits[:, -1, :]   # 取前缀最后一个 token 的 logits
+
+        generated = input_ids.clone()                  # 记录完整序列
+
+        # -------------------------------------------------------------
+        # 2. 进入增量采样‑生成循环
+        # -------------------------------------------------------------
+        for _ in range(max_new_tokens):  
+            # — 2‑1 采样 —
             # 应用温度
             if temperature != 1.0:
                 next_token_logits = next_token_logits / temperature
             
             # Top-k采样
-            if top_k is not None:
+            if top_k is not None and top_k > 0:
                 top_k = min(top_k, next_token_logits.size(-1))
                 v, _ = torch.topk(next_token_logits, top_k)
                 next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
+            
+            if top_p is not None and 0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # 保证至少有一个 token
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits = torch.where(indices_to_remove, torch.full_like(next_token_logits, -float("inf")), next_token_logits)
             
             # 概率采样
             probs = F.softmax(next_token_logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1)
             
-            # 检查停止条件
+            # — 2‑2 停止条件 —
             if stop_token_id is not None and torch.all(next_tokens == stop_token_id):
                 break
             
-            # 更新输入序列
-            input_ids = next_tokens
+            # — 2‑3 写入输出 & KV‑Cache 已自动扩充 —
             generated = torch.cat([generated, next_tokens], dim=-1)
-            attention_mask = torch.cat([
-                attention_mask,
-                torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=attention_mask.device)
-            ], dim=-1)
-        
+
+            # — 2‑4 前向增量：**只喂新 token，不传 attention_mask** —
+            outputs = self(
+                input_ids=next_tokens,           # [B, 1]
+                attention_mask=None,             # 让 forward 自行推断 past_len
+                use_cache=use_kv,
+            )
+            next_token_logits = outputs.logits[:, -1, :]
+
         # 只返回新生成的token
-        return generated[:, input_ids.size(1):]
+        return generated[:, prefix_len:]
     
     def get_num_params(self, non_embedding: bool = False) -> int:
         """
@@ -289,12 +338,27 @@ class ByteTransformer(PreTrainedModel):
         
         if non_embedding:
             # 排除词嵌入层参数
-            n_params -= self.tok_embeddings.weight.numel()
+            n_params -= self.embed_tokens.weight.numel()
             if self.config.tie_word_embeddings:
                 # 如果共享了权重，输出层参数已包含在词嵌入中
-                n_params -= self.output.weight.numel()
+                n_params -= self.lm_head.weight.numel()
         
         return n_params
+    
+    def get_optimizer_param_groups(self, weight_decay: float = 0.01):
+        decay, no_decay = [], []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith("bias"):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
 
 # 测试代码
 if __name__ == "__main__":

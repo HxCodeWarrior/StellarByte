@@ -279,6 +279,7 @@ if __name__ == "__main__":
         model_parallel_size=1,        # 模型并行大小
         use_flash_attention=False,    # 关闭FlashAttention，便于调试
         use_causal=True,
+        use_cache=False
     )
     
     # 创建Attention层
