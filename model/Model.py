@@ -69,7 +69,7 @@ class ByteTransformer(PreTrainedModel):
                 num_layers=config.num_layers,
                 num_heads=config.num_attention_heads,  # 总头数
                 head_dim=D // config.num_attention_heads,
-                max_seq_len=config.max_position_embeddings,
+                max_seq_len=config.max_seq_len,
                 key_dtype=config.key_cache_dtype,
                 value_dtype=config.value_cache_dtype,
                 tensor_parallel_size=config.tensor_parallel_size,
@@ -381,7 +381,7 @@ if __name__ == "__main__":
         num_attention_heads=12,
         num_kv_heads=6,
         hidden_dim=3072,
-        max_position_embeddings=2048,
+        max_seq_len=2048,
         attention_dropout_prob=0.1,
         residual_dropout_prob=0.1,
         hidden_dropout_prob=0.1,

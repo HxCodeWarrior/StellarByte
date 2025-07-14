@@ -97,7 +97,7 @@ class MultiHeadSelfAttention(nn.Module):
         # ---- 全局因果 Mask 缓存 ----
         # 缓存bool型因果mask，避免重复计算（FlashAttention用）
         # 一次性生成最大因果 Mask，shape = [max_seq_len, max_seq_len]
-        max_len = args.max_position_embeddings
+        max_len = args.max_seq_len
         full = torch.triu(torch.ones(max_len, max_len, dtype=torch.bool), diagonal=1)
         self.register_buffer("full_causal_mask", full, persistent=False)# 可选剪枝 mask
         self.head_mask = torch.ones(self.num_local_heads, dtype=torch.bool)
@@ -281,7 +281,7 @@ if __name__ == "__main__":
         xpos_rope_theta=10000,
         attention_dropout_prob=0.1,
         residual_dropout_prob=0.1,
-        max_position_embeddings=512,
+        max_seq_len=512,
         model_parallel_size=1,        # 模型并行大小
         use_flash_attention=False,    # 关闭FlashAttention，便于调试
         use_causal=True
@@ -312,7 +312,7 @@ if __name__ == "__main__":
         num_layers=1,  # 添加必需的层数参数（测试用1层）
         num_heads=args.num_kv_heads,  # 使用正确的参数名 num_heads
         head_dim=args.model_dim // args.num_attention_heads,
-        max_seq_len=args.max_position_embeddings,
+        max_seq_len=args.max_seq_len,
         device=x.device
     )
 

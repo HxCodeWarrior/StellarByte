@@ -41,7 +41,7 @@ class ByteModelConfig(PretrainedConfig):
         self.num_kv_heads = num_kv_heads
         self.hidden_dim = hidden_dim if hidden_dim is not None else 4 * model_dim
         self.dim_multiplier = dim_multiplier
-        self.max_position_embeddings = max_seq_len
+        self.max_seq_len = max_seq_len
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
 

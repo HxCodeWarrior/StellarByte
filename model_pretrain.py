@@ -12,7 +12,7 @@ from model.Model import ByteTransformer
 from datasets import PretrainDataset
 from utils.logger import Logger
 from utils.checkpoint import CheckpointManager
-from config import ModelConfig
+from model.config import ByteModelConfig
 
 
 def set_seed(seed):
@@ -70,7 +70,7 @@ def evaluate(model, dataloader, args, logger):
 
 
 def init_model(args):
-    lm_config = ModelConfig(
+    lm_config = ByteModelConfig(
         vocab_size=args.vocab_size,
         dim=args.model_dim,
         n_layers=args.num_layers,
