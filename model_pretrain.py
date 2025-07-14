@@ -10,8 +10,9 @@ from transformers import AutoTokenizer
 
 from model.Model import ByteTransformer
 from datasets import PretrainDataset
-from utils.logger import Logger
+from utils.logger import get_logger
 from utils.checkpoint import CheckpointManager
+from utils.progressbar import ProgressBar, DataLoaderProgress
 from model.config import ByteModelConfig
 
 
@@ -20,7 +21,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def get_lr(it, all_iters, args):
     warmup_iters = int(args.warmup_steps_ratio * all_iters)
@@ -69,7 +69,7 @@ def evaluate(model, dataloader, args, logger):
     return avg_loss
 
 
-def init_model(args):
+def init_model(args, logger):
     lm_config = ByteModelConfig(
         vocab_size=args.vocab_size,
         dim=args.model_dim,
@@ -106,7 +106,7 @@ def init_model(args):
     model = model.to(args.device)
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    Logger(f"模型参数总量：{param_count / 1e6:.2f}M")
+    logger.info(f"模型参数总量：{param_count / 1e6:.2f}M")
     return model, tokenizer, lm_config
 
 
@@ -114,7 +114,14 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_it
     model.train()
     total_loss = 0.0
 
-    for step, batch in enumerate(dataloader):
+    # 初始化进度条
+    progress = ProgressBar(
+        total_epochs=args.epochs,
+        total_steps=len(dataloader),
+        desc=f"Epoch {epoch+1}/{args.epochs}"
+    )
+
+    for step, batch in enumerate(DataLoaderProgress(dataloader, desc="Loading data")):
         input_ids = batch['input_ids'].to(args.device)
         labels = batch['labels'].to(args.device)
 
@@ -146,17 +153,25 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_it
 
         if global_step % args.save_interval == 0:
             args.ckpt_mgr.save_checkpoint(model, optimizer, None, epoch, step=global_step)
+        
+        # 更新进度条
+        progress.update(
+            step=step+1,
+            epoch=epoch+1,
+            loss=loss.item(),
+            lr=lr
+        )
 
+    progress.close()
     avg_loss = total_loss / len(dataloader)
     logger.info(f"[Epoch {epoch}] 平均损失: {avg_loss:.4f}")
     return global_step
 
 
-def train(args):
-    logger = Logger(os.path.join(args.logs_dir, "train.log"))
+def train(args, logger):
     set_seed(args.seed)
 
-    model, tokenizer, config = init_model(args)
+    model, tokenizer, config = init_model(args, logger)
     dataset = PretrainDataset(args.train_data_path, tokenizer, max_length=config.max_seq_len)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
@@ -303,5 +318,9 @@ if __name__ == "__main__":
     parser.add_argument("--eval_batch_size", type=int, default=64, help="验证批次大小")
     parser.add_argument("--eval_max_steps", type=int, default=100, help="最大验证步数（全验证集过大时使用）")
     args = parser.parse_args()
+    
+    # -------- 日志系统 --------
+    logger = get_logger(args.logs_dir, args.swanlab_experiment_name)
+    logger.info("配置参数:\n" + str(vars(args)))
 
-    train(args)  # 启动训练
+    train(args, logger)  # 启动训练
