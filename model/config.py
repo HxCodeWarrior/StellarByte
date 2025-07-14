@@ -2,7 +2,7 @@ import torch
 from transformers import PretrainedConfig
 
 class ByteModelConfig(PretrainedConfig):
-    model_type = "byte_model"
+    model_type = "stellarbyte_model"
 
     def __init__(
         self,
@@ -12,7 +12,6 @@ class ByteModelConfig(PretrainedConfig):
         num_attention_heads: int = 16,        # 多头注意力头数
         num_kv_heads: int = 8,                # 多头KV注意力头数（默认为num_heads，可做头分离）
         hidden_dim: int = None,               # 隐藏层维度
-        intermediate_size: int = None,        # FFN中间层大小
         dim_multiplier: int = 4,              # 隐藏层维度的对齐基数
         max_seq_len: int = 2048,              # 最大序列长度
         drop_path_prob: float = 0.0,          # DropPath残差连接dropout率
@@ -41,7 +40,6 @@ class ByteModelConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_kv_heads = num_kv_heads
         self.hidden_dim = hidden_dim if hidden_dim is not None else 4 * model_dim
-        self.intermediate_size = intermediate_size if intermediate_size is not None else self.hidden_dim
         self.dim_multiplier = dim_multiplier
         self.max_position_embeddings = max_seq_len
         self.layer_norm_eps = layer_norm_eps

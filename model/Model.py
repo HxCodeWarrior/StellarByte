@@ -1,4 +1,4 @@
-"""Byte‑Transformer 模型（中文高质量注释版）
+"""Byte‑Transformer 模型
 =================================================
 本文件实现了一个基于 **XPos** 旋转位置编码的 GPT‑类语言模型，
 包含 DeepNorm、LayerScale、DropPath、KV‑Cache 等现代化 Tricks，
@@ -18,10 +18,16 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # ==== 本项目自定义模块 ====
-from config import ByteModelConfig            # 模型配置类（超参数集中管理）
-from DecoderLayer import ByteDecoderLayer     # 单层解码器实现（Attention + MLP）
-from utils.KVCache import KVCache             # 高性能 KV 缓存（推理加速）
-from RMSNorm import RMSNorm                   # RMSNorm 归一化层
+try:
+    from .config        import ByteModelConfig      # 模型配置类（超参数集中管理）
+    from .DecoderLayer  import ByteDecoderLayer     # 单层解码器实现（Attention + MLP）
+    from .utils.KVCache import KVCache              # 高性能 KV 缓存（推理加速）
+    from .RMSNorm       import RMSNorm              # RMSNorm 归一化层
+except:
+    from config         import ByteModelConfig       
+    from DecoderLayer   import ByteDecoderLayer
+    from utils.KVCache  import KVCache        
+    from RMSNorm        import RMSNorm              
 
 __all__ = ["ByteTransformer"]
 

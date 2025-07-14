@@ -4,12 +4,20 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from config           import ByteModelConfig
-from utils.KVCache    import KVCache
-from utils.DropPath   import DropPath
-from RMSNorm          import RMSNorm
-from Attention        import MultiHeadSelfAttention
-from MLP              import MLP
+try:
+    from .config           import ByteModelConfig
+    from .utils.KVCache    import KVCache
+    from .utils.DropPath   import DropPath
+    from .RMSNorm          import RMSNorm
+    from .Attention        import MultiHeadSelfAttention
+    from .MLP              import MLP
+except:
+    from config           import ByteModelConfig
+    from utils.KVCache    import KVCache
+    from utils.DropPath   import DropPath
+    from RMSNorm          import RMSNorm
+    from Attention        import MultiHeadSelfAttention
+    from MLP              import MLP
 
 
 class ByteDecoderLayer(nn.Module):

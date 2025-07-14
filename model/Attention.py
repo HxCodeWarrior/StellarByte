@@ -3,9 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing             import Optional, Dict, Tuple
-from config             import ByteModelConfig
-from utils.KVCache      import KVCache
-from Position_Embedding import XPosRotaryEmbedding
+try:
+    from .config             import ByteModelConfig
+    from .utils.KVCache      import KVCache
+    from .Position_Embedding import XPosRotaryEmbedding
+except:
+    from config             import ByteModelConfig
+    from utils.KVCache      import KVCache
+    from Position_Embedding import XPosRotaryEmbedding
 
 class MultiHeadSelfAttention(nn.Module):
     """
