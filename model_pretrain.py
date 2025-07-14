@@ -153,7 +153,7 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_it
 
 
 def train(args):
-    logger = Logger(os.path.join(args.out_dir, "train.log"))
+    logger = Logger(os.path.join(args.logs_dir, "train.log"))
     set_seed(args.seed)
 
     model, tokenizer, config = init_model(args)
@@ -172,7 +172,7 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     ctx = nullcontext() if args.device == 'cpu' else torch.cuda.amp.autocast(dtype=getattr(torch, args.dtype)) if use_amp else nullcontext()
 
-    ckpt_mgr = CheckpointManager(args.out_dir)
+    ckpt_mgr = CheckpointManager(args.checkpoints_dir)
     start_epoch = 0
     global_step = 0
     if ckpt_mgr.has_checkpoint():
@@ -202,14 +202,15 @@ if __name__ == "__main__":
     parser.add_argument("--swanlab_project", type=str, default="Happy-LLM", help="SwanLab项目名称")
     parser.add_argument("--swanlab_experiment_name", type=str, default="Pretrain-215M", help="SwanLab实验名称")
     parser.add_argument("--swanlab_api_key", type=str, default="",  help="SwanLab API认证密钥")
-    parser.add_argument("--out_dir", type=str, default="./checkpoints", help="模型检查点和日志输出目录")
+    parser.add_argument("--logs_dir", type=str, default="./logs", help="日志输出目录")
+    parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="模型检查点输出目录")
 
     # =============================
     #       数据集配置
     # =============================
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer", help="分词器配置文件路径")
-    parser.add_argument("--train_data_path", type=str, default="./test/train.jsonl", help="训练数据集文件路径")
-    parser.add_argument("--val_data_path", type=str, default="./test/val.jsonl", help="验证数据集文件路径（可选）")
+    parser.add_argument("--train_data_path", type=str, default="./datasets/test/train.jsonl", help="训练数据集文件路径")
+    parser.add_argument("--val_data_path", type=str, default="./datasets/test/val.jsonl", help="验证数据集文件路径（可选）")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载器工作进程数")
 
     # =============================
