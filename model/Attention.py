@@ -226,6 +226,11 @@ class MultiHeadSelfAttention(nn.Module):
             k_cat, v_cat = k, v
 
         Tk = k_cat.size(1)  # 拼接后键值长度
+        
+        # --- 4.1 对齐 padding mask ---
+        if additive_mask is not None and additive_mask.size(-1) != Tk:
+            # 只保留最后 Tk 列（即本层真正可见的 token）
+            additive_mask = additive_mask[..., -Tk:]
 
         # —— 5. 转成 FlashAttention 要求的维度 ——
         # 调整维度为FlashAttention所需 [B, H, T, D]

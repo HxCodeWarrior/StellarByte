@@ -376,7 +376,7 @@ if __name__ == "__main__":
         hidden_dropout_prob=0.1,
         layer_norm_eps=1e-5,
         tie_word_embeddings=True,
-        use_cache=True,
+        use_cache=False,
         use_flash_attention=True
     )
     
