@@ -1,0 +1,5 @@
+# DropoutPath
+timm==1.0.17
+
+# 测试
+pytest
