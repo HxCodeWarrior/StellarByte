@@ -173,27 +173,32 @@ class ByteTransformer(PreTrainedModel):
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds   # [B,T,D]
         hidden_states = self.embed_dropout(hidden_states)
 
-        # ---- 3. 构造 Padding 掩码 ----
-        additive_mask = None  # 经典 Attention 分支：-inf 掩码
+        # ---- 3. 构造 Padding mask ----
+        base_mask = None
         if attention_mask is not None:
-            # 获取历史缓存长度（KVCache）
-            past_len = self.kv_cache.length if self.kv_cache is not None else 0
-            total_len = past_len + attention_mask.size(1)
+            base_mask = attention_mask.to(hidden_states.dtype)
 
-            # 创建全1 mask 并拼接已有 mask
-            if past_len > 0:
-                past_mask = torch.ones(attention_mask.size(0), past_len, dtype=attention_mask.dtype, device=attention_mask.device)
-                attention_mask = torch.cat([past_mask, attention_mask], dim=1)
-
-            additive_mask = (1.0 - attention_mask.to(hidden_states.dtype)) * torch.finfo(hidden_states.dtype).min
-            additive_mask = additive_mask[:, None, None, :]   # [B,1,1,Tk]
-
-        # ---- 4. 逐层前向 ----
+        # ---- 4. 底层前向 (KVCache-aware) ----
+        B = hidden_states.size(0)
         hidden_states_list: List[torch.Tensor] = []
         if return_hidden_states:
             hidden_states_list.append(hidden_states)
 
         for i, layer in enumerate(self.layers):
+            # 4.1 缓存长度
+            past_len = self.kv_cache.layer_length(i) if self.kv_cache is not None else 0
+
+            # 4.2 构造 layer-specific mask
+            additive_mask = None
+            if base_mask is not None:
+                if past_len > 0:
+                    ones = torch.ones(B, past_len, dtype=base_mask.dtype, device=base_mask.device)
+                    mask = torch.cat([ones, base_mask], dim=1)
+                else:
+                    mask = base_mask
+                additive_mask = (1.0 - mask) * torch.finfo(hidden_states.dtype).min
+                additive_mask = additive_mask[:, None, None, :]
+
             hidden_states = layer(hidden_states, additive_mask=additive_mask)
             if return_hidden_states:
                 hidden_states_list.append(hidden_states)
@@ -376,7 +381,7 @@ if __name__ == "__main__":
         hidden_dropout_prob=0.1,
         layer_norm_eps=1e-5,
         tie_word_embeddings=True,
-        use_cache=False,
+        use_cache=True,
         use_flash_attention=True
     )
     

@@ -212,7 +212,8 @@ class MultiHeadSelfAttention(nn.Module):
         # —— 4. KV 缓存（增量推理） —— 
         # 增量推理时从KV缓存获取过去缓存，拼接当前KV
         if self.kv_cache is not None and self.layer_id is not None:
-            if self.kv_cache.length > 0:
+            past_len = self.kv_cache.layer_length(self.layer_id) 
+            if past_len > 0:
                 past_k, past_v = self.kv_cache.get(self.layer_id)  # [B, Tp, H, D]
                 k_cat = torch.cat([past_k, k], dim=1)              # 拼接历史和当前K
                 v_cat = torch.cat([past_v, v], dim=1)              # 拼接历史和当前V
@@ -226,11 +227,6 @@ class MultiHeadSelfAttention(nn.Module):
             k_cat, v_cat = k, v
 
         Tk = k_cat.size(1)  # 拼接后键值长度
-        
-        # --- 4.1 对齐 padding mask ---
-        if additive_mask is not None and additive_mask.size(-1) != Tk:
-            # 只保留最后 Tk 列（即本层真正可见的 token）
-            additive_mask = additive_mask[..., -Tk:]
 
         # —— 5. 转成 FlashAttention 要求的维度 ——
         # 调整维度为FlashAttention所需 [B, H, T, D]

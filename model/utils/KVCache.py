@@ -42,46 +42,15 @@ class KVCache:
 
         # runtime attributes（运行时确定）
         self.batch_size: Optional[int] = None
-        self.length: int = 0
+        self._seq_lens: List[int] = [0] * self.L
         self.cache: List[Dict[str, torch.Tensor]] = []
 
-    @torch.inference_mode()
-    def append(self, layer_id: int, key: torch.Tensor, value: torch.Tensor) -> None:
-        """
-        追加新的 KV 对到指定层缓存，自动 sliding-window。
-        要求 key / value: [B, T_new, H_local, D]
-        """
-        assert key.shape == value.shape, "K/V 形状不一致"
-        B, T_new, H, D = key.shape
-        assert H == self.H_local and D == self.D, f"KV head_dim 不一致：{H} vs {self.H_local}"
+    def layer_length(self, layer_id: int) -> int:
+        return self._seq_lens[layer_id]
 
-        if self.batch_size is None:
-            self._allocate_buffers(B)
-        assert B == self.batch_size, "batch_size 不一致"
+    def global_length(self) -> int:
+        return max(self._seq_lens)
 
-        # sliding-window
-        overflow = max(0, self.length + T_new - self.max_T)
-        if overflow > 0:
-            for buf in self.cache:
-                buf["key"] = torch.roll(buf["key"], shifts=-overflow, dims=1)
-                buf["value"] = torch.roll(buf["value"], shifts=-overflow, dims=1)
-
-        start = max(0, self.length - overflow)
-        end = start + T_new
-        self.cache[layer_id]["key"][:, start:end].copy_(key)
-        self.cache[layer_id]["value"][:, start:end].copy_(value)
-        self.length = min(self.length + T_new, self.max_T)
-
-    @torch.inference_mode()
-    def get(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        返回有效的 KV 缓存（不拷贝），shape=[B, T_valid, H_local, D]
-        """
-        key = self.cache[layer_id]["key"][:, : self.length]
-        value = self.cache[layer_id]["value"][:, : self.length]
-        return key, value
-
-    @torch.inference_mode()
     def reset(self) -> None:
         """清空缓存内容（保留显存）"""
         if self.batch_size is None:
@@ -90,8 +59,7 @@ class KVCache:
             buf["key"].zero_()
             buf["value"].zero_()
         self.length = 0
-
-    @torch.inference_mode()
+    
     def to(self, device: str | torch.device) -> "KVCache":
         """将缓存迁移到其他设备"""
         for buf in self.cache:
@@ -110,4 +78,43 @@ class KVCache:
             }
             for _ in range(self.L)
         ]
-        self.length = 0
+        self._seq_lens = [0] * self.L
+    
+    @torch.inference_mode()
+    def get(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        返回有效的 KV 缓存（不拷贝），shape=[B, T_valid, H_local, D]
+        """
+        T_valid = self._seq_lens[layer_id]
+        buf = self.cache[layer_id]
+        key = buf["key"][:, :T_valid]
+        value = buf["value"][:, :T_valid]
+        return key, value
+
+    @torch.inference_mode()
+    def append(self, layer_id: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        """
+        追加新的 KV 对到指定层缓存，自动 sliding-window。
+        要求 key / value: [B, T_new, H_local, D]
+        """
+        assert key.shape == value.shape, "K/V 形状不一致"
+        B, T_new, H, D = key.shape
+        assert H == self.H_local and D == self.D, f"KV head_dim 不一致：{H} vs {self.H_local}"
+
+        if self.batch_size is None:
+            self._allocate_buffers(B)
+        assert B == self.batch_size, "batch_size 不一致"
+
+        # sliding-window
+        current_len = self._seq_lens[layer_id]
+        overflow = max(0, current_len + T_new - self.max_T)
+        if overflow > 0:
+            buf = self.cache[layer_id]
+            buf["key"] = torch.roll(buf["key"], shifts=-overflow, dims=1)
+            buf["value"] = torch.roll(buf["value"], shifts=-overflow, dims=1)
+
+        start = max(0, current_len - overflow)
+        end = start + T_new
+        self.cache[layer_id]["key"][:, start:end].copy_(key)
+        self.cache[layer_id]["value"][:, start:end].copy_(value)
+        self._seq_lens[layer_id] = min(current_len + T_new, self.max_T)
