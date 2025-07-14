@@ -12,7 +12,7 @@ from model.Model import ByteTransformer
 from datasets import PretrainDataset
 from utils.logger import get_logger
 from utils.checkpoint import CheckpointManager
-from utils.progressbar import ProgressBar, DataLoaderProgress
+from utils.progressbar import RichProgressBar
 from model.config import ByteModelConfig
 
 
@@ -113,56 +113,47 @@ def init_model(args, logger):
 def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_iters, logger, global_step):
     model.train()
     total_loss = 0.0
+    total_steps = len(dataloader)
+    total = args.epochs * total_steps
 
-    # 初始化进度条
-    progress = ProgressBar(
-        total_epochs=args.epochs,
-        total_steps=len(dataloader),
-        desc=f"Epoch {epoch+1}/{args.epochs}"
-    )
+    with RichProgressBar(total_steps=total, total_batches=total_steps, total_epochs=args.epochs,desc="Training") as pbar:
+        for step, batch in enumerate(dataloader, 1):
+            input_ids = batch['input_ids'].to(args.device)
+            labels = batch['labels'].to(args.device)
 
-    for step, batch in enumerate(DataLoaderProgress(dataloader, desc="Loading data")):
-        input_ids = batch['input_ids'].to(args.device)
-        labels = batch['labels'].to(args.device)
+            lr = get_lr(global_step, total_iters, args)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        lr = get_lr(global_step, total_iters, args)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            with ctx:
+                outputs = model(input_ids=input_ids, labels=labels)
+                loss = outputs.loss / args.accumulation_steps
 
-        with ctx:
-            outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs.loss / args.accumulation_steps
+            scaler.scale(loss).backward()
 
-        scaler.scale(loss).backward()
+            if (step + 1) % args.accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            total_loss += loss.item()
+            global_step += 1
 
-        total_loss += loss.item()
-        global_step += 1
+            if global_step % args.log_interval == 0:
+                logger.info(f"[Epoch {epoch} | Step {global_step}] Loss: {loss.item() * args.accumulation_steps:.4f}, LR: {lr:.8f}")
 
-        if global_step % args.log_interval == 0:
-            logger.info(f"[Epoch {epoch} | Step {global_step}] Loss: {loss.item() * args.accumulation_steps:.4f}, LR: {lr:.8f}")
+            if args.val_data_path and global_step % args.eval_interval == 0:
+                evaluate(model, dataloader, args, logger)
 
-        if args.val_data_path and global_step % args.eval_interval == 0:
-            evaluate(model, dataloader, args, logger)
+            if global_step % args.save_interval == 0:
+                args.ckpt_mgr.save_checkpoint(model, optimizer, None, epoch, step=global_step)
 
-        if global_step % args.save_interval == 0:
-            args.ckpt_mgr.save_checkpoint(model, optimizer, None, epoch, step=global_step)
-        
-        # 更新进度条
-        progress.update(
-            step=step+1,
-            epoch=epoch+1,
-            loss=loss.item(),
-            lr=lr
-        )
+            # 更新进度条
+            pbar.update_loader(step)
+            pbar.update_train(global_step, epoch+1, loss=loss.item() * args.accumulation_steps, lr=lr)
 
-    progress.close()
     avg_loss = total_loss / len(dataloader)
     logger.info(f"[Epoch {epoch}] 平均损失: {avg_loss:.4f}")
     return global_step
@@ -196,13 +187,13 @@ def train(args, logger):
         start_epoch = checkpoint.get("epoch", 0) + 1
         global_step = checkpoint.get("step", 0)
 
-    logger.info("开始训练...")
+    logger.info("🚀 开始训练…")
     for epoch in range(start_epoch, args.epochs):
         global_step = train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_iters, logger, global_step)
         if val_loader:
             evaluate(model, val_loader, args, logger)
         ckpt_mgr.save_checkpoint(model, optimizer, None, epoch)
-    logger.info("训练结束。")
+    logger.info("✅ 训练结束。")
 
 
 # 程序入口

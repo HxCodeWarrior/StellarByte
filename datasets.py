@@ -3,6 +3,7 @@ import json
 import torch
 import logging
 import pandas as pd
+import numpy as np
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from typing import List, Optional, Callable
@@ -123,7 +124,11 @@ class PretrainDataset(BaseDataset):
         label_tensor = torch.tensor(input_ids[1:], dtype=torch.long)
         mask_tensor  = torch.tensor(loss_mask[1:], dtype=torch.long)
 
-        return input_tensor, label_tensor, mask_tensor
+        return {
+            "input_ids": input_tensor,     # [seq_len-1]
+            "labels":    label_tensor,     # [seq_len-1]
+            "loss_mask": mask_tensor,      # [seq_len-1]
+        }
 
 class SFTDataset(BaseDataset):
     def __init__(self, data_path, tokenizer, max_length=512):
