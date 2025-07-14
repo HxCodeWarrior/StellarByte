@@ -278,10 +278,11 @@ if __name__ == "__main__":
         max_position_embeddings=512,
         model_parallel_size=1,        # 模型并行大小
         use_flash_attention=False,    # 关闭FlashAttention，便于调试
-        use_causal=True,
-        use_cache=False
+        use_causal=True
     )
     
+    # ===== 无KVCache测试 =====
+    print("BaseTest without KVCache...")
     # 创建Attention层
     attention = MultiHeadSelfAttention(args)
     
@@ -296,4 +297,31 @@ if __name__ == "__main__":
 
     print(f"Input shape : {x.shape}") # [batch_size, seq_len, model_dim]
     print(f"Output shape: {y.shape}") # [batch_size, seq_len, model_dim]
+    print("Without KVCache test completed.")
+
+    # ===== 启动KVCache测试 ====
+    print("\nTesting KVCache...")
+    # 创建 KVCache 实例
+    kv_cache = KVCache(
+        num_layers=1,  # 添加必需的层数参数（测试用1层）
+        num_heads=args.num_kv_heads,  # 使用正确的参数名 num_heads
+        head_dim=args.model_dim // args.num_attention_heads,
+        max_seq_len=args.max_position_embeddings,
+        device=x.device
+    )
+
+    attn_kvcache = MultiHeadSelfAttention(args, kv_cache=kv_cache)
+    
+    # 模拟自回归生成过程
+    for i in range(seq_len):
+        # 每次处理一个 token
+        x_step = x[:, i:i+1, :]
+        
+        # 前向传播（使用缓存）
+        with torch.no_grad():
+            y_step, kv_cache = attn_kvcache(x_step)
+        
+        print(f"Step {i+1}: Input shape {x_step.shape}, Output shape {y_step.shape}")
+    
+    print("KVCache test completed.")
     
