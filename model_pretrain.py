@@ -1,199 +1,373 @@
+# -----------------------------------------------------------------------------
+# 导入依赖
+# -----------------------------------------------------------------------------
 import os
 import math
-import torch
+import time
+import json
 import random
 import argparse
-import numpy as np
 from contextlib import nullcontext
+
+import torch
+import numpy as np
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from model.Model import ByteTransformer
+# 分布式训练核心
+# from accelerate import Accelerator, DistributedDataParallelKwargs, DeepSpeedPlugin
+# from accelerate.logging import get_logger as get_accel_logger
+
+# 实验追踪
+import swanlab
+
+# 终端美化输出
+from rich.console import Console
+from rich.table import Table
+
+# 项目内部模块
 from datasets import PretrainDataset
-from utils.logger import get_logger
+from model.Model import ByteTransformer
+from model.config import ByteModelConfig
 from utils.checkpoint import CheckpointManager
 from utils.progressbar import RichProgressBar
-from model.config import ByteModelConfig
+from utils.logger import get_logger
 
+console = Console()
 
-def set_seed(seed):
+# -----------------------------------------------------------------------------
+# 随机种子与学习率调度器
+# -----------------------------------------------------------------------------
+def set_seed(seed: int) -> None:
+    """固定随机种子，保证实验可复现性。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def get_lr(it, all_iters, args):
-    warmup_iters = int(args.warmup_steps_ratio * all_iters)
-    decay_steps = int(args.lr_decay_steps_ratio * all_iters)
 
-    min_lr = args.min_lr
-    warmup_start_lr = args.warmup_start_lr
-    num_restarts = args.num_restarts
-    lr_decay_rate = args.lr_decay_rate
+def get_lr(it: int, all_iters: int, args) -> float:
+    """
+    余弦退火 + 线性预热 + 周期重启 学习率调度器。
 
-    cycle_length = all_iters
-    total_iters = all_iters * (num_restarts + 1)
+    参数说明
+    --------
+    it : int
+        当前全局 step。
+    all_iters : int
+        单个 epoch 内的 step 数乘以总 epoch 数，表示单周期迭代数。
+    args : Namespace
+        命令行参数集合。
+    """
+    # 计算关键节点
+    warmup_iters = int(args.warmup_steps_ratio * all_iters)  # 预热步数
+    decay_steps = int(args.lr_decay_steps_ratio * all_iters) # 每次衰减的步长
 
+    # 便捷变量
+    min_lr           = args.min_lr
+    warmup_start_lr  = args.warmup_start_lr or args.learning_rate / 1_000
+    num_restarts     = args.num_restarts
+    lr_decay_rate    = args.lr_decay_rate
+
+    cycle_length = all_iters                 # 一个周期长度
+    total_iters  = all_iters * (num_restarts + 1)  # 所有周期的总步数
+
+    # 如果超过最大训练步数，返回最小学习率
     if it >= total_iters:
         return min_lr
 
+    # ------- 1. 线性 + 余弦预热 -------
     if it < warmup_iters:
-        ratio = it / max(1, warmup_iters)
+        ratio  = it / max(1, warmup_iters)
         cosine = 0.5 * (1 - math.cos(math.pi * ratio))
         return warmup_start_lr + cosine * (args.learning_rate - warmup_start_lr)
 
-    cycle_step = (it - warmup_iters) % cycle_length
-    cycle_idx = (it - warmup_iters) // cycle_length
-    decay_steps_count = cycle_step // decay_steps
+    # ------- 2. 多周期余弦退火 -------
+    cycle_step       = (it - warmup_iters) % cycle_length   # 当前周期内的步数
+    cycle_idx        = (it - warmup_iters) // cycle_length  # 周期索引
+    decay_steps_cnt  = cycle_step // decay_steps            # 已触发的衰减次数
 
-    decayed_lr = args.learning_rate * (lr_decay_rate ** decay_steps_count)
-    decay_ratio = (cycle_step % decay_steps) / max(1, decay_steps)
-    cosine_coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    decayed_lr       = args.learning_rate * (lr_decay_rate ** decay_steps_cnt)
+    decay_ratio      = (cycle_step % decay_steps) / max(1, decay_steps)
+    cosine_coeff     = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
-    cycle_base_lr = decayed_lr * (lr_decay_rate ** cycle_idx)
-    current_lr = min_lr + cosine_coeff * (max(cycle_base_lr, min_lr) - min_lr)
+    cycle_base_lr    = decayed_lr * (lr_decay_rate ** cycle_idx)
+    current_lr       = min_lr + cosine_coeff * (max(cycle_base_lr, min_lr) - min_lr)
     return max(current_lr, min_lr)
 
 
-def evaluate(model, dataloader, args, logger):
-    model.eval()
-    total_loss = 0.0
+# -----------------------------------------------------------------------------
+# 训练过程辅助函数
+# -----------------------------------------------------------------------------
+
+def grad_global_norm(parameters) -> float:
+    """计算所有可训练参数梯度的 L2 范数（用于监控 & 梯度裁剪）。"""
+    total_norm = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        param_norm  = p.grad.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    return math.sqrt(total_norm)
+
+
+def format_size(num_bytes: int) -> str:
+    """将字节数格式化为可读字符串，如 256.0 MiB。"""
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:3.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} PiB"
+
+
+# -----------------------------------------------------------------------------
+# 验证循环
+# -----------------------------------------------------------------------------
+
+def evaluate(model, dataloader, args, logger, global_step):
+    """
+    整个验证集前向推理，不计算梯度。
+
+    返回
+    ----
+    avg_loss : float
+        验证集平均损失，用于早停或学习率调度。
+    """
+    model.eval()  # 切换到评估模式
+    total_loss   = 0.0
+    total_tokens = 0
+
     with torch.no_grad():
         for batch in dataloader:
-            input_ids = batch['input_ids'].to(args.device)
-            labels = batch['labels'].to(args.device)
-            outputs = model(input_ids=input_ids, labels=labels)
-            total_loss += outputs.loss.item()
-    avg_loss = total_loss / len(dataloader)
-    logger.info(f"[Eval] Validation Loss: {avg_loss:.4f}")
+            input_ids = batch["input_ids"].to(args.device)
+            labels    = batch["labels"].to(args.device)
+            outputs   = model(input_ids=input_ids, labels=labels)
+            # 累加 *样本数* 方便最后求平均
+            total_loss += outputs.loss.item() * input_ids.size(0)
+
+    avg_loss = total_loss / len(dataloader.dataset)
+    ppl      = math.exp(min(20, avg_loss))  # 防止溢出
+
+    logger.info(f"[Eval] Step {global_step} | 验证损失 {avg_loss:.4f} | PPL {ppl:.2f}")
+
+    if args.use_swanlab:
+        swanlab.log({
+            "val/loss": avg_loss,
+            "val/perplexity": ppl,
+        }, step=global_step)
+
+    model.train()  # 评估完记得切回训练模式
     return avg_loss
 
 
+# -----------------------------------------------------------------------------
+# 模型与分词器初始化
+# -----------------------------------------------------------------------------
+
 def init_model(args, logger):
-    lm_config = ByteModelConfig(
-        vocab_size=args.vocab_size,
-        dim=args.model_dim,
-        n_layers=args.num_layers,
-        n_heads=args.num_attention_heads,
-        n_kv_heads=args.num_kv_heads,
-        hidden_dim=args.hidden_dim,
-        multiple_of=args.dim_multiplier,
-        max_seq_len=args.max_seq_len,
-        drop_path_prob=args.drop_path_prob,
-        hidden_dropout=args.hidden_dropout_prob,
-        attention_dropout=args.attention_dropout_prob,
-        residual_dropout=args.residual_dropout_prob,
-        layer_norm_eps=args.layer_norm_eps,
-        initializer_range=args.initializer_range,
-        layerscale_init_value=args.layerscale_init,
-        tie_word_embeddings=args.tie_word_embeddings,
-        xpos_rope_theta=args.xpos_rope_theta,
-        xpos_scale_base=args.xpos_scale_base,
-        use_flash_attention=args.use_flash_attention,
-        causal=args.use_causal,
-        use_cache=args.use_cache,
-        key_dtype=args.key_cache_dtype,
-        value_dtype=args.value_cache_dtype,
-        model_parallel_size=args.model_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        tensor_parallel_rank=args.tensor_parallel_rank,
+    """根据 CLI 参数构造 ByteTransformer 与分词器。"""
+
+    # 1. 组装配置
+    config = ByteModelConfig(
+        vocab_size           = args.vocab_size,
+        dim                  = args.model_dim,
+        n_layers             = args.num_layers,
+        n_heads              = args.num_attention_heads,
+        n_kv_heads           = args.num_kv_heads,
+        hidden_dim           = args.hidden_dim,
+        multiple_of          = args.dim_multiplier,
+        max_seq_len          = args.max_seq_len,
+        drop_path_prob       = args.drop_path_prob,
+        hidden_dropout       = args.hidden_dropout_prob,
+        attention_dropout    = args.attention_dropout_prob,
+        residual_dropout     = args.residual_dropout_prob,
+        layer_norm_eps       = args.layer_norm_eps,
+        initializer_range    = args.initializer_range,
+        layerscale_init_value= args.layerscale_init,
+        tie_word_embeddings  = args.tie_word_embeddings,
+        xpos_rope_theta      = args.xpos_rope_theta,
+        xpos_scale_base      = args.xpos_scale_base,
+        use_flash_attention  = args.use_flash_attention,
+        causal               = args.use_causal,
+        use_cache            = args.use_cache,
+        key_dtype            = args.key_cache_dtype,
+        value_dtype          = args.value_cache_dtype,
+        model_parallel_size  = args.model_parallel_size,
+        tensor_parallel_size = args.tensor_parallel_size,
+        tensor_parallel_rank = args.tensor_parallel_rank,
     )
 
+    # 2. 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    model = ByteTransformer(lm_config)
-    if torch.cuda.device_count() > 1:
+
+    # 3. 构建模型
+    model = ByteTransformer(config)
+    if torch.cuda.device_count() > 1 and not args.ddp:
         model = torch.nn.DataParallel(model)
     model = model.to(args.device)
 
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"模型参数总量：{param_count / 1e6:.2f}M")
-    return model, tokenizer, lm_config
+    # 4. 打印参数规模
+    param_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"模型参数总量: {param_cnt/1e6:.2f}M")
+
+    return model, tokenizer, config
 
 
-def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_iters, logger, global_step):
+# -----------------------------------------------------------------------------
+# 单个 epoch 训练
+# -----------------------------------------------------------------------------
+def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
+                total_iters, logger, global_step):
+    """执行一个 epoch 的前向、反向与梯度更新。"""
+
     model.train()
-    total_loss = 0.0
-    total_steps = len(dataloader)
-    total = args.epochs * total_steps
+    loss_sum = 0.0
 
-    with RichProgressBar(total_steps=total, total_batches=total_steps, total_epochs=args.epochs,desc="Training") as pbar:
+    pb_total = len(dataloader)
+    # 使用 RichProgressBar 可视化训练进度
+    with RichProgressBar(total_steps=pb_total, total_batches=pb_total,
+                         total_epochs=args.epochs, desc=f"Epoch {epoch+1}") as pbar:
+
+        start_wall = time.perf_counter()
+
+        # --------------------------------------------------
+        # 遍历数据集
+        # --------------------------------------------------
         for step, batch in enumerate(dataloader, 1):
-            input_ids = batch['input_ids'].to(args.device)
-            labels = batch['labels'].to(args.device)
+            input_ids          = batch["input_ids"].to(args.device)
+            labels             = batch["labels"].to(args.device)
+            tokens_this_batch  = input_ids.numel()
 
+            # —— 动态学习率 ——
             lr = get_lr(global_step, total_iters, args)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
 
-            with ctx:
+            # —— 前向 + 反向 ——
+            with ctx:  # 支持 AMP autocast
                 outputs = model(input_ids=input_ids, labels=labels)
-                loss = outputs.loss / args.accumulation_steps
+                loss    = outputs.loss / args.accumulation_steps
 
             scaler.scale(loss).backward()
 
-            if (step + 1) % args.accumulation_steps == 0:
+            # —— 梯度累积 ——
+            if (step % args.accumulation_steps) == 0:
+                # 反缩放后裁剪 & 记录梯度范数
                 scaler.unscale_(optimizer)
+                total_grad_norm = grad_global_norm(model.parameters())
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+                # 更新参数
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+            else:
+                total_grad_norm = 0.0  # 非更新步，梯度范数置 0 仅做日志占位
 
-            total_loss += loss.item()
-            global_step += 1
+            # —— 指标统计 ——
+            loss_item     = loss.item() * args.accumulation_steps
+            loss_sum     += loss_item
+            tokens_per_s  = tokens_this_batch / max(1e-6, time.perf_counter() - start_wall)
+            gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
 
+            # —— 日志打印 & SwanLab ——
             if global_step % args.log_interval == 0:
-                logger.info(f"[Epoch {epoch} | Step {global_step}] Loss: {loss.item() * args.accumulation_steps:.4f}, LR: {lr:.8f}")
+                ppl = math.exp(min(20, loss_item))
+                logger.info(
+                    f"E{epoch+1} S{global_step} | loss {loss_item:.4f} | ppl {ppl:.1f} "
+                    f"| lr {lr:.6g} | gnorm {total_grad_norm:.2f} | tok/s {tokens_per_s:.0f} "
+                    f"| mem {format_size(gpu_mem)}")
 
-            if args.val_data_path and global_step % args.eval_interval == 0:
-                evaluate(model, dataloader, args, logger)
+                if args.use_swanlab:
+                    swanlab.log({
+                        "train/loss": loss_item,
+                        "train/perplexity": ppl,
+                        "train/lr": lr,
+                        "train/grad_norm": total_grad_norm,
+                        "train/tokens_per_sec": tokens_per_s,
+                        "train/gpu_mem": gpu_mem / (1024**2),  # 转 MB
+                    }, step=global_step)
+
+            # —— 验证 & 保存 ——
+            if args.val_data_path and (global_step % args.eval_interval == 0):
+                evaluate(model, args.val_loader, args, logger, global_step)
 
             if global_step % args.save_interval == 0:
                 args.ckpt_mgr.save_checkpoint(model, optimizer, None, epoch, step=global_step)
 
-            # 更新进度条
+            # —— 更新进度条 ——
             pbar.update_loader(step)
-            pbar.update_train(global_step, epoch+1, loss=loss.item() * args.accumulation_steps, lr=lr)
+            pbar.update_train(global_step, epoch+1, loss=loss_item, lr=lr)
 
-    avg_loss = total_loss / len(dataloader)
-    logger.info(f"[Epoch {epoch}] 平均损失: {avg_loss:.4f}")
+            global_step += 1
+
+    avg_loss = loss_sum / pb_total
+    logger.info(f"[Epoch {epoch+1}] 平均损失 {avg_loss:.4f}")
+
     return global_step
 
 
+# -----------------------------------------------------------------------------
+# 主训练流程
+# -----------------------------------------------------------------------------
 def train(args, logger):
+    """主训练流程，包含模型初始化、训练与验证、SwanLab 接入等。"""
     set_seed(args.seed)
 
-    model, tokenizer, config = init_model(args, logger)
-    dataset = PretrainDataset(args.train_data_path, tokenizer, max_length=config.max_seq_len)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    # 初始化 SwanLab 实验
+    if args.use_swanlab:
+        swanlab.login(api_key=args.swanlab_api_key)
+        swanlab.init(
+            project=args.swanlab_project,
+            experiment_name=args.swanlab_experiment_name,
+            config=vars(args)
+        )
 
+    # 初始化模型、分词器与配置
+    model, tokenizer, config = init_model(args, logger)
+
+    # 加载训练集
+    train_dataset = PretrainDataset(args.train_data_path, tokenizer, max_length=config.max_seq_len)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+
+    # 加载验证集（如果提供）
     val_loader = None
     if args.val_data_path:
         val_dataset = PretrainDataset(args.val_data_path, tokenizer, max_length=config.max_seq_len)
         val_loader = DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers)
+        args.val_loader = val_loader
 
+    # 构建优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_iters = args.epochs * len(dataloader)
 
+    # 学习率调度与AMP配置
+    total_iters = args.epochs * len(train_loader)
     use_amp = args.amp or args.dtype in ['float16', 'bfloat16']
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     ctx = nullcontext() if args.device == 'cpu' else torch.cuda.amp.autocast(dtype=getattr(torch, args.dtype)) if use_amp else nullcontext()
 
+    # 初始化检查点管理器
     ckpt_mgr = CheckpointManager(args.checkpoints_dir)
+    args.ckpt_mgr = ckpt_mgr
+
     start_epoch = 0
     global_step = 0
     if ckpt_mgr.has_checkpoint():
-        logger.info("恢复模型权重中...")
+        logger.info("🔁 检测到历史检查点，正在恢复中…")
         checkpoint = ckpt_mgr.load_checkpoint(model, optimizer, None)
         start_epoch = checkpoint.get("epoch", 0) + 1
         global_step = checkpoint.get("step", 0)
 
     logger.info("🚀 开始训练…")
     for epoch in range(start_epoch, args.epochs):
-        global_step = train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch, total_iters, logger, global_step)
+        global_step = train_epoch(model, train_loader, optimizer, scaler, ctx,
+                                  args, epoch, total_iters, logger, global_step)
         if val_loader:
-            evaluate(model, val_loader, args, logger)
+            evaluate(model, val_loader, args, logger, global_step)
         ckpt_mgr.save_checkpoint(model, optimizer, None, epoch)
-    logger.info("✅ 训练结束。")
+
+    logger.info("✅ 训练完成。")
+
 
 
 # 程序入口
