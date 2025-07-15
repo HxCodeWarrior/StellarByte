@@ -66,14 +66,14 @@ class ByteTransformer(PreTrainedModel):
         self.kv_cache: Optional[KVCache] = None
         if config.use_cache:
             self.kv_cache = KVCache(
-                num_layers=config.num_layers,
-                num_heads=config.num_attention_heads,  # 总头数
-                head_dim=D // config.num_attention_heads,
-                max_seq_len=config.max_seq_len,
-                key_dtype=config.key_cache_dtype,
-                value_dtype=config.value_cache_dtype,
-                tensor_parallel_size=config.tensor_parallel_size,
-                tensor_parallel_rank=config.tensor_parallel_rank,
+                num_layers           = config.num_layers,
+                num_heads            = config.num_attention_heads,  # 总头数
+                head_dim             = D // config.num_attention_heads,
+                max_seq_len          = config.max_seq_len,
+                key_dtype            = config.key_cache_dtype,
+                value_dtype          = config.value_cache_dtype,
+                tensor_parallel_size = config.tensor_parallel_size,
+                tensor_parallel_rank = config.tensor_parallel_rank,
             )
 
         # ------- 解码器堆栈 -------

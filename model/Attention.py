@@ -86,7 +86,6 @@ class MultiHeadSelfAttention(nn.Module):
             scale_base=args.xpos_scale_base,
             theta=args.xpos_rope_theta,
         )
-        self._rotary_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # ---- Dropout ----
         # 注意力权重dropout，防止过拟合
@@ -133,14 +132,6 @@ class MultiHeadSelfAttention(nn.Module):
             self.W_v = torch.quantization.quantize_dynamic(self.W_v, {nn.Linear}, dtype=torch.qint8)
             self.W_o = torch.quantization.quantize_dynamic(self.W_o, {nn.Linear}, dtype=torch.qint8)
             self.quantized = True
-
-    def _get_rotary(self, seq_len: int, device, dtype):
-        """缓存或计算 cos, sin, scale"""
-        if seq_len not in self._rotary_cache:
-            cos, sin = self.rotary._compute_cos_sin(seq_len, device, dtype)
-            scale = self.rotary._compute_xpos_scale(seq_len, device, dtype)
-            self._rotary_cache[seq_len] = (cos, sin, scale)
-        return self._rotary_cache[seq_len]
 
     def _build_attention_mask(self, T: int, Tk: int, additive_mask: Optional[torch.Tensor]):
         """
@@ -198,8 +189,7 @@ class MultiHeadSelfAttention(nn.Module):
         additive_mask: Optional[torch.Tensor] = None,  # 可选padding掩码，形状 [B, 1, 1, T_k]
     ) -> torch.Tensor:
         B, T, _ = x.shape
-        device = x.device
-        dtype = x.dtype
+        device  = x.device
 
         # —— 1. KVCache 设备同步 —— 
         if self.kv_cache is not None:
@@ -211,12 +201,16 @@ class MultiHeadSelfAttention(nn.Module):
         if self.kv_cache is not None and self.layer_id is not None:
             past_len = self.kv_cache.layer_length(self.layer_id)  # 历史缓存长度，保证位置编码连续
 
-        # —— 3. QKV 投影 & 拆分 —— 
+        # —— 3. 获取数据类型dtype ——
+        param_dtype   = x.dtype                        # fp16 / bf16 / fp32
+        compute_dtype = torch.float32                  # 统一本层计算精度
+
+        # —— 4. QKV 投影 & 拆分 —— 
         # 线性变换得到QKV，形状 [B, T, embed_dim]
         # [B,T,E] -> [B,T,3E] 再 chunk 也可，但这里单独调用
-        q = self.W_q(x)
-        k = self.W_k(x)
-        v = self.W_v(x)
+        q = self.W_q(x).to(param_dtype)
+        k = self.W_k(x).to(param_dtype)
+        v = self.W_v(x).to(param_dtype)
 
         # reshape成多头格式 [B, T, H, head_dim]
         q = q.view(B, T, self.num_local_heads, self.head_dim)       # [B,T,H,dh]
@@ -232,7 +226,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         # —— 4. Rotary Position Embedding —— 
         # 4.1 XPos Rotary 位置编码，生成长度为 (past_len + T) 的 cos, sin, scale，支持缓存历史拼接
-        cos_full, sin_full, scale_full = self._get_rotary(past_len + T, device, dtype)
+        cos_full, sin_full, scale_full = self.rotary._get_cos_sin_scale(past_len + T, device, compute_dtype)
         # 4.2 只取当前输入位置对应的编码（即从past_len开始的切片）
         cos = cos_full[past_len : past_len + T]   # [T, head_dim]
         sin = sin_full[past_len : past_len + T]
@@ -280,15 +274,17 @@ class MultiHeadSelfAttention(nn.Module):
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
             )
         else:
-            scores = (q @ k_cat.transpose(-1,-2)) * self.scale  # [B,H,T,Tk]
+            scores = ( q.to(compute_dtype)
+                  @ k_cat.to(compute_dtype).transpose(-1,-2) ) \
+                  * self.scale.to(compute_dtype)  # [B,H,T,Tk]
             if additive_mask is not None:
-                scores = scores + additive_mask
+                scores = scores + additive_mask.to(compute_dtype)
             if self.causal:
                 inf_mask = self._build_attention_mask(T, Tk, additive_mask)
-                scores = scores + inf_mask
-            probs = F.softmax(scores, dim=-1)
-            probs = self.attn_dropout(probs)
-            attn_out = probs @ v_cat  # [B,H,T,dh]
+                scores = scores + inf_mask.to(compute_dtype)
+            probs    = F.softmax(scores, dim=-1)
+            probs    = self.attn_dropout(probs).to(param_dtype)
+            attn_out = probs @ v_cat.to(param_dtype)  # [B,H,T,dh]
 
 
         # —— 8. OutPut：拼回 & 输出投影 & Residual Dropout ——
