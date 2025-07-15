@@ -4,6 +4,7 @@
 import os
 import math
 import time
+import signal
 import json
 import random
 import argparse
@@ -29,7 +30,7 @@ from rich.table import Table
 from datasets import PretrainDataset
 from model.Model import ByteTransformer
 from model.config import ByteModelConfig
-from utils.checkpoint import CheckpointManager
+from utils.checkpoint import CheckpointManager, GracefulKiller
 from utils.progressbar import RichProgressBar
 from utils.logger import get_logger
 
@@ -124,7 +125,7 @@ def format_size(num_bytes: int) -> str:
 # 验证循环
 # -----------------------------------------------------------------------------
 
-def evaluate(model, dataloader, args, logger, global_step):
+def evaluate(model, dataloader, args, global_step, logger):
     """
     整个验证集前向推理，不计算梯度。
 
@@ -143,9 +144,10 @@ def evaluate(model, dataloader, args, logger, global_step):
             labels    = batch["labels"].to(args.device)
             outputs   = model(input_ids=input_ids, labels=labels)
             # 累加 *样本数* 方便最后求平均
-            total_loss += outputs.loss.item() * input_ids.size(0)
+            total_loss   += outputs.loss.item() * input_ids.size(0)
+            total_tokens += input_ids.size(0)
 
-    avg_loss = total_loss / len(dataloader.dataset)
+    avg_loss = total_loss / total_tokens
     ppl      = math.exp(min(20, avg_loss))  # 防止溢出
 
     logger.info(f"[Eval] Step {global_step} | 验证损失 {avg_loss:.4f} | PPL {ppl:.2f}")
@@ -163,7 +165,6 @@ def evaluate(model, dataloader, args, logger, global_step):
 # -----------------------------------------------------------------------------
 # 模型与分词器初始化
 # -----------------------------------------------------------------------------
-
 def init_model(args, logger):
     """根据 CLI 参数构造 ByteTransformer 与分词器。"""
 
@@ -217,16 +218,18 @@ def init_model(args, logger):
 # 单个 epoch 训练
 # -----------------------------------------------------------------------------
 def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
-                total_iters, logger, global_step):
+                total_iters, logger, global_step, ckpt_mgr, killer, best_val_loss):
     """执行一个 epoch 的前向、反向与梯度更新。"""
 
     model.train()
     loss_sum = 0.0
-
     pb_total = len(dataloader)
+
     # 使用 RichProgressBar 可视化训练进度
-    with RichProgressBar(total_steps=pb_total, total_batches=pb_total,
-                         total_epochs=args.epochs, desc=f"Epoch {epoch+1}") as pbar:
+    with RichProgressBar(total_steps=pb_total, 
+                         total_batches=pb_total,
+                         total_epochs=args.epochs, 
+                         desc=f"Epoch {epoch+1}") as pbar:
 
         start_wall = time.perf_counter()
 
@@ -270,6 +273,15 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
             tokens_per_s  = tokens_this_batch / max(1e-6, time.perf_counter() - start_wall)
             gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
 
+            # —— 轻量 checkpoint(按步) ——
+            if ckpt_mgr.should_save(global_step):
+                ckpt_mgr.save(model, optimizer, scaler,
+                              epoch=epoch, step=global_step,
+                              full=False)
+
+            # —— 更新 Killer ——
+            killer.update(epoch, global_step, best_val_loss)
+
             # —— 日志打印 & SwanLab ——
             if global_step % args.log_interval == 0:
                 ppl = math.exp(min(20, loss_item))
@@ -287,13 +299,6 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
                         "train/tokens_per_sec": tokens_per_s,
                         "train/gpu_mem": gpu_mem / (1024**2),  # 转 MB
                     }, step=global_step)
-
-            # —— 验证 & 保存 ——
-            if args.val_data_path and (global_step % args.eval_interval == 0):
-                evaluate(model, args.val_loader, args, logger, global_step)
-
-            if global_step % args.save_interval == 0:
-                args.ckpt_mgr.save_checkpoint(model, optimizer, None, epoch, step=global_step)
 
             # —— 更新进度条 ——
             pbar.update_loader(step)
@@ -314,6 +319,7 @@ def train(args, logger):
     """主训练流程，包含模型初始化、训练与验证、SwanLab 接入等。"""
     set_seed(args.seed)
 
+    # --------- 初始化组件 ---------
     # 初始化 SwanLab 实验
     if args.use_swanlab:
         swanlab.login(api_key=args.swanlab_api_key)
@@ -323,18 +329,35 @@ def train(args, logger):
             config=vars(args)
         )
 
+     # 初始化检查点管理器
+    ckpt_mgr = CheckpointManager(args.checkpoints_dir,
+                                 keep_latest=args.keep_latest,
+                                 keep_epoch=args.keep_epoch,
+                                 keep_best=args.keep_best,
+                                 save_every_n_steps=args.save_interval)
+
     # 初始化模型、分词器与配置
     model, tokenizer, config = init_model(args, logger)
 
     # 加载训练集
-    train_dataset = PretrainDataset(args.train_data_path, tokenizer, max_length=config.max_seq_len)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    train_dataset = PretrainDataset(args.train_data_path, 
+                                    tokenizer, 
+                                    max_length=config.max_seq_len)
+    train_loader = DataLoader(train_dataset, 
+                              batch_size=args.batch_size, 
+                              shuffle=True, 
+                              num_workers=args.num_workers)
 
     # 加载验证集（如果提供）
     val_loader = None
     if args.val_data_path:
-        val_dataset = PretrainDataset(args.val_data_path, tokenizer, max_length=config.max_seq_len)
-        val_loader = DataLoader(val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers)
+        val_dataset = PretrainDataset(args.val_data_path, 
+                                      tokenizer, 
+                                      max_length=config.max_seq_len)
+        val_loader  = DataLoader(val_dataset, 
+                                 batch_size=args.eval_batch_size, 
+                                 shuffle=False, 
+                                 num_workers=args.num_workers)
         args.val_loader = val_loader
 
     # 构建优化器
@@ -343,31 +366,58 @@ def train(args, logger):
     # 学习率调度与AMP配置
     total_iters = args.epochs * len(train_loader)
     use_amp = args.amp or args.dtype in ['float16', 'bfloat16']
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    ctx = nullcontext() if args.device == 'cpu' else torch.cuda.amp.autocast(dtype=getattr(torch, args.dtype)) if use_amp else nullcontext()
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    ctx     = (nullcontext() if args.device == 'cpu'
+               else torch.cuda.amp.autocast(dtype=getattr(torch, args.dtype))
+               if use_amp else nullcontext())
 
-    # 初始化检查点管理器
-    ckpt_mgr = CheckpointManager(args.checkpoints_dir)
-    args.ckpt_mgr = ckpt_mgr
+    # 初始化 GracefulKiller
+    killer = GracefulKiller(model, optimizer, scaler, ckpt_mgr, logger, sync=True)
 
     start_epoch = 0
     global_step = 0
-    if ckpt_mgr.has_checkpoint():
+    best_val_loss = float("inf")
+
+    # ---------- 恢复 ----------
+    try:
         logger.info("🔁 检测到历史检查点，正在恢复中…")
-        checkpoint = ckpt_mgr.load_checkpoint(model, optimizer, None)
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        global_step = checkpoint.get("step", 0)
+        ckpt = ckpt_mgr.load_latest(model, optimizer, scaler)
+        start_epoch  = ckpt['epoch'] + 1
+        global_step  = ckpt['step'] + 1
+        best_val_loss = ckpt.get('val_loss', float('inf'))
+        logger.info(f"🪄 已恢复到 epoch {start_epoch}, step {global_step}")
+    except FileNotFoundError:
+        logger.info("🆕 未检测到 checkpoint，开始全新训练")
+        start_epoch, global_step, best_val_loss = 0, 0, float('inf')
 
-    logger.info("🚀 开始训练…")
-    for epoch in range(start_epoch, args.epochs):
-        global_step = train_epoch(model, train_loader, optimizer, scaler, ctx,
-                                  args, epoch, total_iters, logger, global_step)
-        if val_loader:
-            evaluate(model, val_loader, args, logger, global_step)
-        ckpt_mgr.save_checkpoint(model, optimizer, None, epoch)
+    # ---------- 训练 ----------
+    try:
+        logger.info("🚀 开始训练…")
+        for epoch in range(start_epoch, args.epochs):
+            global_step = train_epoch(model, train_loader, optimizer, scaler, ctx,
+                                      args, epoch, total_iters, logger, global_step, 
+                                      ckpt_mgr, killer, best_val_loss)
+            # -------------- 验证 --------------------------------
+            if val_loader:
+                val_loss = evaluate(model, val_loader, args, logger, global_step)
 
-    logger.info("✅ 训练完成。")
+                # 保存最优模型
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    logger.info(f"🎉 验证集损失下降至 {best_val_loss:.4f}，保存最优模型权重。")
 
+            # --------- 每 Epoch 末保存完整检查点 ------------------
+            ckpt_mgr.save(model, optimizer, scaler,
+                          epoch=epoch, step=global_step,
+                          val_loss=val_loss,
+                          full=True)  # 保存完整检查点
+            killer.update(epoch, global_step, best_val_loss)   # 同步最新 best
+
+        logger.info("✅ 训练完成。")
+    except Exception as e:
+        logger.error(f"训练过程中发生异常: {e}")
+        logger.info("💀 异常退出，正在保存检查点…")
+        raise e
 
 
 # 程序入口
@@ -382,8 +432,6 @@ if __name__ == "__main__":
     parser.add_argument("--swanlab_project", type=str, default="Happy-LLM", help="SwanLab项目名称")
     parser.add_argument("--swanlab_experiment_name", type=str, default="Pretrain-215M", help="SwanLab实验名称")
     parser.add_argument("--swanlab_api_key", type=str, default="",  help="SwanLab API认证密钥")
-    parser.add_argument("--logs_dir", type=str, default="./logs", help="日志输出目录")
-    parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="模型检查点输出目录")
 
     # =============================
     #       数据集配置
@@ -469,13 +517,18 @@ if __name__ == "__main__":
                        help="训练数据类型（float32/full precision, float16/half, bfloat16/brain float）")
     parser.add_argument("--amp", action="store_true", help="启用自动混合精度训练（与dtype互斥）")
 
+
     # =============================
     #       日志与保存配置
     # =============================
+    parser.add_argument("--logs_dir", type=str, default="./logs", help="日志输出目录")
+    parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="模型检查点输出目录")
     parser.add_argument("--log_interval", type=int, default=100, help="训练日志打印间隔（步数）")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型检查点保存间隔（步数）")
-    parser.add_argument("--eval_interval", type=int, default=2000, help="验证集评估间隔（步数）")
-    parser.add_argument("--max_checkpoints", type=int, default=5, help="最大保留的检查点数量")
+    parser.add_argument("--save_interval", type=int, default=1000, help="轻量 checkpoint 步长")
+    parser.add_argument("--keep_latest", type=int, default=5, help="轻量 checkpoint 最多保留数量")
+    parser.add_argument("--keep_epoch",  type=int, default=10, help="完整 checkpoint 最多保留数量")
+    parser.add_argument("--keep_best",   type=int, default=3, help="最优 checkpoint 保留数量")
+    
 
     # =============================
     #       验证配置
