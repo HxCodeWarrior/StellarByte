@@ -95,27 +95,50 @@ class KVCache:
     @torch.inference_mode()
     def append(self, layer_id: int, key: torch.Tensor, value: torch.Tensor) -> None:
         """
-        追加新的 KV 对到指定层缓存，自动 sliding-window。
-        要求 key / value: [B, T_new, H_local, D]
+        追加新的 KV 对到指定层缓存，超出窗口长度时自动“滑动窗口截断”。
+
+        参数
+        ----
+        key / value: [B, T_new, H_local, D]
+        约束:
+            1. T_new 可以任意（≥1），若 > max_seq_len 仅保留最近 max_seq_len。
+            2. 不会创建新张量；只做必要的 in‑place copy。
         """
+        # —— 1. 基本合法性检查 ——
         assert key.shape == value.shape, "K/V 形状不一致"
         B, T_new, H, D = key.shape
-        assert H == self.H_local and D == self.D, f"KV head_dim 不一致：{H} vs {self.H_local}"
-
+        assert H == self.H_local and D == self.D, \
+            f"KV head_dim 不一致: {H} vs {self.H_local}"
         if self.batch_size is None:
             self._allocate_buffers(B)
         assert B == self.batch_size, "batch_size 不一致"
 
-        # sliding-window
-        current_len = self._seq_lens[layer_id]
-        overflow = max(0, current_len + T_new - self.max_T)
-        if overflow > 0:
-            buf = self.cache[layer_id]
-            buf["key"] = torch.roll(buf["key"], shifts=-overflow, dims=1)
-            buf["value"] = torch.roll(buf["value"], shifts=-overflow, dims=1)
+        # —— 2. 若一次输入超过窗口，就直接截断 ——
+        if T_new >= self.max_T:  # 只保留最近 max_T
+            key  = key[:, -self.max_T:]
+            value = value[:, -self.max_T:]
+            T_new = self.max_T
+            overflow = self._seq_lens[layer_id]  # 全部被替换
+        else:
+            current_len = self._seq_lens[layer_id]
+            overflow = max(0, current_len + T_new - self.max_T)
 
-        start = max(0, current_len - overflow)
-        end = start + T_new
-        self.cache[layer_id]["key"][:, start:end].copy_(key)
-        self.cache[layer_id]["value"][:, start:end].copy_(value)
-        self._seq_lens[layer_id] = min(current_len + T_new, self.max_T)
+        buf = self.cache[layer_id]
+
+        # —— 3. 若存在 overflow，则左移 (current_len - overflow) 个 token ——
+        if overflow > 0:
+            keep_len = current_len - overflow  # 将要保留的旧 token 数
+            if keep_len > 0:  # 仅当有内容需要保留时才复制
+                src = slice(overflow, overflow + keep_len)   # 旧 token
+                dst = slice(0, keep_len)                    # 左移后位置
+                buf["key"][:, dst].copy_(buf["key"][:, src])
+                buf["value"][:, dst].copy_(buf["value"][:, src])
+
+        # —— 4. 写入新 token ——
+        start = min(self._seq_lens[layer_id], self.max_T) - overflow
+        end   = start + T_new
+        buf["key"][:, start:end].copy_(key)
+        buf["value"][:, start:end].copy_(value)
+
+        # —— 5. 更新长度 ——
+        self._seq_lens[layer_id] = min(self._seq_lens[layer_id] + T_new, self.max_T)

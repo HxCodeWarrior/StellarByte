@@ -186,11 +186,18 @@ StellarByte/
 1. 构建并优化模型训练组件：
 - 检查点管理组件
 - 意外中断保护组件
-2. 在模型训练过程中应用检查点管理以及意外中断保护组件
-3. 关于LoRA
+2. 实现LLM的记忆管理机制
+3. 实现单步推理接口以及相关组件
+4. 在模型训练过程中应用检查点管理以及意外中断保护组件
+5. 关于LoRA
 - 优化LoRA：支持热插拔、正则优化、减少内存占用提升速度
 - 测试LoRA
-4. 实现LLM的记忆管理机制
+6. 优化位置编码
+- 移除旋转位置编码的本地缓存，改用全局缓存类RotaryCache
+- 添加可学习的缩放因子参数到XPosRotaryEmbedding
+7. 统一了Attention部分的param参数dtype和本层计算数据dtype
+- 统一计算精度为float32以提高数值稳定性
+8. KVCache添加滑动窗口截断处理
 
 #### TODO：
 1. LoRA进一步优化
@@ -198,6 +205,18 @@ StellarByte/
 - 支持Conv2d/Transformer.Conv1d注入
 - 适配量化模块
 - Tuner冻结层选择策略
+2. Attention:
+- 实现 线程并行/All‑Reduce
+- 进一步融合FlashAttention-2
+- 接入RetNet
+3. 测试
+- 测试数据集加载器
+- 测试LoRA
+- 测试Attention
+- 测试Memory
+
+### DEBUG
+1. 工具脚本分析模型信息报错
 
 
 ## 🤝 贡献指南

@@ -100,6 +100,11 @@ class ByteTransformer(PreTrainedModel):
         # ------- 运行时辅助 -------
         self.last_loss: Optional[torch.Tensor] = None  # 记录最近一次 forward 的损失
 
+        # 记录一次权重 dtype，用于推理时安全 cast
+        self._infer_dtype: torch.dtype = next(self.parameters()).dtype
+        # 缓存首帧掩码 (batch_shape, additive_mask)
+        self._cached_mask: Tuple[Tuple[int, int], torch.Tensor] = ((0, 0), torch.empty(0))
+
     # ------------------------------------------------------------------
     # 权重初始化相关
     # ------------------------------------------------------------------
@@ -335,6 +340,100 @@ class ByteTransformer(PreTrainedModel):
         # 只返回新生成的token
         return generated[:, prefix_len:]
     
+    # ------------------------------------------------------------------
+    # 单步推理接口 (增量解码原子 API)
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def inference_step(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        reset_cache: bool = False,
+        return_logits: bool = True,
+        kv_clip: Optional[int] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        单步推理 (Single‑step Inference)
+
+        参数
+        ----
+        input_ids   : LongTensor, 形状 [B,T] / [B] / [B,1]
+                      * 首帧 (reset_cache=True 或 KVCache 为空) 允许任意 T≤max_seq_len
+                      * 后续步骤通常传入 1 个新 token
+        attention_mask : (可选) 仅首帧需要；后续自动推断
+        reset_cache : 若 True 则先清空 KV‑Cache，从头推理
+        return_logits : 是否返回最新 logits（常用于采样）
+        kv_clip : 限制 KV‑Cache 的最大保留长度；None 表示不截断
+
+        返回
+        ----
+        hidden_last : None (本实现不返回隐状态，可自行扩展)
+        logits_last : FloatTensor | None, 形状 [B,V]
+        """
+
+        # ===== 0. 前置处理 =====
+        if reset_cache:
+            self.reset_cache()                       # 开启新一轮推理
+
+        # 保证 input_ids 形状为 [B,T]
+        if input_ids.ndim == 1:
+            input_ids = input_ids[:, None]           # [B] -> [B,1]
+        elif input_ids.ndim != 2:
+            raise ValueError("input_ids 应为 [B] / [B,1] / [B,T]")
+
+        B, T = input_ids.shape
+        is_first_frame = (self.kv_cache is None) or (self.kv_cache.global_length() == 0)
+
+        # ===== 1. dtype 强一致 =====
+        if input_ids.dtype != torch.long:
+            raise TypeError("input_ids 必须是 torch.long 类型")
+        # 统计参数 dtype（首次在 __init__ 已记录）
+        param_dtype = self._infer_dtype
+        if self.embed_tokens.weight.dtype != param_dtype:
+            # 若外部调用了 model.to(...) 改变 dtype，则更新记录
+            param_dtype = self.embed_tokens.weight.dtype
+            self._infer_dtype = param_dtype
+
+        # ===== 2. 掩码构造 (仅首帧) =====
+        additive_mask = None
+        if is_first_frame:
+            # 若用户没给 attention_mask，默认全 1（无 PAD）
+            if attention_mask is None:
+                attention_mask = torch.ones(B, T, dtype=torch.long, device=input_ids.device)
+
+            # 查看是否已缓存同形状的掩码模板
+            if self._cached_mask[0] != (B, T):
+                # 计算 additive mask 并缓存
+                m = attention_mask.to(param_dtype)        # [B,T]
+                causal_inf = torch.finfo(param_dtype).min
+                additive_mask_tmpl = (1.0 - m)[:, None, None, :] * causal_inf  # [B,1,1,T]
+                self._cached_mask = ((B, T), additive_mask_tmpl)
+
+            additive_mask = self._cached_mask[1]
+        # 单 token 步骤跳过掩码构造 (Attention 内部会处理 causal)
+
+        # ===== 3. 调用 forward =====
+        output: CausalLMOutputWithPast = self(
+            input_ids=input_ids,
+            attention_mask=attention_mask if is_first_frame else None,
+            use_cache=True,                # 始终使用 KV‑Cache
+            return_hidden_states=False,    # 推理不需要逐层 hidden
+        )
+
+        logits_last = output.logits[:, -1, :] if return_logits else None
+
+        # ===== 4. KV‑Cache 长度控制 =====
+        if kv_clip is not None and self.kv_cache is not None:
+            # 若 KVCache 对象实现 clip() & total_len
+            if hasattr(self.kv_cache, "global_length") and self.kv_cache.global_length() > kv_clip:
+                if hasattr(self.kv_cache, "clip"):
+                    self.kv_cache.clip(kv_clip)
+                else:
+                    warnings.warn("KVCache 未实现 clip()，已跳过 kv_clip")
+
+        # 返回 (hidden_last, logits_last)
+        return None, logits_last
+
     def get_num_params(self, non_embedding: bool = False) -> int:
         """
         计算模型参数数量
@@ -374,7 +473,7 @@ class ByteTransformer(PreTrainedModel):
 # 测试代码
 if __name__ == "__main__":
     # 创建配置
-    config = ByteModelConfig(
+    cfg = ByteModelConfig(
         vocab_size=32000,
         model_dim=768,
         num_layers=12,
@@ -388,27 +487,30 @@ if __name__ == "__main__":
         layer_norm_eps=1e-5,
         tie_word_embeddings=True,
         use_cache=True,
-        use_flash_attention=True
+        use_flash_attention=True,
     )
-    
+
     # 创建模型
-    model = ByteTransformer(config)
-    
-    # 打印模型信息
-    print(f"模型参数总数: {model.get_num_params() / 1e6:.2f}M")
-    print(f"非词嵌入参数: {model.get_num_params(non_embedding=True) / 1e6:.2f}M")
-    
-    # 测试前向传播
-    input_ids = torch.randint(0, config.vocab_size, (2, 16))
+    model = ByteTransformer(cfg)
+    print(f"模型参数总数: {model.get_num_params()/1e6:.2f}M")
+    print(f"非词嵌入参数: {model.get_num_params(non_embedding=True)/1e6:.2f}M")
+
+    # ----- 测试 forward -----
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 16))
     attention_mask = torch.ones_like(input_ids)
-    
+
     outputs = model(input_ids, attention_mask=attention_mask)
-    print(f"Logits形状: {outputs.logits.shape}")  # 应为 [2, 16, 32000]
-    
-    # 测试生成
-    generated = model.generate(
-        input_ids=input_ids[:, :1],  # 只使用第一个token作为起始
-        max_new_tokens=10,
-        temperature=0.8
-    )
-    print(f"生成结果形状: {generated.shape}")  # 应为 [2, 10]
+    print(f"Logits 形状: {outputs.logits.shape}")  # [2,16,32000]
+
+    # ----- 测试 step() -----
+    # 首帧
+    _, logits = model.inference_step(input_ids, attention_mask=attention_mask, reset_cache=True)
+    print(f"step() 首帧 logits: {logits.shape}")  # [2,32000]
+    # 单 token
+    next_token = torch.tensor([[1],[2]])
+    _, logits = model.inference_step(next_token)
+    print(f"step() 单 token logits: {logits.shape}")  # [2,32000]
+
+    # ----- 测试 generate -----
+    gen = model.generate(input_ids[:, :1], max_new_tokens=10, temperature=0.8)
+    print(f"生成序列形状: {gen.shape}")  # [2,10]
