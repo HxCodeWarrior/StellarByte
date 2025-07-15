@@ -133,3 +133,6 @@ def test_config_parameters(base_config, param, value):
     x = torch.randn(2, 16, config.model_dim)
     y = layer(x)
     assert y.requires_grad
+
+if __name__ == "__main__":
+    pytest.main([__file__])

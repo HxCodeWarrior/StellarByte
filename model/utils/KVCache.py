@@ -51,6 +51,7 @@ class KVCache:
     def global_length(self) -> int:
         return max(self._seq_lens)
 
+    @torch.inference_mode()
     def reset(self) -> None:
         """清空缓存内容（保留显存）"""
         if self.batch_size is None:
@@ -58,7 +59,7 @@ class KVCache:
         for buf in self.cache:
             buf["key"].zero_()
             buf["value"].zero_()
-        self.length = 0
+        self._seq_lens = [0] * self.L
     
     def to(self, device: str | torch.device) -> "KVCache":
         """将缓存迁移到其他设备"""
