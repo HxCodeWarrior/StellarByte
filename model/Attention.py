@@ -142,36 +142,47 @@ class MultiHeadSelfAttention(nn.Module):
             self._rotary_cache[seq_len] = (cos, sin, scale)
         return self._rotary_cache[seq_len]
 
-    def _build_attention_mask(
-        self,
-        T: int,
-        Tk: int,
-        additive_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    def _build_attention_mask(self, T: int, Tk: int, additive_mask: Optional[torch.Tensor]):
         """
-        返回 attn_mask：
-         - FlashAttention 分支需 [B,1,T,Tk] bool
-         - 经典分支需 [T,Tk] float(-inf) + additive_mask
+        构建注意力掩码：
+        - 因果掩码保证当前token只能attend过去及当前token
+        - padding掩码加法屏蔽无效token
+        - 支持动态长度Tk > max_seq_len的情况（动态生成因果掩码）
+    
+        参数：
+          T: query序列长度
+          Tk: key序列长度（可能包含缓存）
+          additive_mask: padding掩码，形状 [B, 1, 1, Tk]，float或bool
+    
+        返回：
+          如果使用FlashAttention，返回形状 [B, 1, T, Tk] bool掩码
+          否则返回形状 [T, Tk] 的 float掩码，True处为 -inf，用于scores相加
         """
-        # 1. 切片因果 Mask
-        causal_sq = self.full_causal_mask[:T, :Tk]  # [T,Tk]
-
-        if self.use_flash:
-            # 转为 [1,1,T,Tk]
-            flash_mask = causal_sq.unsqueeze(0).unsqueeze(1)  # bool
-            if additive_mask is not None:
-                pad_bool = additive_mask.to(torch.bool)      # [B,1,1,Tk]
-                # 广播 OR，得到 [B,1,T,Tk]
-                flash_mask = pad_bool if flash_mask is None else (flash_mask | pad_bool)
-            return flash_mask
-
+    
+        if Tk <= self.full_causal_mask.size(1):
+            # 从缓存的预先生成最大因果掩码中切片
+            causal_sq = self.full_causal_mask[:T, :Tk]  # [T,Tk] bool
         else:
-            # float mask: -inf where True
-            inf_mask = causal_sq.to(additive_mask.dtype if additive_mask is not None else torch.float32)
-            inf_mask = inf_mask.masked_fill(causal_sq, float("-inf"))  # [T,Tk]
+            # 超过缓存最大长度，动态生成上三角掩码
+            causal_sq = torch.triu(
+                torch.ones(T, Tk, dtype=torch.bool, device=self.full_causal_mask.device),
+                diagonal=1,
+            )  # [T,Tk]
+    
+        if self.use_flash:
+            # FlashAttention期望bool掩码，扩展batch和head维度
+            flash_mask = causal_sq.unsqueeze(0).unsqueeze(1)  # [1,1,T,Tk]
             if additive_mask is not None:
-                # additive_mask: [B,1,1,Tk], 经典路径直接加到 scores 上即可
-                return inf_mask
+                pad_bool = additive_mask.to(torch.bool)       # [B,1,1,Tk]
+                flash_mask = flash_mask | pad_bool             # 广播或逻辑或
+            return flash_mask
+    
+        else:
+            # 经典实现，掩码加负无穷屏蔽无效token
+            inf_mask = causal_sq.to(additive_mask.dtype if additive_mask is not None else torch.float32)
+            inf_mask = inf_mask.masked_fill(causal_sq, float("-inf"))  # True处 -inf
+            if additive_mask is not None:
+                inf_mask = inf_mask + additive_mask
             return inf_mask
 
     def forward(
@@ -187,8 +198,13 @@ class MultiHeadSelfAttention(nn.Module):
         if self.kv_cache is not None:
             # 确保 cache 在同一设备
             self.kv_cache.to(device)
+        
+        # —— 2. 获取历史缓存长度，默认为0（无缓存或训练阶段）——
+        past_len = 0
+        if self.kv_cache is not None and self.layer_id is not None:
+            past_len = self.kv_cache.layer_length(self.layer_id)  # 历史缓存长度，保证位置编码连续
 
-        # —— 2. QKV 投影 & 拆分 —— 
+        # —— 3. QKV 投影 & 拆分 —— 
         # 线性变换得到QKV，形状 [B, T, embed_dim]
         # [B,T,E] -> [B,T,3E] 再 chunk 也可，但这里单独调用
         q = self.W_q(x)
@@ -200,21 +216,35 @@ class MultiHeadSelfAttention(nn.Module):
         # KV 做 num_kv_heads 拆分后 repeat 到 num_heads
         k = k.view(B, T, self.num_local_kv_heads, self.head_dim)
         v = v.view(B, T, self.num_local_kv_heads, self.head_dim)
+        # 如果num_local_kv_heads不等于num_local_heads，重复k,v以匹配
         if self.num_local_kv_heads != self.num_local_heads:
             repeat_times = self.num_local_heads // self.num_local_kv_heads
             # 在 head 维度上平铺
             k = k.repeat_interleave(repeat_times, dim=2)
             v = v.repeat_interleave(repeat_times, dim=2)
 
-        # —— 3. Rotary Position Embedding —— 
-        # XPos Rotary 位置编码，稳定长序列建模
-        cos, sin, scale = self._get_rotary(T, device, dtype)
-        q = q * scale[None,:,None,:]
-        q = q * cos[None,:,None,:] + self.rotary._rotate_half(q * scale[None,:,None,:]) * sin[None,:,None,:]
-        k = k / scale[None,:,None,:]
-        k = k * cos[None,:,None,:] + self.rotary._rotate_half(k) * sin[None,:,None,:]
+        # —— 4. Rotary Position Embedding —— 
+        # 4.1 XPos Rotary 位置编码，生成长度为 (past_len + T) 的 cos, sin, scale，支持缓存历史拼接
+        cos_full, sin_full, scale_full = self._get_rotary(past_len + T, device, dtype)
+        # 4.2 只取当前输入位置对应的编码（即从past_len开始的切片）
+        cos = cos_full[past_len : past_len + T]   # [T, head_dim]
+        sin = sin_full[past_len : past_len + T]
+        scale = scale_full[past_len : past_len + T]
 
-        # —— 4. KV 缓存（增量推理） —— 
+        # 4.3 扩展维度用于广播
+        cos = cos[None, :, None, :]   # [1, T, 1, head_dim]
+        sin = sin[None, :, None, :]
+        scale = scale[None, :, None, :]
+
+        # Q先乘scale，旋转编码后乘cos，后半部分旋转后乘sin
+        q = q * scale
+        q = q * cos + self.rotary._rotate_half(q) * sin
+
+        # K先除scale，旋转编码后乘cos，后半部分旋转后乘sin
+        k = k / scale
+        k = k * cos + self.rotary._rotate_half(k) * sin
+
+        # —— 5. KV 缓存（增量推理） —— 
         # 增量推理时从KV缓存获取过去缓存，拼接当前KV
         if self.kv_cache is not None and self.layer_id is not None:
             past_len = self.kv_cache.layer_length(self.layer_id) 
@@ -233,13 +263,13 @@ class MultiHeadSelfAttention(nn.Module):
 
         Tk = k_cat.size(1)  # 拼接后键值长度
 
-        # —— 5. 转成 FlashAttention 要求的维度 ——
+        # —— 6. 转成 FlashAttention 要求的维度 ——
         # 调整维度为FlashAttention所需 [B, H, T, D]
         q = q.transpose(1, 2)       # [B, H, T, D]
         k_cat = k_cat.transpose(1, 2)
         v_cat = v_cat.transpose(1, 2)
 
-        # —— 6. 构建 Mask & Attention ——
+        # —— 7. 构建 Mask & Attention ——
         # 构建因果mask及padding mask
         if self.use_flash and q.is_cuda:
             attn_mask = self._build_attention_mask(T, Tk, additive_mask)
@@ -260,7 +290,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn_out = probs @ v_cat  # [B,H,T,dh]
 
 
-        # —— 7. OutPut：拼回 & 输出投影 & Residual Dropout ——
+        # —— 8. OutPut：拼回 & 输出投影 & Residual Dropout ——
         # [B, H, T, D] → [B, T, H, D]
         attn_out = attn_out.transpose(1, 2).contiguous()
         # 多头拼接，形状恢复到 [B, T, embed_dim]
