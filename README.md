@@ -8,7 +8,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange?style=flat-square&logo=pytorch)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-yellow?style=flat-square)](https://huggingface.co/)
-[![Blog](https://img.shields.io/badge/Blog-ByteWyrm=flat-square)](https://blog.devnest.top/)
+[![Blog](https://img.shields.io/badge/Blog-ByteWyrm?style=flat-square)](https://blog.devnest.top/)
 
 </div>
 
@@ -187,9 +187,17 @@ StellarByte/
 - 检查点管理组件
 - 意外中断保护组件
 2. 在模型训练过程中应用检查点管理以及意外中断保护组件
+3. 关于LoRA
+- 优化LoRA：支持热插拔、正则优化、减少内存占用提升速度
+- 测试LoRA
+4. 实现LLM的记忆管理机制
 
 #### TODO：
-1. 
+1. LoRA进一步优化
+- 非线性LoRA
+- 支持Conv2d/Transformer.Conv1d注入
+- 适配量化模块
+- Tuner冻结层选择策略
 
 
 ## 🤝 贡献指南
