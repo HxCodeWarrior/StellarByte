@@ -148,17 +148,17 @@ class MultiHeadSelfAttention(nn.Module):
         - 因果掩码保证当前token只能attend过去及当前token
         - padding掩码加法屏蔽无效token
         - 支持动态长度Tk > max_seq_len的情况（动态生成因果掩码）
-    
+
         参数：
           T: query序列长度
           Tk: key序列长度（可能包含缓存）
           additive_mask: padding掩码，形状 [B, 1, 1, Tk]，float或bool
-    
+
         返回：
           如果使用FlashAttention，返回形状 [B, 1, T, Tk] bool掩码
           否则返回形状 [T, Tk] 的 float掩码，True处为 -inf，用于scores相加
         """
-    
+
         if Tk <= self.full_causal_mask.size(1):
             # 从缓存的预先生成最大因果掩码中切片
             causal_sq = self.full_causal_mask[:T, :Tk]  # [T,Tk] bool
@@ -168,7 +168,7 @@ class MultiHeadSelfAttention(nn.Module):
                 torch.ones(T, Tk, dtype=torch.bool, device=self.full_causal_mask.device),
                 diagonal=1,
             )  # [T,Tk]
-    
+
         if self.use_flash:
             # FlashAttention期望bool掩码，扩展batch和head维度
             flash_mask = causal_sq.unsqueeze(0).unsqueeze(1)  # [1,1,T,Tk]
@@ -176,18 +176,25 @@ class MultiHeadSelfAttention(nn.Module):
                 pad_bool = additive_mask.to(torch.bool)       # [B,1,1,Tk]
                 flash_mask = flash_mask | pad_bool             # 广播或逻辑或
             return flash_mask
-    
+
         else:
             # 经典实现，掩码加负无穷屏蔽无效token
-            inf_mask = causal_sq.to(additive_mask.dtype if additive_mask is not None else torch.float32)
-            inf_mask = inf_mask.masked_fill(causal_sq, float("-inf"))  # True处 -inf
+            # 初始化为全0 float掩码
+            inf_mask = torch.zeros((T, Tk), device=self.full_causal_mask.device, dtype=torch.float32)
+            # 上三角True的位置赋值 -inf，屏蔽未来token
+            inf_mask = inf_mask.masked_fill(causal_sq, float('-inf'))
+            # 扩展维度以匹配scores形状 [1,1,T,Tk]，方便广播
+            inf_mask = inf_mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,Tk]
+
             if additive_mask is not None:
+                # additive_mask形状 [B,1,1,Tk]，广播相加
                 inf_mask = inf_mask + additive_mask
+
             return inf_mask
 
     def forward(
         self,
-        x: torch.Tensor,                      # 输入张量，形状 [B, T, embed_dim]
+        x: torch.Tensor,                               # 输入张量，形状 [B, T, embed_dim]
         additive_mask: Optional[torch.Tensor] = None,  # 可选padding掩码，形状 [B, 1, 1, T_k]
     ) -> torch.Tensor:
         B, T, _ = x.shape
@@ -247,16 +254,10 @@ class MultiHeadSelfAttention(nn.Module):
         # —— 5. KV 缓存（增量推理） —— 
         # 增量推理时从KV缓存获取过去缓存，拼接当前KV
         if self.kv_cache is not None and self.layer_id is not None:
-            past_len = self.kv_cache.layer_length(self.layer_id) 
-            if past_len > 0:
-                past_k, past_v = self.kv_cache.get(self.layer_id)  # [B, Tp, H, D]
-                k_cat = torch.cat([past_k, k], dim=1)              # 拼接历史和当前K
-                v_cat = torch.cat([past_v, v], dim=1)              # 拼接历史和当前V
-            else:
-                k_cat, v_cat = k, v
-
             # 将当前KV写入缓存（自动滑动窗口）
             self.kv_cache.append(self.layer_id, k, v)
+            # 再获取缓存中完整 KV，避免重复拼接
+            k_cat, v_cat = self.kv_cache.get(self.layer_id)  # [B, Tp, H, D]
         else:
             # 训练或无缓存推理，直接使用当前KV
             k_cat, v_cat = k, v
