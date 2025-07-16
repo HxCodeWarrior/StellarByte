@@ -419,13 +419,7 @@ def train(args, logger):
     model, tokenizer, config = init_model(args, logger)
 
     # 加载训练集
-    if args.enable_ddp:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True)
-        shuffle_flag  = False
-    else:
-        train_sampler = None
-        shuffle_flag  = True
-
+    # 1. 加载训练集
     train_dataset = PretrainDataset(
         args.train_data_path, 
         tokenizer, 
@@ -434,6 +428,14 @@ def train(args, logger):
         template=args.dataset_loader.template if args.dataset_loader.template else None,
         add_bos=args.dataset_loader.add_bos
     )
+    # 2. 根据分布式训练设置采样器
+    if args.enable_ddp:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        shuffle_flag  = False
+    else:
+        train_sampler = None
+        shuffle_flag  = True
+    # 3. 构建 Train_DataLoader
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
@@ -446,11 +448,7 @@ def train(args, logger):
     # 加载验证集（如果提供）
     val_loader = None
     if args.val_data_path:
-        if args.enable_ddp:
-            val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        else:
-            val_sampler = None
-
+        # 1. 加载验证集
         val_dataset = PretrainDataset(
             args.val_data_path, 
             tokenizer, 
@@ -459,6 +457,12 @@ def train(args, logger):
             template=args.dataset_loader.template if args.dataset_loader.template else None,
             add_bos=args.dataset_loader.add_bos
         )
+        # 2. 根据分布式训练设置采样器
+        if args.enable_ddp:
+            val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        else:
+            val_sampler = None
+        # 3. 构建 Val_DataLoader
         val_loader  = DataLoader(
             val_dataset, 
             batch_size=args.eval_batch_size, 
