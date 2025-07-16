@@ -8,7 +8,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange?style=flat-square&logo=pytorch)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-yellow?style=flat-square)](https://huggingface.co/)
-[![Blog](https://img.shields.io/badge/Blog-ByteWyrm?style=flat-square)](https://blog.devnest.top/)
+[![Blog](https://img.shields.io/badge/Blog-ByteWyrm-pink?style=flat-square)](https://blog.devnest.top/)
 
 </div>
 
@@ -116,36 +116,95 @@ model = apply_lora_to_model(model, lora_config)
 
 ```
 StellarByte/
-├── config/             # 配置类
-├── datasets/           # 数据集处理
-├── model/              # 模型组件
-│   ├── Attention.py    # 多头自注意力实现
-│   ├── DecoderLayer.py # Transformer 解码器层
-│   ├── LoRA.py         # 低秩适应实现
-│   ├── MLP.py          # 多层感知机实现
-│   ├── MoE.py          # 专家混合实现（计划中）
-│   ├── Position_Embedding.py # 位置编码实现
-│   └── RMSNorm.py      # RMS 归一化实现
-├── tokenizer/          # 分词器
-├── utils/              # 工具函数
-└── test/               # 测试代码
+|   .gitignore
+|   datasets.py
+|   LICENSE
+|   model_pretrain.py
+|   model_stf_train.py
+|   README.md
+|   requirements.txt
+|
++---checkpoints
++---configs
+|       pretrain_config.yaml
+|
++---datasets
+|   |   data_preprocessor.py
+|   |   pretrain_hq.jsonl
+|   |
+|   \---test
+|           train.jsonl
+|           val.jsonl
+|
++---logs
++---model
+|   |   Attention.py
+|   |   config.py
+|   |   DecoderLayer.py
+|   |   MLP.py
+|   |   Model.py
+|   |   MoE.py
+|   |   Position_Embedding.py
+|   |   RMSNorm.py
+|   |   __init__.py
+|   |
+|   +---utils
+|          DropPath.py
+|          KVCache.py
+|          LoRA.py
+|          Memory.py
+|          __init__.py
+|
++---model_info
++---scripts
++---test
+|   |   test_Attention.py
+|   |   test_datasets.py
+|   |   test_DeocoderLayer.py
+|   |   test_KVCache.py
+|   |   test_LoRA.py
+|   |   test_MLP.py
+|   |   test_Position_Embedding.py
+|   |   test_RMSNorm.py
+|   |
+|   +---test_results
+|
++---tokenizer
+|       special_tokens_map.json
+|       tokenizer.json
+|       tokenizer_config.json
+|
++---utils
+        checkpoint.py
+        config_params.py
+        logger.py
+        model_info.py
+        progressbar.py
 ```
 
 ## 🔜 开发计划
 
-### 2025.7.13
-#### Done:
+<details> 
+  <summary>2025.7.13</summary>
+
+### Done:
 1. 实现BaseModelConfig类，后续的超参数将逐渐迭代
 2. 实现RMSNorm层归一化类
 3. Transformer经典的MultiHeadAttention类
 
-#### TODO：
+### TODO：
 1. Attention应用KV缓存，添加量化机制
 2. 构建基础MLP层
 3. 构建基础DecoderLayer层
 
-### 2025.7.14
-#### Done:
+</details>
+
+---
+
+<details> 
+  <summary>2025.7.14</summary>
+
+### Done:
 1. 实现Attention应用缓存机制
 2. 实现Attention量化机制
 3. 实现基础MLP层
@@ -162,7 +221,7 @@ StellarByte/
 10. 实现模型训练数据集加载器包括预训练数据集加载器和STF训练数据集加载器
 10. 基本构建模型预训练流程
 
-#### TODO:
+### TODO:
 1. 构造Memory类并进行应用
 2. 应用LoRA类
 3. 构造单步推理接口 def forward_step(self, x_t, past_k, past_v) -> (out, new_k, new_v)
@@ -173,7 +232,6 @@ StellarByte/
 - num_rep 未被使用 
 - 实现 线程并行/All‑Reduce
 - 进一步融合FlashAttention-2
-- 接入RetNet
 - 线性层量化quantize() 使用了 torch.quantization.quantize_dynamic()，但这仅限于线性层 + 推理，需要进一步优化以支持GPTQ/AWQ/SmoothQuant
 6. KVCache
 将 KVCache.append() 改为支持：
@@ -181,8 +239,14 @@ StellarByte/
 - 写入位置并发锁定（if multi-thread）
 - Layer-wise token位置自动偏移计算
 
-### 2025.7.15
-#### Done:
+</details>
+
+---
+
+<details>
+  <summary>2025.7.15</summary>
+
+### Done:
 1. 构建并优化模型训练组件：
 - 检查点管理组件
 - 意外中断保护组件
@@ -199,16 +263,15 @@ StellarByte/
 - 统一计算精度为float32以提高数值稳定性
 8. KVCache添加滑动窗口截断处理
 
-#### TODO：
+### TODO：
 1. LoRA进一步优化
 - 非线性LoRA
 - 支持Conv2d/Transformer.Conv1d注入
 - 适配量化模块
 - Tuner冻结层选择策略
 2. Attention:
-- 实现 线程并行/All‑Reduce
+- 实现线程并行/All‑Reduce
 - 进一步融合FlashAttention-2
-- 接入RetNet
 3. 测试
 - 测试数据集加载器
 - 测试LoRA
@@ -218,6 +281,60 @@ StellarByte/
 ### DEBUG
 1. 工具脚本分析模型信息报错
 
+</details>
+
+---
+
+<details>
+  <summary>2025.7.16</summary>
+
+### Done:
+1. 实现分布式多卡训练
+2. 实现张量/模型并行
+3. 整合模型训练参数，并构造参数读取器
+4. 优化显存占用、提升吞吐速度
+- 新增可控梯度检查点
+- 指定step后清理无用现存
+- 新增FlashAttention可控开关
+5. Attention 多头注意力机制优化
+- 进一步融合FlashAttention-2
+- 新增模型/张量并行处理
+6. 模型分析脚本 model_info.py 修复如下问题：
+- analyze_performance(),每次切换 batch_size 前，把 KVCache 清零并把 batch_size 设回 None，让下一轮 forward 自动重新分配缓存。
+7. 测试脚本通过
+- Attention测试
+- datasets数据集加载器测试
+- LoRA测试
+8. 优化数据集加载器
+- 掩码从01转换为bool类型
+- 优化截断处理
+9. tokenizer修复：处理tokenizer的pad填充与eos_token一样导致填充混乱，分别使用特殊标识
+10. LoRA修复如下问题：
+- 权重合并的线程锁作用域过大
+- 确保 LoRA 增量计算 时数据类型统一为LoRA统一参数类型self.cfg.dtype or torch.float32
+- 解决 LoRA注入风险，注入前判断模块是否已经是 LoRALinear，跳过注入
+- 解决 LoRALinear 内部权重布局与 fan_in_fan_out 关联不足 问题，在 forward 阶段增量计算时根据 fan_in_fan_out 转置 LoRA 参数
+- 解决 多适配器热切换的 activate() 未解除旧 LoRA 权重占用显存 问题，保存原始层引用，deactivate 时恢复原始层，彻底卸载旧 LoRA层
+- 使用 安全 torch.load(), 当前默认 weights_only=False，但官方已宣布未来会改为 True，因此构建自动检测是否使用该参数导入函数
+11. KVCache修复如下问题：
+- 当 T_new >= self.max_T 条件成立时，overflow 被赋值了，但 current_len 没有被赋值。append函数中，给 current_len 赋一个初始值，且无论哪条分支都保证 current_len 已定义。
+13. 使用模型分析脚本对模型进行初步分析
+
+
+### TODO:
+1. 实现DeepSeed
+2. 实现动态剪枝
+- Attention动态剪枝
+- KVCache动态剪枝
+3. 数据集加载器针对大数据集进行streaming优化
+4. 模型分析脚本
+- 绘图中文不显示
+- 模型层级结构分析不透彻
+- 添加模型层级结构绘图可视化
+
+</details>
+
+---
 
 ## 🤝 贡献指南
 

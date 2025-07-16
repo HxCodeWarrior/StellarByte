@@ -198,8 +198,9 @@ class ModelInfo:
         # 2. 每层详细信息
         layers_info = []
         for i, layer in enumerate(self.model.layers):
+            # print(layer)
             # 注意力层信息
-            attn = layer.attn
+            attn = layer.self_attn
             attn_info = {
                 "num_heads": attn.num_heads,
                 "head_dim": attn.head_dim,
@@ -210,7 +211,7 @@ class ModelInfo:
             # MLP层信息
             mlp = layer.mlp
             mlp_info = {
-                "hidden_dim": mlp.hidden_dim,
+                "hidden_dim": mlp.w1.out_features,
                 "up_params": mlp.w1.weight.numel(),
                 "gate_params": mlp.w2.weight.numel() if hasattr(mlp, "w2") else 0,
                 "down_params": mlp.w3.weight.numel()
@@ -444,7 +445,7 @@ class ModelInfo:
         return self.compute_stats
     
     def analyze_performance(self, batch_sizes: List[int] = [1, 4, 16], 
-                           seq_lengths: List[int] = [128, 512, 2048]) -> Dict[str, Any]:
+                       seq_lengths: List[int] = [128, 512, 2048]) -> Dict[str, Any]:
         """分析模型推理性能
         
         Args:
@@ -465,16 +466,23 @@ class ModelInfo:
         self.model.to(self.device)
         self.model.eval()
         
+        # 获取模型参数的数据类型
+        model_dtype = next(self.model.parameters()).dtype
+        
         results = {}
         
         # 预热
+        warmup_bs = batch_sizes[0]          # 用第一个 batch_size 预热
+        dummy_input = torch.randint(0, 100, (warmup_bs, 128), device=self.device)
         with torch.no_grad():
-            dummy_input = torch.randint(0, 100, (1, 128), device=self.device)
-            for _ in range(10):
                 _ = self.model(dummy_input)
         
         # 测试不同批次大小和序列长度的组合
         for batch_size in batch_sizes:
+            if getattr(self.model, "kv_cache", None) is not None:
+                self.model.kv_cache.reset()          # 清 token
+                self.model.kv_cache.batch_size = None  # 允许重新分配
+
             batch_results = {}
             for seq_len in seq_lengths:
                 # 跳过可能导致OOM的组合
@@ -482,8 +490,8 @@ class ModelInfo:
                     batch_results[seq_len] = {"error": "可能导致OOM，已跳过"}
                     continue
                 
-                # 生成随机输入
-                input_ids = torch.randint(0, 100, (batch_size, seq_len), device=self.device)
+                # 生成随机输入，使用模型的数据类型
+                input_ids = torch.randint(0, 100, (batch_size, seq_len), device=self.device, dtype=torch.long)
                 
                 # 测量前向传播时间
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -510,8 +518,11 @@ class ModelInfo:
         # 测量生成速度（自回归解码）
         gen_results = {}
         for batch_size in [1, 2, 4]:
-            # 生成随机输入
-            input_ids = torch.randint(0, 100, (batch_size, 10), device=self.device)
+            if getattr(self.model, "kv_cache", None) is not None:
+                self.model.kv_cache.reset()
+                self.model.kv_cache.batch_size = None
+            # 生成随机输入，使用模型的数据类型
+            input_ids = torch.randint(0, 100, (batch_size, 10), device=self.device, dtype=torch.long)
             
             # 测量生成时间
             torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -522,7 +533,8 @@ class ModelInfo:
                     # 模拟生成50个token
                     for i in range(50):
                         outputs = self.model(input_ids)
-                        next_token = torch.argmax(outputs[:, -1, :], dim=-1).unsqueeze(-1)
+                        logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
+                        next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
                         input_ids = torch.cat([input_ids, next_token], dim=1)
             
             torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -543,12 +555,13 @@ class ModelInfo:
             "forward_pass": results,
             "generation": gen_results,
             "device": str(self.device),
+            "dtype": str(model_dtype),  # 记录使用的数据类型
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
         
         self._analyzed_perf = True
         return self.perf_stats
-    
+
     def generate_report(self, output_dir: Optional[str] = None, 
                        include_plots: bool = True) -> str:
         """生成详细的模型分析报告
@@ -889,9 +902,9 @@ def main():
     
     parser = argparse.ArgumentParser(description="StellarByte模型分析工具")
     parser.add_argument("--model_path", type=str, default= "",help="模型路径或名称")
-    parser.add_argument("--config_path", type=str, default="D:/Objects/StellarByte/model/config.py", help="配置文件路径")
+    parser.add_argument("--config_path", type=str, default="", help="配置文件路径")
     parser.add_argument("--output_dir", type=str, default="D:/Objects/StellarByte/model_info", help="报告输出目录")
-    parser.add_argument("--no_plots", type=bool, default=True, help="不生成可视化图表")
+    parser.add_argument("--generate_plots", type=bool, default=True, help="是否生成可视化图表")
     parser.add_argument("--analyze_perf", type=bool, default=True , help="分析性能（可能需要较长时间）")
     
     args = parser.parse_args()
@@ -936,7 +949,7 @@ def main():
     print("生成分析报告...")
     report_file = model_info.generate_report(
         output_dir=args.output_dir,
-        include_plots=not args.no_plots
+        include_plots=args.generate_plots
     )
     
     print(f"分析完成！报告已保存至: {report_file}")
