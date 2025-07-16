@@ -27,6 +27,17 @@ dataset:                  # ▶ 数据与 DataLoader
   test_data_path:  ./datasets/test/test.jsonl    # 若无验证集可留空
   num_workers: 4
 
+dataset_loader:            # ▶ 数据集加载器配置（对应 PretrainDataset 和 SFTDataset）
+  max_length: 512          # 最大序列长度（Token级）
+  fields:                  # 需要拼接的字段列表，适用于 PretrainDataset
+    - input
+    - output
+  template: "问:{input} 答:{output}"   # 拼接模板，支持格式化字段；无则为 None 或空字符串
+  add_bos: true            # 是否添加BOS token（如 GPT 风格）
+  sft_special_tokens:      # SFTDataset 特殊标记配置（默认无需修改，留空即可）
+    assistant_start_str: "<|im_start|>assistant\n"
+    im_end_str: "<|im_end|>"
+    
 model:                    # ▶ 网络结构
   vocab_size: 32000
   dim: 768                # 隐藏维度
