@@ -83,8 +83,6 @@ model:                    # ▶ 网络结构
     value_dtype: float16
   parallel:               # 张量/模型并行
     model_parallel_size:  1
-    tensor_parallel_size: 1
-    tensor_parallel_rank: 0
 
 optimizer:                # ▶ AdamW
   learning_rate: 5.0e-5

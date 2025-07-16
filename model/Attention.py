@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing             import Optional, Dict, Tuple
 try:
     from .config             import ByteModelConfig
@@ -46,22 +47,41 @@ class MultiHeadSelfAttention(nn.Module):
         num_layers: Optional[int] = None
     ):
         super().__init__()
+
+        # ---------- 头部参数 ----------
         # 根据是否指定n_kv_heads，确定用于键（key）和值（value）的头的数量。
         self.num_kv_heads = args.num_kv_heads or args.num_attention_heads
-        # 基本维度
         assert args.num_attention_heads % args.num_kv_heads == 0, "num_attention_heads 必须能被 num_kv_heads 整除"
-
         self.embed_dim = args.model_dim
         self.num_heads = args.num_attention_heads
+
+        # ---------- 张量并行 ----------
+        self.model_parallel_size = max(1, args.model_parallel_size)
         # 计算头数，等于总头数除以模型并行处理大小。
-        self.num_local_heads = args.num_attention_heads // args.model_parallel_size
+        self.num_local_heads = args.num_attention_heads // self.model_parallel_size
         # 本地键值头数，等于键值头数除以模型并行处理大小。
-        self.num_local_kv_heads = args.num_kv_heads // args.model_parallel_size
+        self.num_local_kv_heads = args.num_kv_heads // self.model_parallel_size
         # 重复次数，用于扩展键和值的尺寸。
         self.num_rep = self.num_heads // self.num_local_kv_heads
         # 每个头的维度，等于模型维度除以头的总数。
-        self.head_dim = args.model_dim // args.num_attention_heads
+        self.head_dim = args.model_dim // self.num_attention_heads
         self.scale = torch.rsqrt(torch.tensor(self.head_dim, dtype=torch.float32))
+
+        # ---- 模型并行通信组初始化 ----
+        if self.model_parallel_size > 1:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            # 为张量并行单独建子组（同 rank % mp == gid）
+            world = dist.get_world_size()
+            ranks  = [r for r in range(world)
+                      if r % self.model_parallel_size == dist.get_rank() % self.model_parallel_size]
+            self.mp_group = dist.new_group(ranks=ranks, backend="nccl")
+            self.mp_world_size = len(ranks)
+            self.mp_rank = ranks.index(dist.get_rank())
+        else:
+            self.mp_group = None
+            self.mp_world_size = 1
+            self.mp_rank = 0
 
         # ---- 特性开关 ----
         self.use_flash = args.use_flash_attention
@@ -266,17 +286,17 @@ class MultiHeadSelfAttention(nn.Module):
 
         # —— 7. 构建 Mask & Attention ——
         # 构建因果mask及padding mask
-        if self.use_flash and q.is_cuda:
+        if self.use_flash:
             attn_mask = self._build_attention_mask(T, Tk, additive_mask)
             attn_out = F.scaled_dot_product_attention(
                 q, k_cat, v_cat,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=self.causal
             )
         else:
-            scores = ( q.to(compute_dtype)
-                  @ k_cat.to(compute_dtype).transpose(-1,-2) ) \
-                  * self.scale.to(compute_dtype)  # [B,H,T,Tk]
+            # 经典 Attention 实现，支持增量推理
+            scores = ( q.to(compute_dtype) @ k_cat.to(compute_dtype).transpose(-1,-2) ) * self.scale.to(compute_dtype)  # [B,H,T,Tk]
             if additive_mask is not None:
                 scores = scores + additive_mask.to(compute_dtype)
             if self.causal:
@@ -294,7 +314,13 @@ class MultiHeadSelfAttention(nn.Module):
         attn_out = attn_out.view(B, T, self.embed_dim)
         # 输出线性映射
         attn_out = self.W_o(attn_out)
-        # 残差dropout
+
+        # —— 9. 张量并行 All‑Reduce 汇聚 ——
+        if self.mp_world_size > 1:
+            dist.all_reduce(attn_out, op=dist.ReduceOp.SUM, group=self.mp_group)
+            attn_out = attn_out / self.mp_world_size
+        
+        # —— 10. 残差dropout连接并返回 ——
         attn_out = self.resid_dropout(attn_out)
 
         return attn_out
