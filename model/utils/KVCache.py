@@ -114,13 +114,13 @@ class KVCache:
         assert B == self.batch_size, "batch_size 不一致"
 
         # —— 2. 若一次输入超过窗口，就直接截断 ——
+        current_len = self._seq_lens[layer_id]  # 统一提前赋值
         if T_new >= self.max_T:  # 只保留最近 max_T
             key  = key[:, -self.max_T:]
             value = value[:, -self.max_T:]
             T_new = self.max_T
-            overflow = self._seq_lens[layer_id]  # 全部被替换
+            overflow = current_len  # 全部被替换
         else:
-            current_len = self._seq_lens[layer_id]
             overflow = max(0, current_len + T_new - self.max_T)
 
         buf = self.cache[layer_id]
