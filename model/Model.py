@@ -132,10 +132,10 @@ class ByteTransformer(PreTrainedModel):
         if self.kv_cache is not None:
             self.kv_cache.reset()
     
-    def enable_gradient_checkpointing(self):
+    def gradient_checkpointing_enable(self):
         """为所有 DecoderLayer 打开 Torch Utils Checkpoint，加速训练"""
         for layer in self.layers:
-            layer.enable_gradient_checkpointing = True
+            layer.gradient_checkpointing_enable = True
         return self
 
     def compile(self, mode: str = "default"):

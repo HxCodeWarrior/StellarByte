@@ -15,6 +15,20 @@ experiment:               # ▶ 实验基础信息
     experiment_name: Pretrain-StellarByte-LLM
     api_key: ""           # ← 请填入你的 API KEY
 
+training:                 # ▶ 训练流程
+  batch_size: 32
+  epochs: 5
+  accumulation_steps: 8   # 梯度累积
+  grad_clip: 1.0
+  grad_checkpoint:  True
+  use_torch_compile: True
+  compile_mode: max-autotune
+  empty_cache_interval: 100
+
+evaluation:               # ▶ 验证
+  eval_batch_size: 64
+  eval_max_steps:  100
+
 distributed:              # ▶ 分布式&设备
   enable_ddp: false       # true→使用 torchrun 启动 DDP
   local_rank: -1          # torchrun 会自动注入
@@ -29,10 +43,9 @@ dataset:                  # ▶ 数据与 DataLoader
 
 dataset_loader:            # ▶ 数据集加载器配置（对应 PretrainDataset 和 SFTDataset）
   max_length: 512          # 最大序列长度（Token级）
-  fields:                  # 需要拼接的字段列表，适用于 PretrainDataset
-    - input
-    - output
-  template: "问:{input} 答:{output}"   # 拼接模板，支持格式化字段；无则为 None 或空字符串
+  fields:                  # 需要拼接的字段列表，适用于 PretrainDataset，如：input、output、thinking
+    - text
+  template: ""             # 拼接模板，支持格式化字段；无则为 None 或空字符串，示例："问:{input} 答:{output}"
   add_bos: true            # 是否添加BOS token（如 GPT 风格）
   sft_special_tokens:      # SFTDataset 特殊标记配置（默认无需修改，留空即可）
     assistant_start_str: "<|im_start|>assistant\n"
@@ -73,12 +86,6 @@ model:                    # ▶ 网络结构
     tensor_parallel_size: 1
     tensor_parallel_rank: 0
 
-training:                 # ▶ 训练流程
-  batch_size: 32
-  epochs: 5
-  accumulation_steps: 8   # 梯度累积
-  grad_clip: 1.0
-
 optimizer:                # ▶ AdamW
   learning_rate: 5.0e-5
   min_lr:        5.0e-6
@@ -103,7 +110,3 @@ logging:                  # ▶ 日志与检查点
   keep_latest:     5
   keep_epoch:      10
   keep_best:       3
-
-evaluation:               # ▶ 验证
-  eval_batch_size: 64
-  eval_max_steps:  100

@@ -1,14 +1,8 @@
 import os
 import sys
-import socket
 import math
 import time
-import signal
-import json
 import random
-import argparse
-import multiprocessing as mp
-from datetime import datetime
 from contextlib import nullcontext
 
 import torch
@@ -36,6 +30,11 @@ from utils.logger import get_logger
 from utils.config_params import load_config
 
 console = Console()
+
+# ========= 全局性能 / 显存优化（新增） =========
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 减碎片 :contentReference[oaicite:0]{index=0}
+torch.backends.cuda.matmul.allow_tf32 = True        # Ampere+ TF32 ⾃动降精度
+torch.backends.cudnn.benchmark = True               # cuDNN 算法自动搜索
 
 # -----------------------------------------------------------------------------
 # 随机种子与学习率调度器
@@ -215,7 +214,18 @@ def init_model(args, logger):
     # 3. 构建模型
     model = ByteTransformer(config).to(args.device)
 
-    # 4. 并行包装
+    # 4. 梯度检查点
+    if getattr(args, "grad_checkpoint", False):
+        model.gradient_checkpointing_enable()
+        logger.info("✅ 已启用 Gradient Checkpointing")
+ 
+    # 5. torch.compile（吞吐+显存双赢）
+    if getattr(args, "use_torch_compile", False) and hasattr(torch, "compile"):
+        mode = getattr(args, "compile_mode", "max-autotune")
+        model = torch.compile(model, mode=mode, fullgraph=False)
+        logger.info(f"🚀 torch.compile(mode='{mode}') 已启用")  # :contentReference[oaicite:1]{index=1}
+ 
+    # 6. 并行包装
     if args.enable_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -226,7 +236,7 @@ def init_model(args, logger):
     elif torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
-    # 5. 打印参数规模
+    # 7. 打印参数规模
     param_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"模型参数总量: {param_cnt/1e6:.2f}M")
 
@@ -299,6 +309,9 @@ def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
         # 遍历数据集
         # --------------------------------------------------
         for step, batch in enumerate(dataloader, 1):
+            # 每 N 步再清一次，避免强同步导致吞吐下降
+            if (step % args.empty_cache_interval) == 0:
+                torch.cuda.empty_cache()
             input_ids          = batch["input_ids"].to(args.device)
             labels             = batch["labels"].to(args.device)
             tokens_this_batch  = input_ids.numel()
@@ -406,17 +419,21 @@ def train(args, logger):
     model, tokenizer, config = init_model(args, logger)
 
     # 加载训练集
-    train_dataset = PretrainDataset(
-        args.train_data_path, 
-        tokenizer, 
-        max_length=config.max_seq_len
-    )
     if args.enable_ddp:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         shuffle_flag  = False
     else:
         train_sampler = None
         shuffle_flag  = True
+
+    train_dataset = PretrainDataset(
+        args.train_data_path, 
+        tokenizer, 
+        max_length=config.max_seq_len,
+        fields=args.dataset_loader.fields,
+        template=args.dataset_loader.template if args.dataset_loader.template else None,
+        add_bos=args.dataset_loader.add_bos
+    )
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
@@ -429,15 +446,19 @@ def train(args, logger):
     # 加载验证集（如果提供）
     val_loader = None
     if args.val_data_path:
-        val_dataset = PretrainDataset(
-            args.val_data_path, 
-            tokenizer, 
-            max_length=config.max_seq_len
-        )
         if args.enable_ddp:
             val_sampler = DistributedSampler(val_dataset, shuffle=False)
         else:
             val_sampler = None
+
+        val_dataset = PretrainDataset(
+            args.val_data_path, 
+            tokenizer, 
+            max_length=config.max_seq_len,
+            fields=args.dataset_loader.fields,
+            template=args.dataset_loader.template if args.dataset_loader.template else None,
+            add_bos=args.dataset_loader.add_bos
+        )
         val_loader  = DataLoader(
             val_dataset, 
             batch_size=args.eval_batch_size, 
@@ -530,6 +551,12 @@ if __name__ == "__main__":
 
     # ==== 日志 ====
     logger = get_logger(args.logging.logs_dir, "pretrain-distributed")
+
+    # ==== 自动降级为 CPU（若无 CUDA）====                         
+    if args.device.startswith("cuda") and not torch.cuda.is_available():  
+        logger.warning("⚠️  当前环境未检测到 CUDA，已自动回退到 CPU 训练模式。")    
+        args.device = "cpu"
+        args.enable_ddp = False
 
     # ==== 初始化分布式 ====
     init_distributed(args)
