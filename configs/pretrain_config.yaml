@@ -1,52 +1,98 @@
-seed: 42
-device: cuda
-tokenizer_path: "./tokenizer"
-train_data_path: "./data/train.jsonl"
-val_data_path: "./data/val.jsonl"
-out_dir: "./checkpoints"
-vocab_size: 32000
-model_dim: 768
-num_layers: 12
-num_attention_heads: 12
-num_kv_heads: 6
-dim_multiplier: 4
-max_seq_len: 2048
-drop_path_prob: 0.0
-hidden_dropout_prob: 0.1
-attention_dropout_prob: 0.1
-residual_dropout_prob: 0.1
-layer_norm_eps: 1e-5
-initializer_range: 0.02
-layerscale_init: 1e-5
-tie_word_embeddings: true
-xpos_rope_theta: 10000.0
-xpos_scale_base: 512.0
-use_flash_attention: true
-use_causal: true
-use_cache: false
-key_cache_dtype: float16
-value_cache_dtype: float16
-model_parallel_size: 1
-tensor_parallel_size: 1
-tensor_parallel_rank: 0
-batch_size: 32
-epochs: 5
-accumulation_steps: 8
-grad_clip: 1.0
-learning_rate: 5e-5
-min_lr: 5e-6
-weight_decay: 0.01
-warmup_steps_ratio: 0.05
-warmup_start_lr: 5e-7
-lr_decay_rate: 0.8
-lr_decay_steps_ratio: 0.3
-num_restarts: 0
-dtype: bfloat16
-amp: false
-log_interval: 100
-save_interval: 1000
-eval_interval: 2000
-max_checkpoints: 5
-eval_batch_size: 64
-eval_max_steps: 100
-num_workers: 4
+# =======================================================================
+#  文件: pretrain_config.yaml
+#  说明: Byte‑Transformer 预训练/继续训练的统一配置
+#        ├─ 一级键 = 功能模块
+#        └─ 二级键 = 具体超参
+#  ⚠️注意：YAML 规范要求键和值之间必须有一个空格
+#         可按需增删；键名若改动，记得调整代码中的读取逻辑
+# =======================================================================
+
+experiment:               # ▶ 实验基础信息
+  seed: 42                # 全局随机种子，保证可复现
+  use_swanlab: false      # 是否启用 SwanLab 实验可视化
+  swanlab:                # SwanLab 相关设置
+    project: StellarByte-LLM
+    experiment_name: Pretrain-StellarByte-LLM
+    api_key: ""           # ← 请填入你的 API KEY
+
+distributed:              # ▶ 分布式&设备
+  enable_ddp: false       # true→使用 torchrun 启动 DDP
+  local_rank: -1          # torchrun 会自动注入
+  device: cpu            # "cuda" / "cpu"
+
+dataset:                  # ▶ 数据与 DataLoader
+  tokenizer_path: ./tokenizer
+  train_data_path: ./datasets/test/train.jsonl
+  val_data_path:   ./datasets/test/val.jsonl     # 若无验证集可留空
+  test_data_path:  ./datasets/test/test.jsonl    # 若无验证集可留空
+  num_workers: 4
+
+model:                    # ▶ 网络结构
+  vocab_size: 32000
+  dim: 768                # 隐藏维度
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 8
+  hidden_dim: null        # null→按 4×dim 推断
+  dim_multiplier: 4
+  max_seq_len: 2048
+  dropout:                # 各类 Dropout
+    drop_path_prob:         0.0
+    hidden_dropout_prob:    0.1
+    attention_dropout_prob: 0.1
+    residual_dropout_prob:  0.1
+  norm:
+    layer_norm_eps:    1.0e-5
+    initializer_range: 0.02
+    layerscale_init:   1.0e-5
+  embeddings:
+    tie_word_embeddings: false
+  xpos:                   # XPos‑RoPE 位置编码
+    rope_theta: 10000.0
+    scale_base: 512.0
+  attention:
+    use_flash_attention: false
+    use_causal: true
+  kv_cache:               # 推理加速
+    use_cache: true
+    key_dtype: float16    # float16 / bfloat16 / float32
+    value_dtype: float16
+  parallel:               # 张量/模型并行
+    model_parallel_size:  1
+    tensor_parallel_size: 1
+    tensor_parallel_rank: 0
+
+training:                 # ▶ 训练流程
+  batch_size: 32
+  epochs: 5
+  accumulation_steps: 8   # 梯度累积
+  grad_clip: 1.0
+
+optimizer:                # ▶ AdamW
+  learning_rate: 5.0e-5
+  min_lr:        5.0e-6
+  weight_decay:  0.01
+
+lr_scheduler:             # ▶ 余弦 + 线性预热 + 周期重启
+  warmup_steps_ratio:   0.05
+  warmup_start_lr:      5.0e-7
+  lr_decay_rate:        0.8
+  lr_decay_steps_ratio: 0.3
+  num_restarts:         0
+
+precision:                # ▶ 混合精度
+  dtype: bfloat16         # float32 / float16 / bfloat16
+  amp: false              # 额外启用 torch.cuda.amp（与 dtype 互斥）
+
+logging:                  # ▶ 日志与检查点
+  logs_dir:        ./logs
+  checkpoints_dir: ./checkpoints
+  log_interval:    100
+  save_interval:   1000
+  keep_latest:     5
+  keep_epoch:      10
+  keep_best:       3
+
+evaluation:               # ▶ 验证
+  eval_batch_size: 64
+  eval_max_steps:  100
