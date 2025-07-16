@@ -1,3 +1,4 @@
+import sys
 import math
 import torch
 import torch.nn as nn
@@ -50,10 +51,10 @@ class MultiHeadSelfAttention(nn.Module):
 
         # ---------- 头部参数 ----------
         # 根据是否指定n_kv_heads，确定用于键（key）和值（value）的头的数量。
+        self.num_heads = args.num_attention_heads
         self.num_kv_heads = args.num_kv_heads or args.num_attention_heads
         assert args.num_attention_heads % args.num_kv_heads == 0, "num_attention_heads 必须能被 num_kv_heads 整除"
         self.embed_dim = args.model_dim
-        self.num_heads = args.num_attention_heads
 
         # ---------- 张量并行 ----------
         self.model_parallel_size = max(1, args.model_parallel_size)
@@ -64,18 +65,19 @@ class MultiHeadSelfAttention(nn.Module):
         # 重复次数，用于扩展键和值的尺寸。
         self.num_rep = self.num_heads // self.num_local_kv_heads
         # 每个头的维度，等于模型维度除以头的总数。
-        self.head_dim = args.model_dim // self.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
         self.scale = torch.rsqrt(torch.tensor(self.head_dim, dtype=torch.float32))
 
         # ---- 模型并行通信组初始化 ----
         if self.model_parallel_size > 1:
+            backend="nccl" if torch.cuda.is_available() and sys.platform != "win32" else "gloo"
             if not dist.is_initialized():
-                dist.init_process_group(backend="nccl")
+                dist.init_process_group(backend=backend)
             # 为张量并行单独建子组（同 rank % mp == gid）
             world = dist.get_world_size()
             ranks  = [r for r in range(world)
                       if r % self.model_parallel_size == dist.get_rank() % self.model_parallel_size]
-            self.mp_group = dist.new_group(ranks=ranks, backend="nccl")
+            self.mp_group = dist.new_group(ranks=ranks, backend=backend)
             self.mp_world_size = len(ranks)
             self.mp_rank = ranks.index(dist.get_rank())
         else:
@@ -143,15 +145,6 @@ class MultiHeadSelfAttention(nn.Module):
         mask = self.head_mask.clone()
         mask[heads] = False
         self.head_mask = mask
-
-    def quantize(self):
-        """动态量化线性层"""
-        if not self.quantized:
-            self.W_q = torch.quantization.quantize_dynamic(self.W_q, {nn.Linear}, dtype=torch.qint8)
-            self.W_k = torch.quantization.quantize_dynamic(self.W_k, {nn.Linear}, dtype=torch.qint8)
-            self.W_v = torch.quantization.quantize_dynamic(self.W_v, {nn.Linear}, dtype=torch.qint8)
-            self.W_o = torch.quantization.quantize_dynamic(self.W_o, {nn.Linear}, dtype=torch.qint8)
-            self.quantized = True
 
     def _build_attention_mask(self, T: int, Tk: int, additive_mask: Optional[torch.Tensor]):
         """
@@ -370,6 +363,7 @@ if __name__ == "__main__":
     )
 
     attn_kvcache = MultiHeadSelfAttention(args, kv_cache=kv_cache)
+    print(attn_kvcache)
     
     # 模拟自回归生成过程
     for i in range(seq_len):
