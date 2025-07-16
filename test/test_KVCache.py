@@ -142,4 +142,4 @@ def test_dtypes():
 
 # ---- 直接运行脚本时也执行全部测试 ----
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main(["-v", __file__])

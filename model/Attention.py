@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing             import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple
 try:
     from .config             import ByteModelConfig
     from .utils.KVCache      import KVCache

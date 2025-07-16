@@ -131,8 +131,8 @@ class KVCache:
             if keep_len > 0:  # 仅当有内容需要保留时才复制
                 src = slice(overflow, overflow + keep_len)   # 旧 token
                 dst = slice(0, keep_len)                    # 左移后位置
-                buf["key"][:, dst].copy_(buf["key"][:, src])
-                buf["value"][:, dst].copy_(buf["value"][:, src])
+                buf["key"][:, dst].copy_(buf["key"][:, src].clone())
+                buf["value"][:, dst].copy_(buf["value"][:, src].clone())
 
         # —— 4. 写入新 token ——
         start = min(self._seq_lens[layer_id], self.max_T) - overflow

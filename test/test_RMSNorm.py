@@ -106,4 +106,4 @@ class TestRMSNorm:
         assert not torch.all(rms_norm.weight.grad == 0)
 
 if __name__ == "__main__":
-    pytest.main(["-v", "-s", "./test/test_RMSNorm.py"])
+    pytest.main(["-v", __file__])

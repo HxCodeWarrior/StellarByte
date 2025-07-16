@@ -155,4 +155,4 @@ def test_numerical_stability(config):
     assert not torch.isinf(xk_rot).any()
 
 if __name__ == "__main__":
-    pytest.main(["-v", "-s", "./test/test_Position_Embedding.py"])
+    pytest.main(["-v", __file__])

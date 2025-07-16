@@ -155,4 +155,4 @@ def test_variable_sequence_length(seq_len, config):
     assert output.shape == (2, seq_len, config.model_dim)
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main(["-v", __file__])

@@ -135,4 +135,4 @@ def test_config_parameters(base_config, param, value):
     assert y.requires_grad
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main(["-v", __file__])

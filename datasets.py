@@ -19,8 +19,8 @@ class BaseDataset(Dataset):
 
         # 2) 若 tokenizer 没有 pad_token，则动态注入一个占位符
         if tokenizer.pad_token is None:
-            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|pad|>'.")
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|PAD|>'.")
+            tokenizer.add_special_tokens({"pad_token": "<|PAD|>"})
             # ⬆️ 上层（model 初始化处）需调用 model.resize_token_embeddings
 
         # 3) 最终的 pad_token_id（注入后一定存在）
@@ -317,44 +317,4 @@ class SFTDataset(BaseDataset):
 
 
 if __name__ == "__main__":
-    # 1. 创建虚拟分词器
-    class DummyTokenizer:
-        bos_token = "[BOS]"
-        eos_token = "[EOS]"
-        pad_token_id = 0
-        
-        def encode(self, text, **kwargs):
-            return [ord(c) for c in text]  # 简单字符编码
-    
-    # 2. 创建测试数据文件
-    test_data = [
-        {"input": "你好", "output": "世界"},
-        {"input": "测试", "output": "数据集"}
-    ]
-    with open("test_data.jsonl", "w") as f:
-        for item in test_data:
-            f.write(json.dumps(item) + "\n")
-    
-    # 3. 初始化数据集
-    tokenizer = DummyTokenizer()
-    dataset = PretrainDataset(
-        data_path="test_data.jsonl",
-        tokenizer=tokenizer,
-        max_length=10,
-        fields=["input", "output"],
-        template="问:{input} 答:{output}"
-    )
-    
-    # 4. 测试样本获取
-    print(f"数据集大小: {len(dataset)}")
-    sample = dataset[0]
-    input_tensor = sample["input_ids"]
-    label_tensor = sample["labels"]
-    mask_tensor  = sample["loss_mask"]
-
-    print("\n输入张量:",  input_tensor)
-    print("标签张量:",  label_tensor)
-    print("掩码张量:",  mask_tensor)
-    
-    # 5. 清理测试文件
-    os.remove("test_data.jsonl")
+    pass

@@ -56,12 +56,13 @@ class LoRALinear(nn.Module):
         self.in_features  = in_features                    # 输入维度
         self.out_features = out_features                   # 输出维度
         self.device       = device or torch.device("cpu")  # 默认在 CPU 上初始化
+        self.dtype        = self.cfg.dtype or torch.float32
 
         # ---------------- 原始权重 W, b ---------------- #
         # 注意：此处不直接调用 nn.Linear，而是手动创建 weight/bias，
         # 便于灵活控制 requires_grad 与权重布局。
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=self.device))
-        self.bias   = nn.Parameter(torch.empty(out_features, device=self.device)) if bias else None
+        self.weight  = nn.Parameter(torch.empty(out_features, in_features, device=self.device, dtype=self.dtype))
+        self.bias    = nn.Parameter(torch.empty(out_features, device=self.device, dtype=self.dtype)) if bias else None
         self.reset_parameters()  # 初始化权重
 
         # ---------------- LoRA 增量参数 ---------------- #
@@ -69,14 +70,14 @@ class LoRALinear(nn.Module):
         if self.r > 0 and self.cfg.enable_lora:
             # A: [r, in_features]   B: [out_features, r]
             self.lora_A = nn.Parameter(
-                torch.zeros(self.r, in_features, dtype=self.cfg.dtype, device=self.device, requires_grad=True)
+                torch.zeros(self.r, in_features, dtype=self.dtype, device=self.device, requires_grad=True)
             )
             self.lora_B = nn.Parameter(
-                torch.zeros(out_features, self.r, dtype=self.cfg.dtype, device=self.device, requires_grad=True)
+                torch.zeros(out_features, self.r, dtype=self.dtype, device=self.device, requires_grad=True)
             )
-            # 初始化：A 用 Kaiming，B 用零；与原论文一致
+            # 初始化：A/B 用 Kaiming，B 用零(论文推荐)
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B)
+            nn.init.kaiming_uniform_(self.lora_B, a=math.sqrt(5))
 
             # LoRA 缩放系数；scaling = alpha / r
             self.scaling: float = self.cfg.alpha / self.r
@@ -136,12 +137,11 @@ class LoRALinear(nn.Module):
         if self.r == 0 or self.merged:
             return  # 无 LoRA 或已合并直接返回
 
+        delta_w = (self.lora_B @ self.lora_A) * self.scaling # 计算 ΔW
+        # 若 fan_in_fan_out=True（例如 conv 转置权重），需转置
+        if self.cfg.fan_in_fan_out:
+            delta_w = delta_w.T
         with self._lock:  # 锁住合并操作，避免推理中并发写入
-            delta_w = (self.lora_B @ self.lora_A) * self.scaling  # 计算 ΔW
-            # 若 fan_in_fan_out=True（例如 conv 转置权重），需转置
-            if self.cfg.fan_in_fan_out:
-                delta_w = delta_w.T
-
             # 将增量累加到原始权重
             self.weight.data += delta_w.to(self.weight.dtype)
             self.merged = True
@@ -155,10 +155,11 @@ class LoRALinear(nn.Module):
         if self.r == 0 or not self.merged:
             return
 
+        delta_w = (self.lora_B @ self.lora_A) * self.scaling
+        if self.cfg.fan_in_fan_out:
+            delta_w = delta_w.T
+
         with self._lock:  # 锁住撤销合并操作，避免推理中并发写入
-            delta_w = (self.lora_B @ self.lora_A) * self.scaling
-            if self.cfg.fan_in_fan_out:
-                delta_w = delta_w.T
             self.weight.data -= delta_w.to(self.weight.dtype)
             self.merged = False
             self.auto_merge_enabled = False # 用户显式 unmerge ⇒ 禁掉后续自动合并
@@ -167,35 +168,50 @@ class LoRALinear(nn.Module):
     # 前向传播
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 输入尺寸与 dtype 校验
+        if x.dim() < 2 or x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"LoRALinear expected input shape [..., {self.in_features}], "
+                f"got {tuple(x.shape)}"
+            )
         # ★ 性能优化：若处于 eval 模式且 cfg.merge_weights=True，
         #   则自动先合并一次权重，后续前向都走“快捷路径”。
         if (not self.training
-                 and self.auto_merge_enabled
-                 and not self.merged):
+            and self.auto_merge_enabled
+            and not self.merged):
             # 若处于推理阶段且未合并，则自动合并
             if not self.merged:
                 self.merge()
-
-        # 情况 1：存在 LoRA 且未合并，需要计算增量
         if self.r > 0 and self.active and not self.merged:
-            # 1) 主路径输出
-            result   = F.linear(x, self.weight, self.bias)
-            # 2) LoRA 路径输出 = x * A^T -> [B, *, r]
-            lora_out = F.linear(self.lora_dropout(x), self.lora_A)
-            # 3) 再乘 B^T 得到 [B, *, out_features] 并缩放
-            lora_out = F.linear(lora_out, self.lora_B) * self.scaling
-            # 4) 两条路径相加
+            # 主路径输出
+            result = F.linear(x, self.weight, self.bias)
+            # 情况 1：存在 LoRA 且未合并，需要计算增量
+            if self.cfg.fan_in_fan_out:
+                # 1) # 如果是 fan_in_fan_out 布局，LoRA 参数需要转置后使用
+                lora_A = self.lora_A.T  # [in_features, r]
+                lora_B = self.lora_B.T  # [r, out_features]
+                # 2) LoRA 路径输出 = x * A^T -> [B, *, r]
+                lora_out = self.lora_dropout(x) @ lora_A
+                # 3) 再乘 B^T 得到 [B, *, out_features] 并缩放
+                lora_out = lora_out @ lora_B
+                # 4) 缩放
+                lora_out = lora_out * self.scaling
+            else:
+                # 情况 2：已合并或 LoRA 被禁用，走普通线性层
+                lora_out = F.linear(self.lora_dropout(x), self.lora_A)  # [batch, ..., r]
+                lora_out = F.linear(lora_out, self.lora_B) * self.scaling  # [batch, ..., out_features]
+            
+            # 将 LoRA 输出与主路径输出相加
             return result + lora_out.to(result.dtype)
 
-        # 情况 2：已合并或 LoRA 被禁用，走普通线性层
         return F.linear(x, self.weight, self.bias)
+
 
 # =============================================================================
 # 3. LoRA 注入与辅助函数
 # =============================================================================
 # 类型别名：目标模块匹配可用字符串或 regex Pattern
 RegexPattern = Union[str, re.Pattern]
-
 
 def _should_replace(name: str, patterns: Iterable[RegexPattern]) -> bool:
     """判断模块名是否匹配目标模式"""
@@ -207,7 +223,6 @@ def _should_replace(name: str, patterns: Iterable[RegexPattern]) -> bool:
             return True
     return False
 
-
 def inject_lora(
     model: nn.Module,
     target_modules: Tuple[RegexPattern, ...] = (r"q_proj", r"v_proj"),
@@ -217,31 +232,43 @@ def inject_lora(
     """递归遍历模型，将匹配到的 nn.Linear 替换为 LoRALinear"""
     lora_cfg = lora_cfg or LoRAConfig()
 
-    # 必须把 named_modules 提前 list 化，避免遍历时结构改变
+    # 先把 named_modules 抓成 list，避免遍历时结构变化
     for name, module in list(model.named_modules()):
-        # 若该子模块满足条件并且确实是 nn.Linear
-        if _should_replace(name, target_modules) and isinstance(module, nn.Linear):
-            # 找到其父模块，准备替换
-            parent = _get_parent(model, name)
-            child_name = name.split(".")[-1]
+        if not _should_replace(name, target_modules):
+            continue
 
-            # 创建新的 LoRALinear，并保持 dtype/device 与原模块一致
-            new_layer = LoRALinear(
-                module.in_features,
-                module.out_features,
-                bias=module.bias is not None,
-                lora_cfg=lora_cfg,
-            ).to(module.weight.device, dtype=module.weight.dtype)
-
-            # 复制原始权重与偏置
-            new_layer.weight.data = module.weight.data.clone()
-            if module.bias is not None:
-                new_layer.bias.data = module.bias.data.clone()
-
-            # 用带 LoRA 的层替换原层
-            setattr(parent, child_name, new_layer)
+        # --------- 跳过已注入层（防止重复注入） ---------
+        if isinstance(module, LoRALinear):
             if verbose:
-                print(f"[LoRA] Injected → {name}")
+                print(f"[LoRA] Skipped (already LoRALinear) → {name}")
+            continue
+
+        if not isinstance(module, nn.Linear):
+            continue
+
+        # --------- 创建 LoRALinear 并复制权重 ---------
+        parent = _get_parent(model, name)
+        child_name = name.split(".")[-1]
+
+        new_layer = LoRALinear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            lora_cfg=lora_cfg,
+        ).to(module.weight.device, dtype=module.weight.dtype)
+
+        new_layer.weight.data.copy_(module.weight.data)
+        if module.bias is not None:
+            new_layer.bias.data.copy_(module.bias.data)
+
+        # 保存原层指针，方便 LoRAManager 撤销
+        new_layer._orig_module = module
+
+        # --------- 真正替换 ---------
+        setattr(parent, child_name, new_layer)
+        if verbose:
+            print(f"[LoRA] Injected → {name}")
+
 
 
 # ---------------- 工具：获取父模块 ---------------- #
@@ -253,7 +280,6 @@ def _get_parent(root: nn.Module, full_name: str) -> nn.Module:
 
 
 # ---------------- 合并 / 撤回（全局一次性） ---------------- #
-
 def merge_lora(model: nn.Module):
     """遍历模型，调用每层的 merge()"""
     for m in model.modules():
@@ -269,29 +295,47 @@ def unmerge_lora(model: nn.Module):
 
 
 # ---------------- 轻量级保存 / 加载 LoRA 参数 ---------------- #
-
 def lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """仅导出 *.lora_A / *.lora_B 参数，便于小体积分发"""
+    """
+    Function: 只加载 *.lora_* 参数/权重。
+    """
     return {k: v for k, v in model.state_dict().items() if ".lora_" in k}
 
 
 def save_lora_state_dict(model: nn.Module, path: str):
     torch.save(lora_state_dict(model), path)
 
+def _safe_torch_load(path: str):
+    """
+    尝试使用 weights_only=True 加载；若旧版本 PyTorch 不支持该参数，则退回。
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:                         # < 2.3 版本没有该参数
+        return torch.load(path, map_location="cpu")
 
-def load_lora_state_dict(model: nn.Module, 
-                         obj: Union[str, Dict[str, torch.Tensor]], 
-                         strict: bool = True):
+def load_lora_state_dict(
+    model: nn.Module, 
+    obj: Union[str, Dict[str, torch.Tensor]], 
+    strict: bool = True
+):
     """加载轻量级 LoRA 参数，可用于推理或继续训练
      支持两种调用：
          • load_lora_state_dict(model, "lora.bin")
          • load_lora_state_dict(model, state_dict)
+         Function: 只加载 *.lora_* 参数/权重。
+    Params: obj, str 或 dict,
+    Params: strict, 是否严格匹配，若为 False 则忽略未匹配的键,只加载参数；若为True则抛出异常。
+    Return: dict, 包含所有 *.lora_* 参数/权重
      """
-    sd = obj if isinstance(obj, dict) else torch.load(obj, map_location="cpu")
+    sd = obj if isinstance(obj, dict) else _safe_torch_load(obj)
     missing, unexpected = model.load_state_dict(sd, strict=strict)
     if strict and (missing or unexpected):
         raise RuntimeError(
-            f"Load mismatch: missing={missing}, unexpected={unexpected}")
+            f"Load mismatch: missing={missing}, unexpected={unexpected}"
+        )
+
+
 
 # =============================================================================
 # 4. LoRA Manager：多适配器热切换
@@ -329,7 +373,7 @@ class LoRAManager:
         """激活指定 tag 的 LoRA；若已有激活则先撤销"""
         if self.active_tag == tag:
             return  # 已经是该 LoRA，无需重复切换
-        self.deactivate(model)       # 先关闭当前 LoRA
+        self.deactivate(model)       # 确保彻底清理旧 LoRA
         tgt, cfg = self.registry[tag]
         inject_lora(model, tgt, cfg, verbose=False)
         # 打开所有 LoRA 分支
@@ -347,8 +391,11 @@ class LoRAManager:
         # 1) 撤回已合并的权重
         unmerge_lora(model)
         # 2) 彻底关闭 LoRA 分支
-        for m in model.modules():
-            if isinstance(m, LoRALinear):
-                m.active = False
+        for name, module in list(model.named_modules()):
+            if isinstance(module, LoRALinear) and hasattr(module, "_orig_module"):
+                parent = _get_parent(model, name)
+                child_name = name.split(".")[-1]
+                setattr(parent, child_name, module._orig_module)
+                del module._orig_module
         self.active_tag = None
         print("[LoRA] ◄ Deactivated")
