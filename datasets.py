@@ -149,6 +149,9 @@ class PretrainDataset(BaseDataset):
         label_tensor = torch.tensor(input_ids[1:], dtype=torch.long)
         mask_tensor  = torch.tensor(loss_mask[1:], dtype=torch.bool)
 
+        # mask 掩码中，-100 代表不计算损失，-100 以外的值代表计算损失，避免影响loss计算
+        label_tensor[~mask_tensor] = -100
+
         return {
             "input_ids": input_tensor,     # [seq_len-1]
             "labels":    label_tensor,     # [seq_len-1]
