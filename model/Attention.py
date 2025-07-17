@@ -1,3 +1,4 @@
+import os
 import sys
 import math
 import torch
@@ -70,9 +71,10 @@ class MultiHeadSelfAttention(nn.Module):
 
         # ---- 模型并行通信组初始化 ----
         if self.model_parallel_size > 1:
-            backend="nccl" if torch.cuda.is_available() and sys.platform != "win32" else "gloo"
-            if not dist.is_initialized():
-                dist.init_process_group(backend=backend)
+            backend = "nccl" if torch.cuda.is_available() and sys.platform != "win32" else "gloo"
+            is_dist, rank, world_size = self.init_distributed_mode(backend=backend)
+            if not is_dist:
+                raise RuntimeError("Distributed environment variables not set but model_parallel_size > 1 requires distributed.")
             # 为张量并行单独建子组（同 rank % mp == gid）
             world = dist.get_world_size()
             ranks  = [r for r in range(world)
@@ -130,6 +132,55 @@ class MultiHeadSelfAttention(nn.Module):
 
         # ----- 量化标志 ----
         self.quantized = False
+
+    def init_distributed_mode(self, backend=None, rank=None, world_size=None, master_addr=None, master_port=None):
+        """
+        初始化 torch.distributed 进程组
+
+        参数：
+        - backend: str，可选，'nccl' 或 'gloo'，默认为自动选择
+        - rank: int，当前进程rank，默认从环境变量读取
+        - world_size: int，进程总数，默认从环境变量读取
+        - master_addr: str，主节点地址，默认从环境变量读取或127.0.0.1
+        - master_port: str/int，主节点端口，默认从环境变量读取或29500
+
+        返回：
+        - (bool is_initialized, int rank, int world_size)
+        """
+
+        if backend is None:
+            # Windows 用 gloo，Linux/CUDA 可用 nccl
+            if sys.platform == "win32" or not torch.cuda.is_available():
+                backend = "gloo"
+            else:
+                backend = "nccl"
+
+        # 从环境变量读取
+        rank_env = os.environ.get("RANK")
+        world_size_env = os.environ.get("WORLD_SIZE")
+        master_addr_env = os.environ.get("MASTER_ADDR")
+        master_port_env = os.environ.get("MASTER_PORT")
+
+        # 赋值参数优先于环境变量
+        rank = rank if rank is not None else (int(rank_env) if rank_env is not None else None)
+        world_size = world_size if world_size is not None else (int(world_size_env) if world_size_env is not None else None)
+        master_addr = master_addr if master_addr is not None else (master_addr_env if master_addr_env is not None else "127.0.0.1")
+        master_port = master_port if master_port is not None else (master_port_env if master_port_env is not None else "29500")
+
+        # 如果rank或world_size没设置，说明不是分布式环境，返回False
+        if rank is None or world_size is None:
+            print("[Distributed] Not initialized: RANK or WORLD_SIZE environment variables not set.")
+            return False, 0, 1
+
+        if not dist.is_initialized():
+            os.environ['MASTER_ADDR'] = master_addr
+            os.environ['MASTER_PORT'] = str(master_port)
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+            print(f"[Distributed] Initialized with backend={backend}, rank={rank}, world_size={world_size}, master_addr={master_addr}, master_port={master_port}")
+        else:
+            print("[Distributed] Already initialized.")
+
+        return True, rank, world_size
 
     def _init_weights(self, num_layers: int):
         """
