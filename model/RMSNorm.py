@@ -38,13 +38,11 @@ class RMSNorm(nn.Module):
         super().__init__()
         # γ（可学习缩放因子）
         self.weight = nn.Parameter(torch.ones(dim))
-        # 把 eps 注册为 buffer，确保随模型一起搬到 GPU / CPU
-        # 同时避免被优化器更新
-        self.register_buffer("eps", torch.tensor(eps, dtype=torch.float32))
+        self.eps = torch.tensor(eps, dtype=torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:                # noqa: D401
         # 主逻辑完全委托给 TorchScript 函数，JIT 可原地融合 mul/rsqrt
-        return _rms_norm(x, self.weight, float(self.eps))
+        return _rms_norm(x, self.weight, self.eps)
 
 if __name__ == "__main__":
     from config import ByteModelConfig
