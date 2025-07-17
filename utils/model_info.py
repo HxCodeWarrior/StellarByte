@@ -15,9 +15,12 @@ import time
 import math
 import json
 import torch
+import matplotlib
 import numpy as np
-import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from typing import Dict, List, Tuple, Optional, Union, Any
 from pathlib import Path
 from tabulate import tabulate
@@ -31,6 +34,14 @@ sys.path.append(str(root_dir))
 from model.config import ByteModelConfig
 from model.Model import ByteTransformer
 
+# 设置中文字体和负号显示
+# Linux
+# font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+# font_prop = font_manager.FontProperties(fname=font_path)
+# matplotlib.rcParams['font.family'] = font_prop.get_name()
+# Windows
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 解决中文乱码问题
+matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 class ModelInfo:
     """模型信息分析类
@@ -723,41 +734,21 @@ class ModelInfo:
             # 7.1 参数效率
             f.write("### 6.1 参数效率\n\n")
             embed_ratio = self.param_stats["by_type"]["embedding"] / self.param_stats["total"] * 100
-            if embed_ratio > 30:
-                f.write("- **嵌入层占比过高**: 嵌入层参数占总参数的比例为 {:.2f}%，考虑使用参数共享或低秩分解技术\n".format(embed_ratio))
+            f.write("- **嵌入层占比**: 嵌入层参数占总参数的比例为 {:.2f}%\n".format(embed_ratio))
             
             # 7.2 计算效率
             f.write("### 6.2 计算效率\n\n")
             attn_ratio = self.compute_stats["attention"]["total"] / self.compute_stats["total"]["flops"] * 100
-            if attn_ratio > 60:
-                f.write("- **注意力计算占比过高**: 注意力计算占总计算量的 {:.2f}%，考虑使用稀疏注意力或线性注意力机制\n".format(attn_ratio))
+            f.write("- **注意力计算占比**: 注意力计算占总计算量的 {:.2f}%\n".format(attn_ratio))
             
             # 7.3 内存优化
             f.write("### 6.3 内存优化\n\n")
-            if self.memory_stats["kv_cache"]["megabytes"] > 1000:  # 超过1GB
-                f.write("- **KV缓存内存占用过大**: KV缓存占用 {:.2f} MB，考虑使用KV缓存裁剪或量化技术\n".format(
-                    self.memory_stats["kv_cache"]["megabytes"]))
+            f.write("- **KV缓存内存占用**: KV缓存占用 {:.2f} MB\n".format(
+                self.memory_stats["kv_cache"]["megabytes"]))
             
             # 8. 附录：模型架构图
-            f.write("## 7. 附录：模型架构\n\n")
-            f.write("```\n")
-            f.write(f"ByteTransformer(\n")
-            f.write(f"  (embed_tokens): Embedding({self.config.vocab_size}, {self.config.model_dim})\n")
-            
-            # 简化的层结构
-            for i in range(min(3, self.config.num_layers)):
-                f.write(f"  (layers.{i}): DecoderLayer(\n")
-                f.write(f"    (attn): MultiHeadSelfAttention(...)\n")
-                f.write(f"    (mlp): MLP(...)\n")
-                f.write(f"  )\n")
-            
-            if self.config.num_layers > 3:
-                f.write(f"  ... {self.config.num_layers - 3} more layers ...\n")
-            
-            f.write(f"  (norm): LayerNorm({self.config.model_dim})\n")
-            f.write(f"  (lm_head): Linear({self.config.model_dim}, {self.config.vocab_size})\n")
-            f.write(f")\n")
-            f.write("```\n\n")
+            f.write("## 7. 附录：模型架构[简单]\n\n")
+            self._append_architecture_summary(f)
             
             # 9. 生成可视化图表（如果启用）
             if include_plots:
@@ -785,10 +776,64 @@ class ModelInfo:
                     rel_path = os.path.relpath(layer_plot_file, os.path.dirname(report_file))
                     f.write(f"### 8.3 层参数分布\n\n")
                     f.write(f"![层参数分布]({rel_path})\n\n")
+                
+                # 9.4 模型层级结构图
+                structure_plot_file = self._plot_layer_structure(plots_dir)
+                if structure_plot_file:
+                    rel_path = os.path.relpath(structure_plot_file, os.path.dirname(report_file))
+                    f.write(f"### 8.4 模型层级结构图\n\n")
+                    f.write(f"![模型层级结构图]({rel_path})\n\n")
+
+                # 9.5 参数稀疏度热力图
+                heatmap_plot_file = self._plot_sparsity_heatmap(plots_dir)
+                if heatmap_plot_file:
+                    rel_path = os.path.relpath(heatmap_plot_file, os.path.dirname(report_file))
+                    f.write(f"### 8.5 参数稀疏度热力图\n\n")
+                    f.write(f"![稀疏度热力图]({rel_path})\n\n")
+
+                # 9.6 层延迟柱状图
+                latency_file = self._plot_latency_bars(plots_dir)
+                if latency_file:
+                    rel_path = os.path.relpath(latency_file, os.path.dirname(report_file))
+                    f.write(f"### 8.6 层延迟柱状图\n\n")
+                    f.write(f"![延迟柱状图]({rel_path})\n\n")
+
+                # 9.7 模型雷达图
+                radar_plot_file = self._plot_radar_chart(plots_dir)
+                if radar_plot_file:
+                    rel_path = os.path.relpath(radar_plot_file, os.path.dirname(report_file))
+                    f.write(f"### 8.7 模型雷达图\n\n")
+                    f.write(f"![模型雷达图]({rel_path})\n\n")
         
         print(f"报告已生成: {report_file}")
         return report_file
     
+    def _append_architecture_summary(self, f):
+        """生成更加丰富的模型结构概览"""
+        f.write("```")
+        f.write(f"ByteTransformer(")
+        f.write(f"  (embed_tokens): Embedding(vocab_size={self.config.vocab_size}, dim={self.config.model_dim})\n")
+
+        for i in range(self.config.num_layers):
+            f.write(f"  (layers.{i}): DecoderLayer(")
+            f.write(f"    (self_attn): MultiHeadSelfAttention(")
+            f.write(f"      num_heads={self.config.num_heads}, dim={self.config.model_dim}, dropout={self.config.attn_dropout}\n")
+            f.write(f"    )\n")
+            f.write(f"    (mlp): FeedForward(")
+            f.write(f"      dim_inner={self.config.ffn_dim}, activation={getattr(self.config, 'activation', 'gelu')}\n")
+            f.write(f"    )\n")
+            f.write(f"    (norm1): LayerNorm(dim={self.config.model_dim})\n")
+            f.write(f"    (norm2): LayerNorm(dim={self.config.model_dim})\n")
+            f.write(f"  )\n")
+            if i == 2 and self.config.num_layers > 6:
+                f.write(f"  ... ({self.config.num_layers - 5} 层略过) ...\n")
+                i = self.config.num_layers - 3  # Skip middle layers
+
+        f.write(f"  (final_norm): LayerNorm(dim={self.config.model_dim})\n")
+        f.write(f"  (lm_head): Linear(in_features={self.config.model_dim}, out_features={self.config.vocab_size})\n")
+        f.write(f")\n")
+        f.write("```\n")
+
     def _plot_parameter_distribution(self, output_dir: str) -> Optional[str]:
         """绘制参数分布饼图
         
@@ -799,25 +844,39 @@ class ModelInfo:
             图表文件路径，如果失败则返回None
         """
         try:
-            # 准备数据
             labels = []
             sizes = []
             for ptype, count in self.param_stats["by_type"].items():
-                if count > 0:  # 只包含非零值
+                if count > 0:
                     labels.append(ptype)
                     sizes.append(count)
-            
-            # 创建饼图
-            plt.figure(figsize=(10, 8))
-            plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, shadow=True)
-            plt.axis('equal')  # 保持饼图为圆形
-            plt.title('模型参数分布')
-            
-            # 保存图表
+
+            explode = [0.05 if i == max(sizes) else 0 for i in sizes]  # 突出最大块
+            colors = sns.color_palette("pastel", len(sizes))
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+            wedges, texts, autotexts = ax.pie(
+                sizes,
+                labels=labels,
+                autopct="%1.1f%%",
+                startangle=90,
+                shadow=False,
+                explode=explode,
+                colors=colors,
+                textprops={"fontsize": 12}
+            )
+            ax.axis("equal")
+            ax.set_title("模型参数类型分布", fontsize=16)
+
+            for text in texts:
+                text.set_fontsize(12)
+            for autotext in autotexts:
+                autotext.set_fontsize(11)
+                autotext.set_color("black")
+
             plot_file = os.path.join(output_dir, "parameter_distribution.png")
             plt.savefig(plot_file, dpi=300, bbox_inches='tight')
             plt.close()
-            
             return plot_file
         except Exception as e:
             print(f"绘制参数分布图表失败: {e}")
@@ -895,6 +954,127 @@ class ModelInfo:
             print(f"绘制层参数分布图表失败: {e}")
             return None
 
+    def _plot_layer_structure(self, output_dir: str) -> Optional[str]:
+        """绘制详细模型层级结构图（可视化多类型组件）"""
+        try:
+            import networkx as nx
+
+            G = nx.DiGraph()
+
+            G.add_node("Input", shape="box")
+            G.add_node("Embedding", shape="box")
+            G.add_edge("Input", "Embedding")
+
+            for i in range(self.config.num_layers):
+                attn = f"Layer {i}\n[Self-Attn]"
+                mlp = f"Layer {i}\n[MLP]"
+                norm = f"Layer {i}\n[Norm]"
+                G.add_node(attn)
+                G.add_node(mlp)
+                G.add_node(norm)
+                if i == 0:
+                    G.add_edge("Embedding", attn)
+                else:
+                    G.add_edge(f"Layer {i-1}\n[Norm]", attn)
+                G.add_edge(attn, mlp)
+                G.add_edge(mlp, norm)
+
+            G.add_node("LM Head", shape="box")
+            G.add_edge(f"Layer {self.config.num_layers-1}\n[Norm]", "LM Head")
+
+            pos = nx.nx_pydot.graphviz_layout(G, prog="dot")
+            plt.figure(figsize=(14, max(6, self.config.num_layers)))
+            nx.draw(G, pos, with_labels=True, node_size=3000, node_color="#F9F9C5",
+                    font_size=9, font_weight="bold", edge_color="#808080")
+            plt.title("详细模型层级结构图")
+
+            plot_file = os.path.join(output_dir, "layer_detailed_structure.png")
+            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            return plot_file
+        except Exception as e:
+            print(f"绘制详细层级结构图失败: {e}")
+            return None
+
+    def _plot_sparsity_heatmap(self, output_dir: str) -> Optional[str]:
+        """绘制参数稀疏度热力图"""
+        try:
+            sparse_data = {
+                name: sparsity for name, sparsity in self.param_stats['sparsity'].items()
+                if "layers" in name and sparsity is not None
+            }
+            if not sparse_data:
+                return None
+
+            df = pd.DataFrame(list(sparse_data.items()), columns=["layer", "sparsity"])
+            df = df.sort_values("layer")
+            plt.figure(figsize=(12, 6))
+            sns.heatmap(df[["sparsity"]].T, cmap="Reds", annot=True, fmt=".2f")
+            plt.title("模型参数稀疏度热力图")
+            plt.yticks(rotation=0)
+
+            plot_file = os.path.join(output_dir, "sparsity_heatmap.png")
+            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            return plot_file
+        except Exception as e:
+            print(f"绘制稀疏度热力图失败: {e}")
+            return None
+
+    def _plot_latency_bars(self, output_dir: str) -> Optional[str]:
+        """绘制每层延迟柱状图（假设perf_stats中包含每层信息）"""
+        try:
+            if not self._analyzed_perf or "layer_latency" not in self.perf_stats:
+                return None
+            data = self.perf_stats["layer_latency"]
+            layers = list(data.keys())
+            latency = [data[l] for l in layers]
+            plt.figure(figsize=(12, 6))
+            sns.barplot(x=layers, y=latency, palette="Blues_d")
+            plt.title("各层前向延迟 (ms)")
+            plt.xticks(rotation=45)
+            plt.ylabel("延迟 (ms)")
+            plt.tight_layout()
+            plot_file = os.path.join(output_dir, "layer_latency.png")
+            plt.savefig(plot_file, dpi=300)
+            plt.close()
+            return plot_file
+        except Exception as e:
+            print(f"绘制延迟柱状图失败: {e}")
+            return None
+
+    def _plot_radar_chart(self, output_dir: str) -> Optional[str]:
+        """绘制雷达图（展示参数、内存、FLOPs、速度等对比）"""
+        try:
+            labels = ["参数量", "内存(MB)", "计算量(GFLOPs)", "生成速度(tokens/s)"]
+
+            # 安全获取数据（避免 KeyError）
+            param_m = self.param_stats.get("total", 0) / 1e6
+            mem_mb = self.memory_stats.get("total", {}).get("megabytes", 0)
+            gflops = self.compute_stats.get("total", {}).get("gflops", 0)
+            tokps = self.perf_stats.get("generation", {}).get(1, {}).get("tokens_per_sec", 0)
+
+            values = [param_m, mem_mb, gflops, tokps]
+            values = [v if v > 0 else 0.01 for v in values]  # 避免雷达图显示为点
+
+            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+            values += values[:1]  # 闭环
+            angles += angles[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+            ax.plot(angles, values, 'o-', linewidth=2)
+            ax.fill(angles, values, alpha=0.25)
+            ax.set_thetagrids(np.degrees(angles[:-1]), labels)
+            ax.set_title("模型关键指标雷达图")
+            ax.grid(True)
+
+            plot_file = os.path.join(output_dir, "model_radar.png")
+            plt.savefig(plot_file, dpi=300)
+            plt.close()
+            return plot_file
+        except Exception as e:
+            print(f"绘制雷达图失败: {e}")
+            return None
 
 def main():
     """命令行接口"""
