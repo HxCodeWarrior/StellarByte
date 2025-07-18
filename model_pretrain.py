@@ -3,12 +3,18 @@ import sys
 import math
 import time
 import random
+import logging
+from datetime import datetime
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 import numpy as np
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # 分布式训练核心
 from torch.utils.data.distributed import DistributedSampler
@@ -18,22 +24,22 @@ import swanlab
 
 # 终端美化输出
 from rich.console import Console
-from rich.table import Table
 
 # 项目内部模块
 from datasets import PretrainDataset
 from model.Model import ByteTransformer
 from model.config import ByteModelConfig
 from utils.checkpoint import CheckpointManager, GracefulKiller
-from utils.progressbar import RichProgressBar
-from utils.logger import get_logger
+from utils.progressbar import ProgressBarManager
+from utils.logger import get_logger, _build_logger
 from utils.config_params import load_config
 
 console = Console()
 
-# ========= 全局性能 / 显存优化（新增） =========
+# ========= 全局性能 / 显存优化） =========
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 减碎片 :contentReference[oaicite:0]{index=0}
 torch.backends.cuda.matmul.allow_tf32 = True        # Ampere+ TF32 ⾃动降精度
+torch.backends.cudnn.allow_tf32 = True              # Turing+ TF32 ⾃动降精度
 torch.backends.cudnn.benchmark = True               # cuDNN 算法自动搜索
 
 # -----------------------------------------------------------------------------
@@ -70,6 +76,30 @@ def grad_global_norm(parameters) -> float:
         total_norm += param_norm.item() ** 2
     return math.sqrt(total_norm)
 
+def compute_label_smoothing(logits, labels, loss_mask, label_smoothing=0.1):
+    """
+    使用 Label Smoothing 计算交叉熵损失，同时考虑 loss_mask。
+    logits: (B, T, V)
+    labels: (B, T)
+    loss_mask: (B, T)
+    """
+    vocab_size = logits.size(-1)
+    log_probs = F.log_softmax(logits, dim=-1)  # (B, T, V)
+
+    # 构造平滑标签
+    with torch.no_grad():
+        true_dist = torch.zeros_like(log_probs)  # (B, T, V)
+        true_dist.fill_(label_smoothing / (vocab_size - 1))
+        ignore_mask = (labels == -100)
+        labels = labels.clone()
+        labels[ignore_mask] = 0
+        true_dist.scatter_(2, labels.unsqueeze(2), 1.0 - label_smoothing)
+        true_dist[ignore_mask] = 0  # 忽略 pad 部分
+
+    # 交叉熵损失
+    loss = -(true_dist * log_probs).sum(dim=-1)  # (B, T)
+    loss = loss * loss_mask  # 仅对有效 token 求损失
+    return loss.sum() / (loss_mask.sum() + 1e-8)
 
 def format_size(num_bytes: int) -> str:
     """将字节数格式化为可读字符串，如 256.0 MiB。"""
@@ -83,19 +113,19 @@ def format_size(num_bytes: int) -> str:
 # -----------------------------------------------------------------------------
 # 学习率调度器
 # -----------------------------------------------------------------------------
-def get_lr(it: int, all_iters: int, args) -> float:
+def get_lr(global_step: int, total_iters: int, args) -> float:
     """
     余弦退火 + 线性预热 + 周期重启 学习率调度器。
 
     参数说明
     --------
-    it : int,当前全局 step。
-    all_iters : int,单个 epoch 内的 step 数乘以总 epoch 数，表示单周期迭代数。
+    global_step : int,当前全局 step。
+    total_iters : int,总训练步数（所有 epoch * (重启周期+1)），表示单周期迭代数。
     args : Namespace,命令行参数集合。
     """
     # 计算关键节点
-    warmup_iters = int(args.warmup_steps_ratio * all_iters)  # 预热步数
-    decay_steps = int(args.lr_decay_steps_ratio * all_iters) # 每次衰减的步长
+    warmup_iters = int(args.warmup_steps_ratio * total_iters)  # 预热步数
+    decay_steps = int(args.lr_decay_steps_ratio * total_iters) # 每次衰减的步长
 
     # 便捷变量
     min_lr           = args.min_lr
@@ -103,22 +133,21 @@ def get_lr(it: int, all_iters: int, args) -> float:
     num_restarts     = args.num_restarts
     lr_decay_rate    = args.lr_decay_rate
 
-    cycle_length = all_iters                 # 一个周期长度
-    total_iters  = all_iters * (num_restarts + 1)  # 所有周期的总步数
+    cycle_length = total_iters // (num_restarts + 1) # 一个周期长度
 
     # 如果超过最大训练步数，返回最小学习率
-    if it >= total_iters:
+    if global_step >= total_iters:
         return min_lr
 
     # ------- 1. 线性 + 余弦预热 -------
-    if it < warmup_iters:
-        ratio  = it / max(1, warmup_iters)
+    if global_step < warmup_iters:
+        ratio  = global_step / max(1, warmup_iters)
         cosine = 0.5 * (1 - math.cos(math.pi * ratio))
         return warmup_start_lr + cosine * (args.learning_rate - warmup_start_lr)
 
     # ------- 2. 多周期余弦退火 -------
-    cycle_step       = (it - warmup_iters) % cycle_length   # 当前周期内的步数
-    cycle_idx        = (it - warmup_iters) // cycle_length  # 周期索引
+    cycle_step       = (global_step - warmup_iters) % cycle_length   # 当前周期内的步数
+    cycle_idx        = (global_step - warmup_iters) // cycle_length  # 周期索引
     decay_steps_cnt  = cycle_step // decay_steps            # 已触发的衰减次数
 
     decayed_lr       = args.learning_rate * (lr_decay_rate ** decay_steps_cnt)
@@ -133,7 +162,7 @@ def get_lr(it: int, all_iters: int, args) -> float:
 # -----------------------------------------------------------------------------
 # 验证循环
 # -----------------------------------------------------------------------------
-def evaluate(model, dataloader, args, global_step, logger):
+def evaluate(model, dataloader, args, logger, epoch=None, progressor=None):
     """
     整个验证集前向推理，不计算梯度。
 
@@ -145,6 +174,12 @@ def evaluate(model, dataloader, args, global_step, logger):
     model.eval()  # 切换到评估模式
     total_loss   = torch.tensor(0.0, device=args.device)
     total_tokens = torch.tensor(0,   device=args.device)
+    num_batches = len(dataloader)
+
+    # -------- 初始化进度条 --------
+    if progressor and is_main_process(args) and epoch is not None:
+        progressor.set_epoch(epoch)
+        progressor.start_phase(total_steps=num_batches, phase='val')
 
     with torch.no_grad():
         for batch in dataloader:
@@ -155,6 +190,11 @@ def evaluate(model, dataloader, args, global_step, logger):
             total_loss   += outputs.loss.detach() * input_ids.size(0)
             total_tokens += input_ids.size(0)
 
+            # 更新进度条
+            if progressor and is_main_process(args):
+                avg_loss_sofar = (total_loss / total_tokens).item()
+                progressor.update_phase(loss=avg_loss_sofar)
+
      # -------- 分布式汇总 --------
     if args.ddp:
         torch.distributed.all_reduce(total_loss,  op=torch.distributed.ReduceOp.SUM)
@@ -164,9 +204,12 @@ def evaluate(model, dataloader, args, global_step, logger):
     ppl      = math.exp(min(20, avg_loss))
 
     if is_main_process(args):
-        logger.info(f"[Eval] Step {global_step} | loss {avg_loss:.4f} | ppl {ppl:.2f}")
+        logger.info(f"[Eval] Step {epoch} | loss {avg_loss:.4f} | ppl {ppl:.2f}")
         if args.use_swanlab:
-            swanlab.log({"val/loss": avg_loss, "val/ppl": ppl}, step=global_step)
+            swanlab.log({"val/loss": avg_loss, "val/ppl": ppl}, step=epoch)
+    
+    if progressor and is_main_process(args):
+        progressor.end_phase()
 
     model.train()  # 评估完记得切回训练模式
     return avg_loss
@@ -178,7 +221,15 @@ def evaluate(model, dataloader, args, global_step, logger):
 def init_model(args, logger):
     """根据 CLI 参数构造 ByteTransformer 与分词器。"""
 
-    # 1. 组装配置
+    # 1. 加载分词器
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+
+    # 2. 检查词表大小是否变化（比如添加了pad token）
+    if len(tokenizer) > args.vocab_size:
+        logger.info(f"检测到 tokenizer 词表大小变为 {len(tokenizer)}，更新模型配置 vocab_size")
+        args.vocab_size = len(tokenizer)
+
+    # 3. 组装配置
     config = ByteModelConfig(
         vocab_size           = args.vocab_size,
         dim                  = args.dim,
@@ -208,24 +259,21 @@ def init_model(args, logger):
         tensor_parallel_rank = args.tensor_parallel_rank,
     )
 
-    # 2. 加载分词器
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-
-    # 3. 构建模型
+    # 4. 构建模型
     model = ByteTransformer(config).to(args.device)
 
-    # 4. 梯度检查点
+    # 5. 梯度检查点
     if getattr(args, "grad_checkpoint", False):
         model.gradient_checkpointing_enable()
         logger.info("✅ 已启用 Gradient Checkpointing")
  
-    # 5. torch.compile（吞吐+显存双赢）
+    # 6. torch.compile（吞吐+显存双赢）
     if getattr(args, "use_torch_compile", False) and hasattr(torch, "compile"):
         mode = getattr(args, "compile_mode", "max-autotune")
         model = torch.compile(model, mode=mode, fullgraph=False)
         logger.info(f"🚀 torch.compile(mode='{mode}') 已启用")  # :contentReference[oaicite:1]{index=1}
  
-    # 6. 并行包装
+    # 7. 并行包装
     if args.enable_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -236,7 +284,7 @@ def init_model(args, logger):
     elif torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
-    # 7. 打印参数规模
+    # 8. 打印参数规模
     param_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"模型参数总量: {param_cnt/1e6:.2f}M")
 
@@ -248,12 +296,6 @@ def init_model(args, logger):
 # -----------------------------------------------------------------------------
 def init_distributed(args):
     """DDP 初始化（torchrun 环境下自动读取 env 变量）"""
-    if not args.enable_ddp:     # 单进程逻辑
-        args.rank = 0
-        args.world_size = 1
-        args.local_rank = 0
-        return
-
     # ---- 检查 CUDA 设备 ----
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("DDP 已启用，但当前未检测到可用 CUDA，请安装 GPU 版 PyTorch 或设置 enable_ddp=False")
@@ -281,112 +323,150 @@ def is_main_process(args) -> bool:
     """判断当前进程是否主进程（rank0）"""
     return (not args.enable_ddp) or args.rank == 0
 
+def sync_metrics(total_loss, total_correct, total_tokens, args):
+    if args.enable_ddp and dist.is_initialized():
+        t_loss = torch.tensor(total_loss, device=args.device)
+        t_correct = torch.tensor(total_correct, device=args.device)
+        t_tokens = torch.tensor(total_tokens, device=args.device)
+
+        dist.all_reduce(t_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t_tokens, op=dist.ReduceOp.SUM)
+
+        total_loss = t_loss.item()
+        total_correct = t_correct.item()
+        total_tokens = t_tokens.item()
+
+    return total_loss, total_correct, total_tokens
 
 # -----------------------------------------------------------------------------
 # 单个 epoch 训练
 # -----------------------------------------------------------------------------
-def train_epoch(model, dataloader, optimizer, scaler, ctx, args, epoch,
-                total_iters, logger, global_step, ckpt_mgr, killer, best_val_loss):
+def train_epoch(model, dataloader, tokenizer, optimizer, scaler, ctx, args, epoch, 
+                total_iters, global_state, best_val_loss, logger, ckpt_mgr, killer):
     """执行一个 epoch 的前向、反向与梯度更新。"""
 
     model.train()
-    loss_sum = 0.0
-    pb_total = len(dataloader)
+
+    global_step = global_state.global_step
+    total_loss    = 0.0 # 累计总损失
+    total_correct = 0   # 正确预测的 token 数
+    total_tokens  = 0   # 总预测 token 数
+    num_batches   = len(dataloader)
     
     # DDP sampler 洗牌
     if args.enable_ddp and isinstance(dataloader.sampler, DistributedSampler):
         dataloader.sampler.set_epoch(epoch)
 
-    # 使用 RichProgressBar 可视化训练进度
-    with RichProgressBar(total_steps=pb_total, 
-                         total_batches=pb_total,
-                         total_epochs=args.epochs, 
-                         desc=f"Epoch {epoch+1}") as pbar:
+    # 清理梯度
+    optimizer.zero_grad(set_to_none=True)
 
-        start_wall = time.perf_counter()
+    # 初始化吞吐率时间基准（为每步计算吞吐）
+    start_wall = time.perf_counter()
 
-        # --------------------------------------------------
-        # 遍历数据集
-        # --------------------------------------------------
-        for step, batch in enumerate(dataloader, 1):
-            # 每 N 步再清一次，避免强同步导致吞吐下降
-            if (step % args.empty_cache_interval) == 0:
-                torch.cuda.empty_cache()
-            input_ids          = batch["input_ids"].to(args.device)
-            labels             = batch["labels"].to(args.device)
-            tokens_this_batch  = input_ids.numel()
+    # --------------------------------------------------
+    # 遍历数据集
+    # --------------------------------------------------
+    for step, batch in enumerate(dataloader):
+        # 每 N 步再清一次，避免强同步导致吞吐下降
+        if (step % args.empty_cache_interval) == 0:
+            torch.cuda.empty_cache()
+        input_ids          = batch["input_ids"].to(args.device)
+        labels             = batch["labels"].to(args.device)
+        loss_mask          = batch["loss_mask"].to(args.device)
+        attention_mask     = (input_ids != tokenizer.pad_token_id).long()
+        tokens_this_batch  = input_ids.numel()
 
-            # —— 动态学习率 ——
-            lr = get_lr(global_step, total_iters, args)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
+        # 计算全局步数  
+        global_state.global_step += 1
 
-            # —— 前向 + 反向 ——
-            with ctx:  # 支持 AMP autocast
-                outputs = model(input_ids=input_ids, labels=labels)
-                loss    = outputs.loss / args.accumulation_steps
+        # —— 动态学习率 ——
+        lr = get_lr(global_state.global_step, total_iters, args)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
 
-            scaler.scale(loss).backward()
+        # —— 前向 + 反向 ——
+        with ctx:  # 支持 AMP autocast
+            if torch.cuda.is_available():
+                torch.compiler.cudagraph_mark_step_begin()  # 新图开始标记
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss    = outputs.loss / args.accumulation_steps
+            logits  = outputs.logits.detach()  # [B, T, Vocab]
+            predictions = torch.argmax(logits, dim=-1)  # [B, T],预测 token id
+        # 自动混合精度
+        scaler.scale(loss).backward()
 
-            # —— 梯度累积 ——
-            if (step % args.accumulation_steps) == 0:
-                # 反缩放后裁剪 & 记录梯度范数
-                scaler.unscale_(optimizer)
-                total_grad_norm = grad_global_norm(model.parameters())
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # —— 梯度累积 ——
+        # 梯度累积到指定步数，进行梯度裁剪与参数更新
+        if (global_state.global_step % args.accumulation_steps) == 0:
+            # 反缩放后裁剪 & 记录梯度范数
+            scaler.unscale_(optimizer)
+            total_grad_norm = grad_global_norm(model.parameters())
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-                # 更新参数
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-            else:
-                total_grad_norm = 0.0  # 非更新步，梯度范数置 0 仅做日志占位
+            # 更新参数
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            total_grad_norm = 0.0  # 非更新步，梯度范数置 0 仅做日志占位
 
-            # —— 指标统计 ——
-            loss_item     = loss.item() * args.accumulation_steps
-            loss_sum     += loss_item
-            tokens_per_s  = tokens_this_batch / max(1e-6, time.perf_counter() - start_wall)
-            gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
+        # —— 指标统计 ——
+        loss_item     = loss.item() * args.accumulation_steps
+        total_loss    += loss_item * loss_mask.sum().item()
 
-            if is_main_process(args):
-                # —— 轻量 checkpoint(按步) ——
-                if ckpt_mgr.should_save(global_step):
-                    ckpt_mgr.save(model, optimizer, scaler,
-                                  epoch=epoch, step=global_step,
-                                  full=False)
+        # 准确率
+        valid_mask    = (labels != -100)
+        correct       = ((predictions == labels) & valid_mask).sum().item()
+        total_correct += correct
+        total_tokens  += valid_mask.sum().item()
 
-                # —— 更新 Killer ——
-                killer.update(epoch, global_step, best_val_loss)
+        acc           = total_correct / (total_tokens + 1e-8)
+        ppl           = math.exp(min(20, loss_item))
+        
+        # 计算每秒处理 token 数（通过时间差估算）
+        tokens_per_s  = tokens_this_batch / max(1e-6, time.perf_counter() - start_wall)
+        gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
 
-                # —— 日志打印 & SwanLab ——
-                if global_step % args.log_interval == 0:
-                    ppl = math.exp(min(20, loss_item))
-                    logger.info(
-                        f"E{epoch+1} S{global_step} | loss {loss_item:.4f} | ppl {ppl:.1f} "
-                        f"| lr {lr:.6g} | gnorm {total_grad_norm:.2f} | tok/s {tokens_per_s:.0f} "
-                        f"| mem {format_size(gpu_mem)}")
+        if is_main_process(args):
+            # —— 轻量 checkpoint(按步) ——
+            # 每 N 步保存轻量 checkpoint
+            if ckpt_mgr.should_save(global_state.global_step) and (step) % args.save_interval == 0:
+                ckpt_mgr.save(model, 
+                              optimizer, 
+                              scaler,
+                              epoch=epoch, 
+                              step=global_state.global_step,
+                              full=False)
+            # —— 更新 Killer ——
+            killer.update(epoch, global_step, best_val_loss)
 
-                    if args.use_swanlab:
-                        swanlab.log({
-                            "train/loss": loss_item,
-                            "train/perplexity": ppl,
-                            "train/lr": lr,
-                            "train/grad_norm": total_grad_norm,
-                            "train/tokens_per_sec": tokens_per_s,
-                            "train/gpu_mem": gpu_mem / (1024**2),  # 转 MB
-                        }, step=global_step)
+            # —— 日志打印 & SwanLab ——
+            if global_state.global_step % args.log_interval == 0:
+                logger.info(
+                    f"E{epoch+1} S{global_state.global_step} | Loss {loss_item:.4f} | PPL {ppl:.1f} | ACC {acc:.4f} "
+                    f"| LR {lr:.6g} | GradNorm {total_grad_norm:.2f} | Tokens/s {tokens_per_s:.0f} "
+                    f"| Mem {format_size(gpu_mem)}")
+                if args.use_swanlab:
+                    swanlab.log({
+                        "loss": loss_item,
+                        "perplexity": ppl,
+                        "token_accuracy": acc,
+                        "lr": lr,
+                        "grad_norm": total_grad_norm,
+                        "tokens_per_sec": tokens_per_s,
+                        "gpu_mem": gpu_mem / (1024**2),  # 转 MB
+                    })
 
-            # —— 更新进度条 ——
-            pbar.update_loader(step)
-            pbar.update_train(global_step, epoch+1, loss=loss_item, lr=lr)
 
-            global_step += 1
+    # —— 同步指标 ——
+    if args.enable_ddp:
+        total_loss, total_correct, total_tokens = sync_metrics(total_loss, total_correct, total_tokens, args)
 
-    avg_loss = loss_sum / pb_total
+    avg_loss = total_loss / (total_tokens + 1e-8)
+    accuracy = total_correct / (total_tokens + 1e-8)
     if is_main_process(args):
-        logger.info(f"[Epoch {epoch+1}] 平均损失 {avg_loss:.4f}")
-
-    return global_step
+        logger.info(f"[Epoch {epoch+1}] 平均损失 {avg_loss:.4f}, 准确率 {accuracy:.4f}")
 
 
 # -----------------------------------------------------------------------------
@@ -481,18 +561,20 @@ def train(args, logger):
     )
 
     # 学习率调度与AMP配置
-    total_iters = args.epochs * len(train_loader)
-    use_amp = args.amp or args.dtype in ['float16', 'bfloat16']
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
-    ctx     = (nullcontext() if args.device == 'cpu'
-               else torch.cuda.amp.autocast(dtype=getattr(torch, args.dtype))
-               if use_amp else nullcontext())
+    steps_per_epoch = len(train_loader)  
+    total_iters = steps_per_epoch * args.epochs * (args.num_restarts + 1)
+    use_amp     = args.amp or args.dtype in ['float16', 'bfloat16']
+    scaler      = torch.amp.GradScaler(enabled=use_amp)
+    device_type = 'cuda' if 'cuda' in args.device else 'cpu'
+    ctx         = (nullcontext() if device_type == 'cpu'
+                   else torch.amp.autocast(device_type=device_type, dtype=getattr(torch, args.dtype))
+                   if use_amp else nullcontext())
 
-    # 初始化 GracefulKiller
+    # 初始化 GracefulKiller，绑定 checkpoint 管理器
     killer = GracefulKiller(model, optimizer, scaler, ckpt_mgr, logger, sync=True)
 
     start_epoch   = 0
-    global_step   = 0
+    global_state   = SimpleNamespace(global_step=0)
     val_loss      = None
     best_val_loss = float("inf")
 
@@ -501,42 +583,49 @@ def train(args, logger):
         logger.info("🔁 检测到历史检查点，正在恢复中…")
         ckpt = ckpt_mgr.load_latest(model, optimizer, scaler)
         start_epoch  = ckpt['epoch'] + 1
-        global_step  = ckpt['step'] + 1
+        global_state.global_step  = ckpt['global_step']
         best_val_loss = ckpt.get('val_loss', float('inf'))
-        logger.info(f"🪄 已恢复到 epoch {start_epoch}, step {global_step}")
+        logger.info(f"🪄 已恢复到 epoch {start_epoch}, step {global_state.global_step}")
     except FileNotFoundError:
         logger.info("🆕 未检测到 checkpoint，开始全新训练")
-        start_epoch, global_step, best_val_loss = 0, 0, float('inf')
+        start_epoch, best_val_loss = 0, float('inf')
 
     # ---------- 训练 ----------
     try:
-        if is_main_process(args):
-            logger.info("🚀 开始训练…")
         for epoch in range(start_epoch, args.epochs):
-            global_step = train_epoch(
-                model, train_loader, optimizer, scaler, ctx,
-                args, epoch, total_iters, logger, global_step, 
-                ckpt_mgr, killer, best_val_loss
+            total_iters = len(train_loader)
+            train_epoch(
+                model, train_loader, tokenizer, optimizer, scaler, ctx, args, epoch,
+                total_iters, global_state, best_val_loss, logger,  ckpt_mgr, killer
             )
+
             # -------------- 验证 (只在主进程) --------------------
-            if val_loader and is_main_process(args):
-                val_loss = evaluate(model, val_loader, args, global_step, logger)
+            if val_loader and is_main_process(args) and (epoch + 1) % args.eval_interval == 0:
+                val_loss = evaluate(model, val_loader, args, logger, epoch, progress=None)
 
                 # 保存最优模型
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    ckpt_mgr.save(model, 
+                                  optimizer, 
+                                  scaler,
+                                  epoch=epoch, 
+                                  step=global_state.global_step,
+                                  val_loss=best_val_loss, 
+                                  full=True)
                     logger.info(f"🎉 验证集损失下降至 {best_val_loss:.4f}，保存最优模型权重。")
-                    ckpt_mgr.save(model, optimizer, scaler,
-                                  epoch=epoch, step=global_step,
-                                  val_loss=best_val_loss, full=True)
 
             # --------- 每 Epoch 末保存完整检查点 ------------------
-            if is_main_process(args):
-                ckpt_mgr.save(model, optimizer, scaler,
-                              epoch=epoch, step=global_step,
-                              val_loss=val_loss, full=True)
-                killer.update(epoch, global_step, best_val_loss)  # 保存完整检查点
-            killer.update(epoch, global_step, best_val_loss)   # 同步最新 best
+            if is_main_process(args) and (epoch + 1) % args.save_interval == 0:
+                ckpt_mgr.save(model, 
+                              optimizer, 
+                              scaler,
+                              epoch=epoch,
+                              step=global_state.global_step,
+                              val_loss=val_loss, 
+                              full=True)
+                killer.update(epoch, global_state.global_step, best_val_loss)  # 保存完整检查点
+            killer.update(epoch, global_state.global_step, best_val_loss)   # 同步最新 best
 
         if is_main_process(args):
             logger.info("✅ 训练完成")
@@ -551,10 +640,18 @@ def train(args, logger):
 
 # 程序入口
 if __name__ == "__main__":
+    # ==== 加载配置 ====
     args = load_config("./configs/pretrain_config.yaml")
 
     # ==== 日志 ====
-    logger = get_logger(args.logging.logs_dir, "pretrain-distributed")
+    log_file_path = os.path.join(args.logs_dir, f"pretrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logger = _build_logger(
+        logger_name="ByteLogger",
+        log_file=log_file_path,
+        log_level=logging.DEBUG,
+        console_level=logging.INFO,
+        enable_color=True,
+    )
 
     # ==== 自动降级为 CPU（若无 CUDA）====                         
     if args.device.startswith("cuda") and not torch.cuda.is_available():  
@@ -563,15 +660,20 @@ if __name__ == "__main__":
         args.enable_ddp = False
 
     # ==== 初始化分布式 ====
-    init_distributed(args)
+    if args.enable_ddp:
+        init_distributed(args)
+    else:
+        args.rank = 0
+        args.world_size = 1
+        args.local_rank = 0
 
     # ==== 设置设备字符串 ====
     if args.device.startswith("cuda"):
         rank_device = f"cuda:{args.local_rank}"
-        args.distributed.device = rank_device if args.enable_ddp else "cuda"
+        args.device = rank_device if args.enable_ddp else "cuda"
     else:
         logger.warning("⚠️  检测不到 CUDA，已自动切换到 CPU。若想用 GPU，请安装带 CUDA 的 PyTorch。")
-        args.distributed.device = "cpu"
+        args.device = "cpu"
 
     # ==== 进程信息 ====
     if is_main_process(args):
