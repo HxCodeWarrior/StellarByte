@@ -73,7 +73,7 @@ class ByteTransformer(PreTrainedModel):
                 key_dtype            = config.key_cache_dtype,
                 value_dtype          = config.value_cache_dtype,
                 tensor_parallel_size = config.tensor_parallel_size,
-                tensor_parallel_rank = config.tensor_parallel_rank,
+                tensor_parallel_rank = config.tensor_parallel_rank
             )
 
         # ------- 解码器堆栈 -------
@@ -204,13 +204,24 @@ class ByteTransformer(PreTrainedModel):
             if base_mask is not None:
                 if past_len > 0:
                     ones = torch.ones(B, past_len, dtype=base_mask.dtype, device=base_mask.device)
-                    mask = torch.cat([ones, base_mask], dim=1)
+                    mask = torch.cat([ones, base_mask], dim=1).to(hidden_states.dtype).to(hidden_states.device)
                 else:
                     mask = base_mask
-                additive_mask = (1.0 - mask) * torch.finfo(hidden_states.dtype).min
+                additive_mask = (1.0 - mask) * -1e4
                 additive_mask = additive_mask[:, None, None, :]
 
-            hidden_states = layer(hidden_states, additive_mask=additive_mask)
+            if getattr(layer, "gradient_checkpointing_enable", False) and self.training:
+                def custom_forward(*inputs):
+                    return layer(*inputs)
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    custom_forward, 
+                    hidden_states, 
+                    additive_mask,
+                    use_reentrant=False # 采用调度器方式，稳定性更高，在实际训练中更可控。
+                )
+            else:
+                hidden_states = layer(hidden_states, additive_mask)
+
             if return_hidden_states:
                 hidden_states_list.append(hidden_states)
 
