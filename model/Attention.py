@@ -246,6 +246,45 @@ class MultiHeadSelfAttention(nn.Module):
                 inf_mask = inf_mask + additive_mask
 
             return inf_mask
+    
+    def _adjust_additive_mask(self, additive_mask: torch.Tensor, Tk: int) -> torch.Tensor:
+        """
+        自动调整 additive_mask 的长度，使其与键值序列长度 Tk 对齐。
+
+        参数：
+          additive_mask: [B, 1, 1, T_orig]，可能是 padding 掩码，长度不一定等于 Tk
+          Tk: 当前键值序列长度（包含缓存）
+
+        返回：
+          新的 additive_mask，长度调整到 Tk，前面补 0（无mask）
+        """
+
+        if additive_mask is None:
+            return None
+
+        # 原长度
+        T_orig = additive_mask.size(-1)
+
+        if T_orig == Tk:
+            return additive_mask  # 无需修改
+
+        if T_orig > Tk:
+            # 如果掩码长度超过 Tk，直接截断（一般不该出现）
+            return additive_mask[..., :Tk]
+
+        # T_orig < Tk，左侧补零
+        pad_len = Tk - T_orig
+        pad = torch.zeros(
+            additive_mask.size(0), 1, 1, pad_len,
+            dtype=additive_mask.dtype,
+            device=additive_mask.device,
+        )
+
+        # 拼接在前面（缓存在序列头部）
+        adjusted_mask = torch.cat([pad, additive_mask], dim=-1)
+
+        return adjusted_mask
+
 
     def forward(
         self,
@@ -321,6 +360,9 @@ class MultiHeadSelfAttention(nn.Module):
             k_cat, v_cat = k, v
 
         Tk = k_cat.size(1)  # 拼接后键值长度
+        # —— 自动调整 additive_mask 长度，和 KV 缓存长度同步 ——
+        if additive_mask is not None:
+            additive_mask = self._adjust_additive_mask(additive_mask, Tk)
 
         # —— 6. 转成 FlashAttention 要求的维度 ——
         # 调整维度为FlashAttention所需 [B, H, T, D]
