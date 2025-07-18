@@ -14,12 +14,13 @@ def _rms_norm(x: torch.Tensor,
     • 不使用任何条件分支，方便 JIT / TorchDynamo 图优化
     """
     rms = torch.mean(x.to(torch.float32).pow(2), dim=-1, keepdim=True)
+    eps = torch.tensor(eps, dtype=torch.float32, device=rms.device)
     inv_rms = torch.rsqrt(rms.clamp_min(eps))
     # 把 inv_rms 和 weight 都 cast 到 x.dtype
     inv_rms = inv_rms.to(x.dtype)
-    weight   = weight.to(x.dtype)
+    weight  = weight.to(x.dtype)
     # cast 回原 dtype，再点乘权重
-    return (x * inv_rms.to(x.dtype)) * weight
+    return (x * inv_rms) * weight
 
 
 class RMSNorm(nn.Module):
@@ -38,7 +39,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         # γ（可学习缩放因子）
         self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = torch.tensor(eps, dtype=torch.float32)
+        self.eps = float(eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:                # noqa: D401
         # 主逻辑完全委托给 TorchScript 函数，JIT 可原地融合 mul/rsqrt
