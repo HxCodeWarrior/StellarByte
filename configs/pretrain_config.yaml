@@ -27,7 +27,7 @@ training:                 # ▶ 训练流程
 
 evaluation:               # ▶ 验证
   eval_batch_size: 64
-  eval_max_steps:  100
+  eval_interval:  100
 
 distributed:              # ▶ 分布式&设备
   enable_ddp: false       # true→使用 torchrun 启动 DDP
@@ -48,14 +48,14 @@ dataset_loader:            # ▶ 数据集加载器配置（对应 PretrainDatas
   template: ""             # 拼接模板，支持格式化字段；无则为 None 或空字符串，示例："问:{input} 答:{output}"
   add_bos: true            # 是否添加BOS token（如 GPT 风格）
   sft_special_tokens:      # SFTDataset 特殊标记配置（默认无需修改，留空即可）
-    assistant_start_str: "<|im_start|>assistant\n"
-    im_end_str: "<|im_end|>"
+    assistant_start_str: "<|SBOS|>assistant\n"
+    im_end_str: "<|SEOS|>"
     
 model:                    # ▶ 网络结构
-  vocab_size: 32000
+  vocab_size: 50007
   dim: 768                # 隐藏维度
   n_layers: 12
-  n_heads: 16
+  n_heads: 16 # dim 必须能被 n_heads 整除，否则报错
   n_kv_heads: 8
   hidden_dim: null        # null→按 4×dim 推断
   dim_multiplier: 4
@@ -83,6 +83,8 @@ model:                    # ▶ 网络结构
     value_dtype: float16
   parallel:               # 张量/模型并行
     model_parallel_size:  1
+    tensor_parallel_size: 1
+    tensor_parallel_rank: 1
 
 optimizer:                # ▶ AdamW
   learning_rate: 5.0e-5
@@ -101,10 +103,10 @@ precision:                # ▶ 混合精度
   amp: false              # 额外启用 torch.cuda.amp（与 dtype 互斥）
 
 logging:                  # ▶ 日志与检查点
-  logs_dir:        ./logs
-  checkpoints_dir: ./checkpoints
-  log_interval:    100
-  save_interval:   1000
-  keep_latest:     5
-  keep_epoch:      10
-  keep_best:       3
+  logs_dir:        ./logs        # 日志文件路径
+  checkpoints_dir: ./checkpoints # 检查点保存路径
+  log_interval:    100           # 日志打印频率（步数）
+  save_interval:   1000          # 模型检查点保存频率（步数）
+  keep_latest:     5             # 保存最新的 n 个检查点
+  keep_epoch:      10            # 保留最近 N 个完整 Epoch 检查点
+  keep_best:       3             # 保存验证损失最优模型检查点。
