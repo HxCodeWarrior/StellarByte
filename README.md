@@ -378,6 +378,278 @@ StellarByte/
 
 ---
 
+<details>
+  <summary>2025.7.18</summary>
+
+### DONE:
+
+1. 训练脚本修复如下问题：
+- (1) 性能与训练效率的问题
+  - 修复学习率调度器计算方式不合理，get_lr 中将 total_iters = len(train_loader) * epochs * (restarts + 1)，但 step 实际是 per-epoch 内部 step。训练中应使用全局 step（global_step = epoch * steps_per_epoch + step），否则调度曲线不平滑。
+  - 修复没有梯度累计下的正确total_step支持，在 get_lr() 和 total_iters 中未考虑 accumulation_steps，导致训练实际更新步数与预期不符，调度失衡。
+  - 启用cudnn.allow.tf32，初始训练脚本设定了 torch.backends.cuda.matmul.allow_tf32 = True，但没有设置 torch.backends.cudnn.allow_tf32 = True。这会错失一半以上的 TF32 算子加速机会。
+  - torch.cuda.empty_cache() 调用频繁
+- (2) 分布式训练的问题，添加分布式训练
+  - 修复 DDP日志未加 rank 过滤 的问题，虽然大多数日志都用 is_main_process() 做了判断，但某些异常捕获如 except Exception 或 init_distributed() 内仍会全 rank 打印，建议统一封装日志器。
+  - 修复 DDP恢复不完整的问题，在恢复模型 checkpoint 时，start_step 没有继续作为 global_step 传入 train_epoch()，导致断点恢复训练时的 LR调度、日志步数、SwanLab step 不准确。
+- (3) 显存管理和稳定性问题
+  - 使用 model.zero_grad(set_to_none=True)，显式用 set_to_none=True 替换 zero_grad()，可释放更早的 grad 显存，提升显存效率。
+  - 修复 Gradient Checkpoint 未按层粒度配置 的问题，启用了 model.gradient_checkpointing_enable()，但若模型结构较深，应配合逐层显式设置 checkpointing=True 的策略，才有实际效果。
+- (4) 鲁棒性与异常恢复问题
+  - 解决 异常恢复未记录 global_step 问题，检查点中只有 epoch, step，未记录 global_step，导致调度器与日志重启后不一致。
+  - 解决 训练弈场捕获未细化 问题，except Exception as e: 中没有使用 traceback.print_exc()，排查问题困难。
+- (5)添加 Tokenizer.embedding_sync()，检查 tokenizer 与 embedding 大小是否同步
+- (6)增加标签平滑损失计算函数
+- (7)添加CUDA图优化标记
+2. RSMNorm修复：
+- 将eps从tensor改为float类型避免重复转换，减少内存
+- 将eps转换为与rms相同的设备以避免跨设备操作
+- 移除冗余的inv_rms类型转换
+- 用 torch._dynamo.disable() 装饰器关闭 RMSNorm 的 forward 编译，避免 CUDA Graph 内存复用冲突。
+3. Attention修复：
+- 添加自动调整additive_mask长度的功能
+- 新增_adjust_additive_mask方法用于自动将additive_mask长度与键值序列对齐，解决KV缓存长度不匹配问题
+4. Model修复：
+- 修复注意力掩码和设备类型不一致的问题并添加梯度检查点
+- 修复了注意力掩码与hidden_states设备类型不一致的问题，将掩码转换为相同设备和类型。
+- 同时添加了梯度检查点功能以在训练时节省显存，使用非重入方式提高稳定性。
+5. Logger日志记录器完善：为日志构建函数添加控制台日志级别参数
+- 添加 console_level 参数以允许自定义控制台输出的日志级别，默认保持为 INFO 级别
+6. 更新预训练配置参数和注释格式
+- 将 eval_max_steps 改为 eval_interval 以更准确描述功能
+- 更新特殊标记格式为 <|SBOS|> 和 <|SEOS|>
+- 调整 vocab_size 和并行配置参数
+- 为日志配置添加注释说明
+
+### TODO:
+1. 优化训练脚本：
+- 添加 早停检查
+- 添加 EMA，平滑收敛过程，提升精度
+- 构建 metrics.py，统一管理训练指标
+- 精度与训练收敛的问题
+  - 使用 Label Smoothing，避免过拟合和提升泛化能力，建议支持参数配置。
+  - 引入 Prompt Mask、Position Shift等训练技巧
+  - PPL计算可能不准确，当前 evaluate() 中 ppl = exp(avg_loss)，但 avg_loss 是平均 token loss，若 loss mask 未正确处理，可能造成过大偏差。
+- 使用FSDP，当前最大支持 DP + DDP，未使用 torch.distributed.fsdp，对于几十亿参数以上的大模型在多节点下不够高效。
+2. 完善意外终止处理
+- 修复意外终止后爆出大量错误的问题，当训练意外终止时，会触发异常捕获，但异常捕获后未清理环境，导致大量错误日志输出。
+```
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 315, in _worker_loop
+    r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/queues.py", line 113, in get
+    if not self._poll(timeout):
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 256, in poll
+    return self._poll(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 315, in _worker_loop
+    r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 423, in _poll
+    r = wait([self], timeout)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/queues.py", line 113, in get
+    if not self._poll(timeout):
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 930, in wait
+    ready = selector.select(timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 256, in poll
+    return self._poll(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/selectors.py", line 415, in select
+    fd_event_list = self._selector.poll(timeout)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 423, in _poll
+    r = wait([self], timeout)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 202, in _handler
+    self.ckpt_mgr.save_sync(self.model, self.optimizer, self.scaler,
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 930, in wait
+    ready = selector.select(timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 77, in save_sync
+    state = self._collect_state(model, optimizer, scaler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/selectors.py", line 415, in select
+    fd_event_list = self._selector.poll(timeout)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 107, in _collect_state
+    "scaler_state": scaler.state_dict() if scaler else None,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 202, in _handler
+    self.ckpt_mgr.save_sync(self.model, self.optimizer, self.scaler,
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 622, in state_dict
+    "scale": self.get_scale(),
+             ^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 77, in save_sync
+    state = self._collect_state(model, optimizer, scaler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 550, in get_scale
+    else cast(float, scale.item())
+                     ^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 107, in _collect_state
+    "scaler_state": scaler.state_dict() if scaler else None,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 622, in state_dict
+    "scale": self.get_scale(),
+             ^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 550, in get_scale
+    else cast(float, scale.item())
+                     ^^^^^^^^^^^^
+RuntimeError: CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+RuntimeError: CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 315, in _worker_loop
+    r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/queues.py", line 113, in get
+    if not self._poll(timeout):
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 256, in poll
+    return self._poll(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 423, in _poll
+    r = wait([self], timeout)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 930, in wait
+    ready = selector.select(timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/selectors.py", line 415, in select
+    fd_event_list = self._selector.poll(timeout)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 202, in _handler
+    self.ckpt_mgr.save_sync(self.model, self.optimizer, self.scaler,
+  File "/workspace/utils/checkpoint.py", line 77, in save_sync
+    state = self._collect_state(model, optimizer, scaler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 107, in _collect_state
+    "scaler_state": scaler.state_dict() if scaler else None,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 622, in state_dict
+    "scale": self.get_scale(),
+             ^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 550, in get_scale
+    else cast(float, scale.item())
+                     ^^^^^^^^^^^^
+RuntimeError: CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Traceback (most recent call last):
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 315, in _worker_loop
+    r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/queues.py", line 113, in get
+    if not self._poll(timeout):
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 256, in poll
+    return self._poll(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 423, in _poll
+    r = wait([self], timeout)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/multiprocessing/connection.py", line 930, in wait
+    ready = selector.select(timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/selectors.py", line 415, in select
+    fd_event_list = self._selector.poll(timeout)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 202, in _handler
+    self.ckpt_mgr.save_sync(self.model, self.optimizer, self.scaler,
+  File "/workspace/utils/checkpoint.py", line 77, in save_sync
+    state = self._collect_state(model, optimizer, scaler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 107, in _collect_state
+    "scaler_state": scaler.state_dict() if scaler else None,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 622, in state_dict
+    "scale": self.get_scale(),
+             ^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 550, in get_scale
+    else cast(float, scale.item())
+                     ^^^^^^^^^^^^
+RuntimeError: CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[2025-07-18 13:12:28] [WARNING] [ByteLogger] 💀 收到 SIGINT，写入完整检查点 …
+[2025-07-18 13:12:28] [ERROR] [ByteLogger] 训练异常: DataLoader worker (pid 2124) exited unexpectedly with exit code 1. Details are lost due to multiprocessing. Rerunning with num_workers=0 may give better error trace.
+[2025-07-18 13:12:28] [INFO] [ByteLogger] 💀 异常退出，正在保存检查点…
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 685, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 397, in train_epoch
+    scaler.scale(loss).backward()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_tensor.py", line 648, in backward
+    torch.autograd.backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/__init__.py", line 353, in backward
+    _engine_run_backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/graph.py", line 824, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 202, in _handler
+    self.ckpt_mgr.save_sync(self.model, self.optimizer, self.scaler,
+  File "/workspace/utils/checkpoint.py", line 77, in save_sync
+    state = self._collect_state(model, optimizer, scaler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/utils/checkpoint.py", line 107, in _collect_state
+    "scaler_state": scaler.state_dict() if scaler else None,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 622, in state_dict
+    "scale": self.get_scale(),
+             ^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/amp/grad_scaler.py", line 550, in get_scale
+    else cast(float, scale.item())
+                     ^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/data/_utils/signal_handling.py", line 73, in handler
+    _error_if_any_worker_fails()
+RuntimeError: DataLoader worker (pid 2124) exited unexpectedly with exit code 1. Details are lost due to multiprocessing. Rerunning with num_workers=0 may give better error trace.
+```
+3. 解决 未检测梯度异常（NaN）问题，若 loss = NaN、grad = inf，应立即中止训练保存 checkpoint，避免浪费资源。
+
+### DEBUG
+1. 找出torch.utils.checkpoint问题根源并进行修复
+```
+/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py:838: UserWarning: torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly. In version 2.5 we will raise an exception if use_reentrant is not passed. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True. Refer to docs for more details on the differences between the two variants.
+  return fn(*args, **kwargs)
+```
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
