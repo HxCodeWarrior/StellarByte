@@ -53,6 +53,7 @@ def _build_logger(
     enable_color: bool = True,
     max_bytes: int = 10 * 1024 * 1024,  # 10MB
     backup_count: int = 5,
+    console_level: int = logging.INFO,
 ) -> logging.Logger:
     """
     构建并返回一个 logger。
@@ -64,6 +65,7 @@ def _build_logger(
         enable_color (bool): 是否启用控制台彩色日志。
         max_bytes (int): 单个日志文件的最大字节数。
         backup_count (int): 最多保留的备份数量。
+        console_level (int): 控制台输出日志级别，默认 INFO。
 
     Returns:
         logging.Logger: 已配置好的 logger 实例。
@@ -95,6 +97,7 @@ def _build_logger(
         console_handler.setFormatter(color_fmt)
     else:
         console_handler.setFormatter(formatter)
+    console_handler.setLevel(console_level)  # 设置控制台日志等级
     logger.addHandler(console_handler)
 
     # === 文件 handler（带回滚）===
