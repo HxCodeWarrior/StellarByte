@@ -164,7 +164,7 @@ class ByteMoE(nn.Module):
         y = y_flat.view(B, S, H)
 
         # === Step 7: 负载均衡loss计算 ===
-        aux_loss = self._balanced_loss(gate_scores, topk_indices)
+        aux_loss = self._balanced_loss(gate_scores, topk_indices_all)
 
         return y, aux_loss
 
