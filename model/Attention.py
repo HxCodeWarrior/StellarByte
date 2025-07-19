@@ -107,6 +107,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
         # XPos Rotary 位置编码模块
         self.rotary = XPosRotaryEmbedding(
             head_dim=self.head_dim,
+            max_seq_len=args.max_seq_len,
             scale_base=args.xpos_scale_base,
             theta=args.xpos_rope_theta,
         )
@@ -353,7 +354,12 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         # —— 4. Rotary Position Embedding —— 
         # 4.1 XPos Rotary 位置编码，生成长度为 (past_len + T) 的 cos, sin, scale，支持缓存历史拼接
-        cos_full, sin_full, scale_full = self.rotary._get_cos_sin_scale(past_len + T, device, compute_dtype)
+        cos_full, sin_full, scale_full = self.rotary._get_cos_sin_scale(
+            seq_len=past_len + T,
+            device=device,
+            dtype=compute_dtype,
+            offset=0 if self.kv_cache is None else past_len,
+        )
         # 4.2 只取当前输入位置对应的编码（即从past_len开始的切片）
         cos = cos_full[past_len : past_len + T]   # [T, head_dim]
         sin = sin_full[past_len : past_len + T]
