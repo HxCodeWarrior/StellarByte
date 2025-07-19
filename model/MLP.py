@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MLP(nn.Module):
+class ByteMLP(nn.Module):
     def __init__(
         self, 
         dim: int, 
@@ -12,7 +12,7 @@ class MLP(nn.Module):
         bias: bool = False
     ):
         """
-        门控多层感知机模块 (Gated MLP)
+        门控多层感知机模块 (Gated ByteMLP)
         
         参数:
         dim: 输入/输出特征的维度
@@ -78,10 +78,10 @@ if __name__ == '__main__':
         residual_dropout_prob=0.1,    # 残差连接dropout率
     )
 
-    mlp = MLP(args.model_dim)
+    ByteMLP = ByteMLP(args.model_dim)
 
     x = torch.randn(2, 16, args.model_dim)
 
-    output = mlp(x)
+    output = ByteMLP(x)
     print("Input shape : {}".format(x.shape))      # [batch_size, seq_len, model_dim]
     print("Output shape: {}".format(output.shape)) # [batch_size, seq_len, model_dim

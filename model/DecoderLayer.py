@@ -8,16 +8,16 @@ try:
     from .config           import ByteModelConfig
     from .utils.KVCache    import KVCache
     from .utils.DropPath   import DropPath
-    from .RMSNorm          import RMSNorm
-    from .Attention        import MultiHeadSelfAttention
-    from .MLP              import MLP
+    from .RMSNorm          import ByteRMSNorm
+    from .Attention        import ByteMultiHeadSelfAttention
+    from .MLP              import ByteMLP
 except:
     from config           import ByteModelConfig
     from utils.KVCache    import KVCache
     from utils.DropPath   import DropPath
-    from RMSNorm          import RMSNorm
-    from Attention        import MultiHeadSelfAttention
-    from MLP              import MLP
+    from RMSNorm          import ByteRMSNorm
+    from Attention        import ByteMultiHeadSelfAttention
+    from MLP              import ByteMLP
 
 
 class ByteDecoderLayer(nn.Module):
@@ -42,17 +42,17 @@ class ByteDecoderLayer(nn.Module):
         D = args.model_dim
 
         # ---------------- Norm ----------------
-        self.norm_attn = RMSNorm(D, eps=args.layer_norm_eps)
-        self.norm_ffn  = RMSNorm(D, eps=args.layer_norm_eps)
+        self.norm_attn = ByteRMSNorm(D, eps=args.layer_norm_eps)
+        self.norm_ffn  = ByteRMSNorm(D, eps=args.layer_norm_eps)
 
         # ---------------- Blocks --------------
-        self.self_attn = MultiHeadSelfAttention(
+        self.self_attn = ByteMultiHeadSelfAttention(
             args,
             kv_cache=kv_cache,
             layer_id=layer_id,
             num_layers=args.num_layers
         )
-        self.mlp = MLP(
+        self.mlp = ByteMLP(
             dim=D,
             hidden_dim=args.hidden_dim,
             multiple_of=args.dim_multiplier,

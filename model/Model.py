@@ -22,12 +22,12 @@ try:
     from .config        import ByteModelConfig      # 模型配置类（超参数集中管理）
     from .DecoderLayer  import ByteDecoderLayer     # 单层解码器实现（Attention + MLP）
     from .utils.KVCache import KVCache              # 高性能 KV 缓存（推理加速）
-    from .RMSNorm       import RMSNorm              # RMSNorm 归一化层
+    from .RMSNorm       import ByteRMSNorm              # RMSNorm 归一化层
 except:
     from config         import ByteModelConfig       
     from DecoderLayer   import ByteDecoderLayer
     from utils.KVCache  import KVCache        
-    from RMSNorm        import RMSNorm              
+    from RMSNorm        import ByteRMSNorm              
 
 __all__ = ["ByteTransformer"]
 
@@ -84,7 +84,7 @@ class ByteTransformer(PreTrainedModel):
         )
 
         # ------- 输出前归一化 -------
-        self.norm = RMSNorm(D, eps=config.layer_norm_eps)
+        self.norm = ByteRMSNorm(D, eps=config.layer_norm_eps)
 
         # ------- LM Head -------
         self.lm_head = nn.Linear(D, config.vocab_size, bias=False)

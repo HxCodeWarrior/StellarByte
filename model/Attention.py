@@ -15,7 +15,7 @@ except:
     from utils.KVCache      import KVCache
     from Position_Embedding import XPosRotaryEmbedding
 
-class MultiHeadSelfAttention(nn.Module):
+class ByteMultiHeadSelfAttention(nn.Module):
     """
     多头自注意力机制实现，支持：
       - XPos Rotary 位置编码（稳定长序列）
@@ -429,7 +429,7 @@ if __name__ == "__main__":
     # ===== 无KVCache测试 =====
     print("BaseTest without KVCache...")
     # 创建Attention层
-    attention = MultiHeadSelfAttention(args)
+    attention = ByteMultiHeadSelfAttention(args)
     
     # 创建测试输入
     batch_size = 2
@@ -455,7 +455,7 @@ if __name__ == "__main__":
         device=x.device
     )
 
-    attn_kvcache = MultiHeadSelfAttention(args, kv_cache=kv_cache)
+    attn_kvcache = ByteMultiHeadSelfAttention(args, kv_cache=kv_cache)
     print(attn_kvcache)
     
     # 模拟自回归生成过程

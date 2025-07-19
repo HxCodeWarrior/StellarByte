@@ -23,7 +23,7 @@ def _rms_norm(x: torch.Tensor,
     return (x * inv_rms) * weight
 
 
-class RMSNorm(nn.Module):
+class ByteRMSNorm(nn.Module):
     """
     RMSNorm（Root‑Mean‑Square Layer Norm）
 
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     from config import ByteModelConfig
 
     args = ByteModelConfig()
-    norm = RMSNorm(args.model_dim, args.layer_norm_eps)
+    norm = ByteRMSNorm(args.model_dim, args.layer_norm_eps)
     x = torch.randn(1, 512, args.model_dim)
     output = norm(x)
     print(output.shape) # torch.Size([1, 512, args.model_dim])
