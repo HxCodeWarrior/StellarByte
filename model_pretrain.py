@@ -31,7 +31,7 @@ from model.Model import ByteTransformer
 from model.config import ByteModelConfig
 from utils.checkpoint import CheckpointManager, GracefulKiller
 from utils.progressbar import ProgressBarManager
-from utils.logger import get_logger, _build_logger
+from utils.logger import register_global_exception_handler, _build_logger
 from utils.config_params import load_config
 
 console = Console()
@@ -652,6 +652,7 @@ if __name__ == "__main__":
         console_level=logging.INFO,
         enable_color=True,
     )
+    register_global_exception_handler(logger)
 
     # ==== 自动降级为 CPU（若无 CUDA）====                         
     if args.device.startswith("cuda") and not torch.cuda.is_available():  
