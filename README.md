@@ -387,7 +387,7 @@ StellarByte 是一个基于 Transformer 架构的高性能语言模型实现，�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/StellarByte.git
+git clone https://github.com/HxCodeWarrior/StellarByte.git
 cd StellarByte
 
 # 安装依赖
@@ -416,10 +416,10 @@ pip install -r requirements.txt[dev]
 
 ```python
 import torch
-from stellarbyte import ByteModel, ByteConfig
+from stellarbyte import ByteTransformer, ByteConfig
 
 # 创建配置
-config = ByteConfig(
+config = ByteModelConfig(
     vocab_size=32000,
     hidden_size=768,
     num_hidden_layers=12,
@@ -428,7 +428,7 @@ config = ByteConfig(
 )
 
 # 初始化模型
-model = ByteModel(config)
+model = ByteTransformer(config)
 
 # 准备输入
 inputs = torch.randint(0, 32000, (1, 512))
@@ -442,11 +442,11 @@ outputs = model(inputs)
 ### 从 HuggingFace 加载预训练模型
 
 ```python
-from stellarbyte import ByteModel
+from stellarbyte import ByteTransformer
 from transformers import AutoTokenizer
 
 # 加载模型和分词器
-model = ByteModel.from_pretrained("path/to/model")
+model = ByteTransformer.from_pretrained("path/to/model")
 tokenizer = AutoTokenizer.from_pretrained("path/to/tokenizer")
 
 # 编码文本
@@ -460,11 +460,11 @@ print(tokenizer.decode(outputs[0]))
 ### 使用 LoRA 进行参数高效微调
 
 ```python
-from stellarbyte import ByteModel, LoRAConfig
+from stellarbyte import ByteTransformer, LoRAConfig
 from stellarbyte.lora import apply_lora_to_model
 
 # 加载基础模型
-model = ByteModel.from_pretrained("path/to/model")
+model = ByteTransformer.from_pretrained("path/to/model")
 
 # 配置 LoRA
 lora_config = LoRAConfig(
@@ -1015,6 +1015,81 @@ RuntimeError: DataLoader worker (pid 2124) exited unexpectedly with exit code 1.
 /root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py:838: UserWarning: torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly. In version 2.5 we will raise an exception if use_reentrant is not passed. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True. Refer to docs for more details on the differences between the two variants.
   return fn(*args, **kwargs)
 ```
+
+---
+
+<details>
+  <summary>2025.7.19</summary>
+
+### DONE
+1. 给每个组件添加专属标志
+2. 完善requirements.txt
+3. 优化训练脚本，添加异常自动处理
+4. 测试训练脚本通过
+- 解决存在于多头自注意力层中的torch.utils.checkpoint配置use_reentrant=False问题
+- 修复意外终止后爆出大量错误的问题，当训练意外终止时，会触发异常捕获，但异常捕获后未清理环境，导致大量错误日志输出。
+5. 新增多阶段训练的tokenizer实现
+- 支持数学表达式、代码块和XML结构的特殊处理
+- 多阶段渐进式词汇表训练
+- 内存优化的批处理生成器
+- 完整的配置文件和特殊token支持
+- 内置评估功能验证tokenizer效果
+6. 添加环境设置脚本和安装文档
+- 添加 Windows 和 Unix 的环境设置脚本，用于自动化安装和配置开发环境
+- 添加 INSTALL.md 和 CONTRIBUTING.md 文档，提供详细的安装和贡献指南
+- 添加 setup.py 用于管理项目依赖和安装配置
+- 环境设置脚本支持以下功能：
+  - 检查系统依赖
+  - 创建虚拟环境
+  - 安装项目依赖
+  - 验证安装
+  - 支持开发环境和 CUDA 选项
+7. 优化位置编码
+- 添加max_seq_len参数，支持预计算并缓存最大长度的位置编码
+- 优化_get_cos_sin_scale方法，支持通过offset参数获取指定窗口的编码切片
+8. 优化Attention，添加repeat_kv方法实现Grouped-Query Attention用于重复Key/Value张量以匹配Query的头数
+9. 重构门控多层感知机模块并添加残差连接
+- 合并w1和w3为共享参数的w13线性层
+- 使用GEGLU门控结构替代原有实现
+- 添加ByteRMSNorm归一化层
+- 引入残差连接提升梯度流动
+10. 构建基础的MoE层，但是结构逻辑还不完善无法应用，需要优化
+11. 构建基础的MeMory记忆机制，支持以下功能：
+- update(layer_idx, new_hidden)
+  - 更新指定层的 memory。
+  - 支持 detach()，避免梯度回传污染；
+  - 若原有记忆不为空，则拼接当前 new_hidden 并截断至 mem_len；
+  - 自动进行设备匹配（如切 GPU）。
+- update_all(new_hiddens)
+  - 批量更新所有层的记忆（例如每次 forward 后更新）。
+  - 要求传入的列表长度等于 n_layers；
+  - 内部调用 update 函数。
+- get(layer_idx),返回指定层的记忆，用于当前推理拼接。
+- clear(),清除所有层的记忆（可用于每段上下文/任务之间清零）。
+- to(device),将当前缓存迁移至指定设备（通常在模型迁移时同步迁移）。
+- memory_size(),返回各层当前保留的记忆长度（token 数），有助于调试。
+- __repr__(),清晰展示当前内存使用状态，方便日志输出。
+
+### TODO
+1. MoE层优化：
+- 分布式MoE，接入 DeepSpeed-MoE 或 FSDP 的 MoE 实现模块
+- 路由器重参数优化，使用 GShard-style noisy-topk 或 Gumbel Softmax 提高探索能力
+- 高效专家共享，多个 MoE 层复用共享专家池（如 M6、GLaM），可用专家池统一调度
+- 提高 token 分派和执行效率	,替代逐专家收集方式，转向基于稀疏表示的并行处理
+- 减少内存浪费,用稀疏张量或稀疏路由结构替代稠密 dispatch_mask
+- 增强鲁棒性,对 token 溢出部分引入“残差路径”或再路由机制
+- 改进负载均衡 Loss,引入 softmax entropy、expected load KL loss 等更合理的约束
+- 增强模块清晰度和可维护性,拆解功能函数、清晰注释、命名标准化
+- 动态专家激活数 k,训练过程中自动调整 k，更智能化调度
+- 混合容量调度策略,高优先 token 分配更多容量
+- 模块化解耦,分离 Gate, Router, Expert 更便于替换
+2. 尝试嵌入MoE层优化模型
+3. MeMory机制优化：
+- 支持滑动窗口更新，设定窗口滑动的比例，实现更加平滑的记忆更替
+- 混合KVCache，将KV缓存与hidden memory统一管理，为Attention服务
+- 持久化保存，提供save()、load()，支持中断恢复
+
+</details>
 
 ---
 
