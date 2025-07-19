@@ -197,6 +197,30 @@ class ByteMultiHeadSelfAttention(nn.Module):
         mask[heads] = False
         self.head_mask = mask
 
+    def repeat_kv(self, kv: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        重复 Key/Value 以匹配 Query 的头数（Grouped-Query Attention）
+
+        输入:
+            kv: Tensor[B, T, num_kv_heads, head_dim] - 原始的 KV 张量
+            n_rep: int - 每个 KV 需要复制的次数，使其头数与 Q 对齐
+
+        返回:
+            Tensor[B, T, num_kv_heads * n_rep, head_dim] - 重复后的 KV 张量
+        """
+        if n_rep == 1:
+            return kv
+
+        assert kv.dim() == 4, f"kv 应为 4 维 [B, T, num_kv_heads, D]，但得到 {kv.shape}"
+        B, T, num_kv_heads, D = kv.shape
+
+        # 新形状: [B, T, num_kv_heads, n_rep, D] → reshape 到 [B, T, num_kv_heads * n_rep, D]
+        kv = kv.unsqueeze(3)                     # [B, T, num_kv_heads, 1, D]
+        kv = kv.expand(B, T, num_kv_heads, n_rep, D)  # [B, T, num_kv_heads, n_rep, D]
+        kv = kv.reshape(B, T, num_kv_heads * n_rep, D)  # [B, T, num_heads, D]
+
+        return kv.contiguous()  # 确保内存连续，避免后续错误
+
     def _build_attention_mask(self, T: int, Tk: int, additive_mask: Optional[torch.Tensor]):
         """
         构建注意力掩码：
@@ -324,8 +348,8 @@ class ByteMultiHeadSelfAttention(nn.Module):
         if self.num_local_kv_heads != self.num_local_heads:
             repeat_times = self.num_local_heads // self.num_local_kv_heads
             # 在 head 维度上平铺
-            k = k.repeat_interleave(repeat_times, dim=2)
-            v = v.repeat_interleave(repeat_times, dim=2)
+            k = self.repeat_kv(k, repeat_times)
+            v = self.repeat_kv(v, repeat_times)
 
         # —— 4. Rotary Position Embedding —— 
         # 4.1 XPos Rotary 位置编码，生成长度为 (past_len + T) 的 cos, sin, scale，支持缓存历史拼接
