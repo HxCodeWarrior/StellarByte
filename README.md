@@ -553,7 +553,7 @@ StellarByte/
 ## 🔜 开发计划
 
 <details> 
-  <summary>2025.7.13</summary>
+<summary>2025.7.13</summary>
 
 ### Done:
 1. 实现BaseModelConfig类，后续的超参数将逐渐迭代
@@ -570,7 +570,7 @@ StellarByte/
 ---
 
 <details> 
-  <summary>2025.7.14</summary>
+<summary>2025.7.14</summary>
 
 ### Done:
 1. 实现Attention应用缓存机制
@@ -612,7 +612,7 @@ StellarByte/
 ---
 
 <details>
-  <summary>2025.7.15</summary>
+<summary>2025.7.15</summary>
 
 ### Done:
 1. 构建并优化模型训练组件：
@@ -654,7 +654,7 @@ StellarByte/
 ---
 
 <details>
-  <summary>2025.7.16</summary>
+<summary>2025.7.16</summary>
 
 ### Done:
 1. 实现分布式多卡训练
@@ -705,7 +705,7 @@ StellarByte/
 ---
 
 <details>
-  <summary>2025.7.17</summary>
+<summary>2025.7.17</summary>
 
 ### DONE:
 1. 增强模型分析报告功能并添加可视化图表
@@ -747,7 +747,7 @@ StellarByte/
 ---
 
 <details>
-  <summary>2025.7.18</summary>
+<summary>2025.7.18</summary>
 
 ### DONE:
 
@@ -1019,7 +1019,7 @@ RuntimeError: DataLoader worker (pid 2124) exited unexpectedly with exit code 1.
 ---
 
 <details>
-  <summary>2025.7.19</summary>
+<summary>2025.7.19</summary>
 
 ### DONE
 1. 给每个组件添加专属标志
