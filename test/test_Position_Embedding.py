@@ -16,6 +16,7 @@ import pytest
 def config():
     return ByteModelConfig(
         model_dim=64,
+        max_seq_len=2048,
         xpos_rope_theta=10000.0,
         xpos_scale_base=512
     )
@@ -24,7 +25,7 @@ def config():
 def test_initialization(config):
     """测试位置编码模块初始化"""
     head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
     
     # 验证缓冲区注册
     assert hasattr(rotary, "inv_freq")
@@ -39,13 +40,13 @@ def test_initialization(config):
 def test_odd_dimension_exception():
     """测试奇数维度时的异常抛出"""
     with pytest.raises(AssertionError, match="Dimension must be even for rotary embedding."):
-        XPosRotaryEmbedding(head_dim=63, scale_base=512, theta=10000.0)
+        XPosRotaryEmbedding(head_dim=63, max_seq_len=1024, scale_base=512, theta=10000.0)
 
 # 测试前向传播形状
 def test_forward_shape(config):
     """测试输出形状一致性"""
     head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
     
     # 创建测试输入
     batch_size, seq_len, num_heads = 2, 128, 4
@@ -63,7 +64,7 @@ def test_forward_shape(config):
 def test_xpos_numerical_stability(config):
     """XPos 应该能够在较长序列上保持数值稳定而不爆炸"""
     head_dim = config.model_dim // config.num_attention_heads
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
 
     # 构造大序列
     xq = torch.randn(1, 2048, config.num_attention_heads, head_dim)
@@ -79,10 +80,10 @@ def test_xpos_numerical_stability(config):
 def test_scale_effect(config):
     """测试缩放因子对输出的影响"""
     head_dim = config.model_dim
-    base_rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    base_rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
     
     # 创建不同缩放因子的模块
-    scaled_rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base * 2, config.xpos_rope_theta)
+    scaled_rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base * 2, config.xpos_rope_theta)
     
     # 相同输入
     xq = torch.randn(1, 10, 1, head_dim)
@@ -104,7 +105,7 @@ def test_device_compatibility(config, device):
         pytest.skip("CUDA not available")
     
     head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta).to(device)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta).to(device)
     
     # 创建测试输入
     xq = torch.randn(2, 64, 2, head_dim, device=device)
@@ -122,7 +123,7 @@ def test_device_compatibility(config, device):
 def test_variable_sequence_length(config, seq_len):
     """测试不同序列长度的处理能力"""
     head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
     
     # 创建测试输入
     xq = torch.randn(1, seq_len, 1, head_dim)
@@ -139,7 +140,7 @@ def test_variable_sequence_length(config, seq_len):
 def test_numerical_stability(config):
     """测试极端条件下的数值稳定性"""
     head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.xpos_scale_base, config.xpos_rope_theta)
+    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
     
     # 创建极端输入（大值）
     xq = torch.randn(1, 2048, 8, head_dim) * 100
