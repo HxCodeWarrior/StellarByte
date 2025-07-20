@@ -1095,6 +1095,83 @@ RuntimeError: DataLoader worker (pid 2124) exited unexpectedly with exit code 1.
 
 ---
 
+<details>
+<summary>2025.7.20</summary>
+
+### DONE
+1. 构建MoERouter路由系统
+- 上下文感知的门控机制（Context-Aware Gating） -> 可支持长序列、多语言、大模型调度场景，对稀疏表示建模能力强。
+  - 引入位置编码 + 历史状态 + 当前语义特征形成联合上下文表示（context_feat）。
+  - 门控网络 (gate_mlp) 输入为 [x, context_feat]，可适应当前token与上下文的微妙变化。
+  - RMSNorm 与 dropout 提升模型稳定性与泛化能力。
+- 温度动态调整与专家优先级 -> 实现冷热专家动态激活、收敛更快、路由更稳定、token 分布更均衡。
+  - 使用 self.temperature 根据专家负载差异动态调整 softmax 温度，控制专家选择的分布熵。
+  - 专家优先级通过 self.expert_priority 和 self.expert_cold_priority 动态更新，对不活跃专家提供冷启动支持。
+- 动态容量调控机制 -> 解决 token 分布极不均衡时的容量瓶颈问题，是大规模 MoE 模型部署的关键组件。
+  - 使用专家利用率 (expert_utilization) 调整每轮 capacity，防止部分专家长期饱和或闲置。
+  - 可设置最大/最小容量上下限，兼顾弹性与稳定性。
+- 高效的向量化专家分发调度 -> 完全向量化实现，性能优于 for-loop 调度；适用于 TP/SP 并行环境下的调度计划生成。
+  - _vectorized_dispatch 基于 torch_scatter + top-k 分发权重构建专家-样本映射表。
+  - token 主导分发（由 gate 输出控制），专家主导筛选（基于分配优先级与容量限制）。
+  - 分配逻辑明确：可用专家优先 + 权重越大优先。
+- 溢出处理机制（Overflow Handling） -> 避免 token 丢失，保障模型鲁棒性，提高模型训练稳定性。
+  - 溢出token 采用 备选专家机制（非 top-k 中分数最高的）、冷启动专家路由、历史专家粘性 fallback 和最终 随机 fallback。
+  - fallback 倾向于选择负载轻 + 长期未活跃 + 学习权重高的专家。
+- 多目标负载均衡损失（Aux Loss） -> 保证路由稳定与专家均匀负载，提升训练效率和专家泛化能力。
+  - 通过 KL、MSE 和专家 load variance 实现路由熵约束，提升分布均匀性。
+  - 引入 token entropy 权重机制，高不确定性 token 被更精细处理。
+- 专家状态更新与自适应学习 -> 实现专家生命周期管理，支持在线专家剔除/替换、冷热专家切换等机制。
+  - 维护专家分配状态（expert_load, utilization, priority）并通过 EMA 更新。
+  - 统计信息支持动态调度决策与训练指标监控。
+2. 一句MoERouter重构MoE层
+- 专家并行（Expert Parallelism）支持：设计中明确区分了num_experts（全局专家数）和num_local_experts（当前设备上的专家数），并且通过dist分布式通信管理专家并行。
+- 动态容量管理：通过router_config中max_capacity参数以及缓冲区expert_inputs和expert_outputs的动态分配，对专家输入容量的控制，避免了静态固定容量导致的内存浪费。
+- 容错路由机制：使用fallback_expert来处理“溢出token”，防止因专家容量限制导致token丢失，增强鲁棒性。同时提供dropout机制，避免过拟合。
+- 零浪费内存管理：预注册缓冲区避免动态内存分配，减少显存碎片和频繁分配开销，利于高效训练。
+- 构建丰富性能监控指标：包括专家利用率、负载不均衡度、溢出率等，方便实时监控MoE层运行状况。
+- 动态专家负载均衡（split/merge）策略：设计了根据利用率动态分裂过载专家、合并低载专家的机制，有利于训练期间专家资源自适应调整，提升模型效率。
+- 设计合理专家模块：专家内部使用带门控的GLU结构（激活+门控乘积）及归一化，符合当前MoE专家的主流设计，计算效率和表达能力兼顾。
+3. Memory机制优化：
+- 分层记忆控制：底层可保留更长历史，高层可减少计算
+- 智能batch处理：支持batch尺寸变化时的自动广播/裁剪
+- 记忆融合：新旧记忆加权融合保留关键信息
+- 策略配置：提供strict/select/repeat三种尺寸适配策略
+4. 构建相关测试代码并修复bug
+- 构建Memory测试代码并测试通过，修复了相关BUG
+- 构建MoERouter测试代码并测试通过，修复了相关BUG
+
+### TODO
+1. MoE层优化：
+- 构建MoE层预热机制
+2. 训练脚本中加入
+- update_cold_priority()，用于更新冷门专家优先级
+```python
+@torch.no_grad()
+def update_cold_priority(self):
+    # 利用当前专家利用率，低利用率专家冷启动优先级提升
+    utilization = self.expert_utilization.clamp(0, 1)
+    cold_priority = 1.0 + (1.0 - utilization)  # 低利用率加成范围[1,2]
+    self.expert_cold_priority.copy_(cold_priority)
+```
+3. 构建test_MoERouter.py测试代码，并修复相关BUG
+4. 构建test_MoE.py测试代码，并修复相关BUG
+5. 尝试嵌入MoE层优化模型
+6. MoERouter还存在如下问题待解决：
+- 问题 1：专家冷启动权重的初始化过于统一，self.expert_cold_priority 默认全为 1，缺乏基于历史统计的初始化策略。
+  - 建议：可引入冷启动历史时间戳或冷却时间窗口，动态更新 [1.0, 2.0] 分布。
+- 问题 2：fallback 过程存在冲突风险，在 _handle_overflow_fallback 中，多个 token 可能争用同一专家，尤其在 batch 大时未完全并发安全。
+  - 建议：可引入 dispatch_bitmap 或利用 index_put_ + 原子计数方案更安全更新。
+- 问题 4：专家分配策略缺乏分布式感知，当前所有专家调度逻辑基于单节点信息，不考虑跨 GPU / TP experts 的分布。
+  - 建议：引入跨设备 expert_rank，构建 local_vs_global_expert_mask，实现跨节点负载均衡。
+- 问题 5：调度信息未显式支持多粒度 token 分配，当前所有分配基于 flat token，如果输入有 padding/attention mask，则可能错误分配。
+  - 建议：引入 token_mask 机制，精确控制有效 token。
+- 问题 6：负载统计状态未持久化/存盘，expert_priority, utilization 等状态参数在训练过程中变化大，但未持久化或复用。
+  - 建议：加持久化接口（如save_state_dict / load_state_dict），支持热重启。
+
+</details>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
