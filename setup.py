@@ -24,11 +24,11 @@ setup(
     name="stellarbyte",
     version=get_version(),
     author="ByteWyrm",
-    author_email="bytewyrm@example.com",
+    author_email="bytewyrm@163.com",
     description="高性能Transformer语言模型实现",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/StellarByte",
+    url="https://github.com/HxCodeWarrior/StellarByte",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
