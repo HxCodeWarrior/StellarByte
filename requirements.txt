@@ -4,6 +4,9 @@ torch==2.5.1
 torchvision==0.20.1
 transformers>=4.30.0
 
+# 算法优化
+torch_scatter>=2.1.2
+
 # 数据处理
 numpy>=1.24.0
 pandas>=2.0.0
