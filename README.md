@@ -830,7 +830,7 @@ def update_cold_priority(self):
 
 ---
 
-<detaills>
+<details>
 <summary>2025.7.21</summary>
 
 ### DONE
