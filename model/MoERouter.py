@@ -11,7 +11,7 @@ try:
 except ImportError:
     from RMSNorm import ByteRMSNorm
     from MLP import ByteMLP
-    
+
 
 class ByteContextAwareRouter(nn.Module):
     """
@@ -32,6 +32,7 @@ class ByteContextAwareRouter(nn.Module):
                  num_experts: int,
                  k: int = 2,
                  capacity_factor: float = 1.25,
+                 max_positions: int = 4096,
                  max_capacity: int = 2048,
                  min_capacity: int = 4,
                  aux_loss_coef: float = 0.01,
@@ -43,10 +44,13 @@ class ByteContextAwareRouter(nn.Module):
         self.num_experts = num_experts
         self.k = k
         self.capacity_factor = capacity_factor
-        self.max_capacity = max_capacity
-        self.min_capacity = min_capacity
-        self.aux_loss_coef = aux_loss_coef
-        self.context_dim = context_dim
+        self.max_positions   = max_positions
+        self.max_capacity    = max_capacity
+        self.min_capacity    = min_capacity
+        self.aux_loss_coef   = aux_loss_coef
+        self.context_dim     = context_dim
+        self.position_dim   = context_dim // 2
+        self.hist_dim        = hidden_size
         
         # 上下文特征提取器
         self.context_net = nn.Sequential(
@@ -56,23 +60,33 @@ class ByteContextAwareRouter(nn.Module):
         )
         
         # 门控网络 - 上下文增强
-        self.gate_norm = ByteRMSNorm(hidden_size + context_dim)  # 输入归一化
+        self.gate_input_dim = (
+            hidden_size + 
+            context_dim + 
+            self.position_dim + 
+            self.hist_dim
+        )
+        self.gate_norm = ByteRMSNorm(self.gate_input_dim)  # 输入归一化
         self.gate_mlp  = ByteMLP(
-            dim=hidden_size + context_dim,
+            dim=self.gate_input_dim,
             hidden_dim=None,              # 默认自动计算
             multiple_of=multiple_of,              # 与主网络对齐
             dropout=dropout,
             bias=False
         )
-        self.gate_proj    = nn.Linear(hidden_size + context_dim, num_experts, bias=False)  # 输出专家 logits
+        self.res_gate = nn.Sequential(
+            nn.Linear(self.gate_input_dim, self.gate_input_dim),
+            nn.Sigmoid()
+        )
+        self.gate_proj    = nn.Linear(self.gate_input_dim, num_experts, bias=False)  # 输出专家 logits
         self.gate_dropout = nn.Dropout(dropout)
         
         # 位置编码
-        self.position_emb = nn.Embedding(4096, context_dim // 2)
+        self.position_emb = nn.Embedding(self.max_positions, self.position_dim)
         
         # 专家状态跟踪
-        self.register_buffer("expert_load", torch.zeros(num_experts))
-        self.register_buffer("expert_utilization", torch.ones(num_experts) * 0.5)
+        self.register_buffer("expert_load", torch.zeros(num_experts, dtype=torch.float32))
+        self.register_buffer("expert_utilization", torch.ones(num_experts, dtype=torch.float32) * 0.5)
         self.register_buffer("expert_priority", torch.ones(num_experts))
         self.register_buffer("total_tokens", torch.tensor(0))
         self.register_buffer("expert_assignment_count", torch.zeros(num_experts, dtype=torch.long))
@@ -119,15 +133,15 @@ class ByteContextAwareRouter(nn.Module):
         context_feat = self.context_net(x_flat)
         
         # 历史状态上下文
+        hist_context = torch.zeros(N, self.hist_dim, device=x.device)
         if prev_hidden is not None:
             hist_context = prev_hidden.unsqueeze(1).expand(B, S, -1).contiguous().view(N, -1)
-            context_feat = torch.cat([context_feat, hist_context], dim=-1)
         
         # 组合上下文特征
-        context_feat = torch.cat([context_feat, pos_emb], dim=-1)
+        context_feat = torch.cat([x_flat, context_feat, pos_emb, hist_context], dim=-1)
         
         # ===== 2. 上下文感知门控 =====
-        gate_input = torch.cat([x_flat, context_feat], dim=-1)
+        gate_input = context_feat
         gate_input = self.gate_norm(gate_input)
         gate_hidden = self.gate_mlp(gate_input)
         gate_hidden = gate_hidden + gate_input
@@ -297,6 +311,9 @@ class ByteContextAwareRouter(nn.Module):
         # =============== [Step 1] 获取溢出 token 的备选候选专家 ===============
         overflow_idx = overflow_mask.nonzero(as_tuple=False).squeeze(1)  # [M]
         M = overflow_idx.size(0)
+        # 检查是否有token需要处理
+        if M == 0:
+            return
         all_scores = gate_scores[overflow_idx]        # [M, E]
         original_topk = topk_indices[overflow_idx]    # [M, k]
 
@@ -308,8 +325,18 @@ class ByteContextAwareRouter(nn.Module):
         # 保留备选专家得分
         candidate_scores = all_scores.masked_fill(~candidate_mask, float("-inf"))
 
-        # 获取备选专家中分数靠前的 backup_k 个
-        backup_k = min(4, self.num_experts - self.k)
+        # 动态计算每个 token 的可用备选专家数量
+        candidate_counts = candidate_mask.sum(dim=1)  # [M]
+        max_backup_k = candidate_counts.min().item()  # 所有 token 可用的最小专家数
+
+        # 设置最终使用的 backup_k
+        backup_k = min(4, self.num_experts - self.k, max_backup_k)
+
+        if backup_k <= 0:
+            # 无备选专家，进入粘性 fallback
+            return self._sticky_fallback(overflow_idx, dispatch_info, capacity)
+
+        # 安全执行 topk
         backup_scores, backup_experts = torch.topk(candidate_scores, backup_k, dim=-1)  # [M, backup_k]
 
         # =============== [Step 2] 尝试为溢出 token 分配 backup 专家 ===============
@@ -538,7 +565,9 @@ class ByteContextAwareRouter(nn.Module):
         
         # 计算当前负载
         current_load = torch_scatter.scatter_add(
-            torch.ones_like(flat_expert_idx), flat_expert_idx, dim_size=self.num_experts
+            torch.ones_like(flat_expert_idx, dtype=torch.float32), 
+            flat_expert_idx, 
+            dim_size=self.num_experts
         )
         
         # 计算分配成功率
