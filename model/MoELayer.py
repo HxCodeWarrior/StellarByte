@@ -152,3 +152,11 @@ class ByteMoELayer(nn.Module):
 
         out = self.dropout(token_outputs.view(B, S, H))
         return out, aux_loss
+
+if __name__ == "__main__":
+    B, S, H = 2, 4, 16
+    x = torch.randn(B, S, H)
+    model = ByteMoELayer(hidden_size=H, ffn_hidden_size=H*4, num_experts=4, k=4)
+    out, aux_loss = model(x)
+    print("输出形状:", out.shape) # [batch_size, seq_len, hidden_size]
+    print("辅助损失:", aux_loss)
