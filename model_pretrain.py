@@ -426,7 +426,7 @@ def train_epoch(model, dataloader, tokenizer, optimizer, scaler, ctx, args, epoc
         
         # 计算每秒处理 token 数（通过时间差估算）
         tokens_per_s  = tokens_this_batch / max(1e-6, time.perf_counter() - start_wall)
-        gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
+        gpu_mem       = torch.cuda.memory_allocated(args.device) if args.device=="cuda" and torch.cuda.is_available() else 0
 
         if is_main_process(args):
             # —— 轻量 checkpoint(按步) ——
