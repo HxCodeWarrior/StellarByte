@@ -358,7 +358,6 @@ class ByteMultiHeadSelfAttention(nn.Module):
             seq_len=past_len + T,
             device=device,
             dtype=compute_dtype,
-            offset=0 if self.kv_cache is None else past_len,
         )
         # 4.2 只取当前输入位置对应的编码（即从past_len开始的切片）
         cos = cos_full[past_len : past_len + T]   # [T, head_dim]

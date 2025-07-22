@@ -95,45 +95,38 @@ class XPosRotaryEmbedding(nn.Module):
         else:
             self.register_buffer("log_scale_weight", torch.arange(0, head_dim // 2).float() / (head_dim // 2))
 
-    def _get_cos_sin_scale(self, seq_len: int, device, dtype, offset=0):
+    def _get_cos_sin_scale(self, seq_len: int, device, dtype):
         """
         获取cos, sin, scale三个张量的当前窗口切片。
 
         Args:
             seq_len: 当前序列长度
-            offset: 当前窗口起始位置偏移
-
+            device: 当前设备
+            dtype: 当前数据类型
         Returns:
             cos, sin, scale: [seq_len, dim]
         """
         # 从缓存取最大长度的cos/sin/scale
-        cos, sin, scale = RotaryCache.get(device, dtype, self.max_seq_len, self.dim, self.theta, self.scale_base)
-
-        # 切片对应offset窗口
-        cos = cos[offset : offset + seq_len]
-        sin = sin[offset : offset + seq_len]
+        cos, sin, scale = RotaryCache.get(device, dtype, seq_len, self.dim, self.theta, self.scale_base)
 
         # 如果使用learnable scale，需要覆盖scale
         if self.learnable_scale:
-            scale = self._compute_xpos_scale(seq_len, device, dtype, offset)
-        else:
-            scale = scale[offset : offset + seq_len]
+            scale = self._compute_xpos_scale(seq_len, device, dtype)
 
         return cos, sin, scale
 
-    def _compute_xpos_scale(self, seq_len: int, device, dtype, offset=0):
+    def _compute_xpos_scale(self, seq_len: int, device, dtype):
         """
-        计算XPos缩放因子scale，支持offset。
+        计算XPos缩放因子scale
 
         Args:
             seq_len: 当前序列长度
-            offset: 当前窗口起始位置偏移（全局序列位置）
 
         Returns:
             scale: [seq_len, dim]
         """
-        # 位置范围考虑offset
-        pos = (torch.arange(offset, offset + seq_len, device=device, dtype=dtype) - self.max_seq_len // 2) / self.scale_base
+        # 位置范围
+        pos = (torch.arange(seq_len, device=device, dtype=dtype) - seq_len // 2) / self.scale_base
         pos = pos.unsqueeze(-1)  # [seq_len, 1]
 
         # 利用log_scale_weight作为缩放权重，广播至seq_len
@@ -159,11 +152,11 @@ class XPosRotaryEmbedding(nn.Module):
         x1, x2 = x[..., ::2], x[..., 1::2]  # 偶数和奇数分离
         return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, xq: torch.Tensor, xk: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, xq: torch.Tensor, xk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            xq, xk: [batch, seq_len, n_head, head_dim]
-            offset: 当前序列在全局序列中的起始位置，用于动态索引cos/sin/scale缓存
+            xq: [batch, seq_len, n_head, head_dim]
+            xk: [batch, seq_len, n_head, head_dim]
         Returns:
             xq_rot, xk_rot: 同形状，加入了XPos嵌入
         """
@@ -174,7 +167,7 @@ class XPosRotaryEmbedding(nn.Module):
             raise ValueError(f"head_dim mismatch: got {D}, expected {self.dim}")
 
         # 获取当前窗口对应的cos/sin/scale
-        cos, sin, scale = self._get_cos_sin_scale(S, device, dtype, offset)  # [S, D]
+        cos, sin, scale = self._get_cos_sin_scale(S, device, dtype)  # [S, D]
 
         # 增加batch和head维度，方便广播: [1, S, 1, D]
         cos = cos[None, :, None, :]  # [1, seq_len, 1, dim]
