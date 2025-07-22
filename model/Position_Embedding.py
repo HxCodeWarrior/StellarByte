@@ -65,7 +65,7 @@ class XPosRotaryEmbedding(nn.Module):
                  extrapolation: Optional[str] = None
     ):
         """
-        基于XPos设计的RoPE位置编码，支持最大序列长度缓存和动态offset索引。
+        基于XPos设计的RoPE位置编码
         Args:
             head_dim: 每个head的维度（应为偶数）
             max_seq_len: 预计算最大序列长度，缓存cos/sin/scale
