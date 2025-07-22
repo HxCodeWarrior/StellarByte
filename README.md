@@ -851,6 +851,319 @@ def update_cold_priority(self):
 
 ---
 
+<details>
+<summary>2025.7.22</summary>
+
+### DONE
+1. 修复XPos位置编码中的bug,将_get_cos_sin_scale函数中的从RotaryCache初始化参数seq_len，从self.max_seq_len修改为seq_len
+```
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 397, in train_epoch
+    scaler.scale(loss).backward()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_tensor.py", line 648, in backward
+    torch.autograd.backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/__init__.py", line 353, in backward
+    _engine_run_backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/graph.py", line 824, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1124, in unpack_hook
+    frame.recompute_fn(*args)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1518, in recompute_fn
+    fn(*args, **kwargs)
+  File "/workspace/model/Model.py", line 215, in custom_forward
+    return layer(*inputs)
+           ^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/DecoderLayer.py", line 102, in forward
+    attn_out = self.self_attn(self.norm_attn(x), additive_mask)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/Attention.py", line 375, in forward
+    q = q * cos + self.rotary._rotate_half(q) * sin
+        ~~^~~~~
+RuntimeError: The size of tensor a (2047) must match the size of tensor b (0) at non-singleton dimension 1
+```
+2. 修复model_pretrain.py中的设备不一致问题
+**关键语句**
+```python
+gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
+```
+**报错**
+```
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 429, in train_epoch
+    gpu_mem       = torch.cuda.memory_allocated(args.device) if torch.cuda.is_available() else 0
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/cuda/memory.py", line 537, in memory_allocated
+    return memory_stats(device=device).get("allocated_bytes.all.current", 0)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/cuda/memory.py", line 323, in memory_stats
+    stats = memory_stats_as_nested_dict(device=device)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/cuda/memory.py", line 334, in memory_stats_as_nested_dict
+    device = _get_device_index(device, optional=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/cuda/_utils.py", line 34, in _get_device_index
+    raise ValueError(f"Expected a cuda device, but got: {device}")
+ValueError: Expected a cuda device, but got: cpu
+```
+**原因**
+torch.cuda.memory_allocated() 只能接受 CUDA 设备（如 "cuda:0"），而在训练脚本中可能传入的是 "cpu"，这在 CPU-only 环境下或在逻辑中显式使用 CPU 设备时会出错。
+**修复**
+```python
+gpu_mem       = torch.cuda.memory_allocated(args.device) if args.device=="cuda" and torch.cuda.is_available() else 0
+```
+3. XPos位置编码，移除XPosRotaryEmbedding中的offset参数，改为直接根据当前序列长度生成cos/sin/scale简化_get_cos_sin_scale和_compute_xpos_scale方法的实现，不再需要offset切片操作。
+
+### TODO
+在有限的资源情况下，尝试调试训练脚本，修复报错
+
+### DEBUG
+1. 启用grad_checkpoint，优化训练速度报错
+```
+raceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 397, in train_epoch
+    scaler.scale(loss).backward()
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_tensor.py", line 648, in backward
+    torch.autograd.backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/__init__.py", line 353, in backward
+    _engine_run_backward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/graph.py", line 824, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1128, in unpack_hook
+    frame.check_recomputed_tensors_match(gid)
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 902, in check_recomputed_tensors_match
+    raise CheckpointError(
+torch.utils.checkpoint.CheckpointError: torch.utils.checkpoint: Recomputed values for the following tensors have different metadata than during the forward pass.
+tensor at position 14:
+saved metadata: {'shape': torch.Size([2047, 1]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([4094, 1]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+tensor at position 15:
+saved metadata: {'shape': torch.Size([2047, 24]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([4094, 24]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+tensor at position 24:
+saved metadata: {'shape': torch.Size([96, 48, 2047]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([96, 48, 2048]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+tensor at position 26:
+saved metadata: {'shape': torch.Size([6, 16, 2047, 2047]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([6, 16, 2047, 2048]), 'dtype': torch.float32, 'device': device(type='cuda', index=0)}
+tensor at position 27:
+saved metadata: {'shape': torch.Size([6, 16, 2047, 2047]), 'dtype': torch.bool, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([6, 16, 2047, 2048]), 'dtype': torch.bool, 'device': device(type='cuda', index=0)}
+tensor at position 28:
+saved metadata: {'shape': torch.Size([96, 2047, 48]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([96, 2048, 48]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+```
+2. 启用torch_compile报错
+```
+ALLOW_TF32=True, BLOCK_K=64, BLOCK_M=64, BLOCK_N=128, EVEN_K=True, GROUP_M=8, num_stages=3, num_warps=4
+  triton_mm_1817 15.9234 ms 69.1% ACC_TYPE='tl.float32', ALLOW_TF32=True, BLOCK_K=16, BLOCK_M=64, BLOCK_N=64, EVEN_K=True, GROUP_M=8, num_stages=2, num_warps=4
+SingleProcess AUTOTUNE benchmarking takes 10.1738 seconds and 0.0001 seconds precompiling for 20 choices
+skipping cudagraphs due to skipping cudagraphs due to cpu device (primals_9). Found from : 
+   File "/workspace/model/Model.py", line 223, in forward
+    hidden_states = layer(hidden_states, additive_mask)
+  File "/workspace/model/DecoderLayer.py", line 102, in forward
+    attn_out = self.self_attn(self.norm_attn(x), additive_mask)
+  File "/workspace/model/Attention.py", line 414, in forward
+    scores = ( q.to(compute_dtype) @ k_cat.to(compute_dtype).transpose(-1,-2) ) * self.scale.to(compute_dtype)  # [B,H,T,Tk]
+```
+```
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 392, in train_epoch
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 655, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/Model.py", line 166, in forward
+    def forward(
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 838, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/aot_autograd.py", line 1201, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 315, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 126, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 100, in g
+    return f(*args)
+           ^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/autograd/function.py", line 575, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 1937, in forward
+    fw_outs = call_func_at_runtime_with_args(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 126, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 495, in wrapper
+    return compiled_fn(runtime_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 689, in inner_fn
+    outs = compiled_fn(args)
+           ^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_inductor/output_code.py", line 460, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/_inductor/utils.py", line 2404, in run
+    return model(new_inputs)
+           ^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_root/qo/cqo3uikhoqttxdvnkhrujkln45yocywss2s73k2di42jfnp5a2vc.py", line 4134, in call
+    buf379 = empty_strided_cuda((12282, 768), (768, 1), torch.bfloat16)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 18.00 MiB. GPU 0 has a total capacity of 22.07 GiB of which 20.44 MiB is free. Process 2708630 has 22.04 GiB memory in use. Of the allocated memory 21.75 GiB is allocated by PyTorch, and 15.17 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+```
+3. 不启动torch_compile、不启动grad_checkpoint报错
+```
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 392, in train_epoch
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/Model.py", line 223, in forward
+    hidden_states = layer(hidden_states, additive_mask)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/DecoderLayer.py", line 102, in forward
+    attn_out = self.self_attn(self.norm_attn(x), additive_mask)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/Attention.py", line 421, in forward
+    probs    = self.attn_dropout(probs).to(param_dtype)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/dropout.py", line 70, in forward
+    return F.dropout(input, self.p, self.training, self.inplace)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/functional.py", line 1425, in dropout
+    _VF.dropout_(input, p, training) if inplace else _VF.dropout(input, p, training)
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 22.07 GiB of which 2.23 GiB is free. Process 3811892 has 19.83 GiB memory in use. Of the allocated memory 19.38 GiB is allocated by PyTorch, and 185.87 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation. 
+```
+4. 启动flash_attention报错
+```
+Traceback (most recent call last):
+  File "/workspace/model_pretrain.py", line 686, in <module>
+    train(args, logger)
+  File "/workspace/model_pretrain.py", line 636, in train
+    raise e
+  File "/workspace/model_pretrain.py", line 597, in train
+    train_epoch(
+  File "/workspace/model_pretrain.py", line 392, in train_epoch
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/Model.py", line 223, in forward
+    hidden_states = layer(hidden_states, additive_mask)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/DecoderLayer.py", line 106, in forward
+    ffn_out = self.mlp(self.norm_ffn(x))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.pyenv/versions/3.11.1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/model/MLP.py", line 78, in forward
+    x_gate = torch.sigmoid(x_gate)  # [batch_size, seq_len, hidden_dim]
+             ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 has a total capacity of 22.07 GiB of which 164.44 MiB is free. Process 3879328 has 21.90 GiB memory in use. Of the allocated memory 21.48 GiB is allocated by PyTorch, and 151.36 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management 
+```
+
+</details>
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
