@@ -400,14 +400,15 @@ class ByteMultiHeadSelfAttention(nn.Module):
         v_cat = v_cat.transpose(1, 2)
 
         # —— 7. 构建 Mask & Attention ——
+        k_cat = k_cat.to(compute_dtype)
+        v_cat = v_cat.to(compute_dtype)
         # 构建因果mask及padding mask
         if self.use_flash:
             attn_mask = self._build_attention_mask(T, Tk, additive_mask)
             attn_out = F.scaled_dot_product_attention(
                 q, k_cat, v_cat,
                 attn_mask=attn_mask,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=self.causal
+                dropout_p=self.attn_dropout.p if self.training else 0.0
             )
         else:
             # 经典 Attention 实现，支持增量推理

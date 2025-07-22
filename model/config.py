@@ -30,7 +30,7 @@ class ByteModelConfig(PretrainedConfig):
         model_parallel_size: int = 1,         # 模型并行大小
         tensor_parallel_size: int = 1,        # 张量并行大小
         tensor_parallel_rank: int = 0,        # 张量并行rank
-        use_causal: bool = True,              # 是否使用因果遮罩（GPT类模型通常为True）
+        use_causal: bool = False,             # 是否使用因果遮罩（GPT类模型通常为True）
         layerscale_init : float = 1e-5,       # 层尺度初始化值
         **kwargs
     ):
