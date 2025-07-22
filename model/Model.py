@@ -525,3 +525,52 @@ if __name__ == "__main__":
     # ----- 测试 generate -----
     gen = model.generate(input_ids[:, :1], max_new_tokens=10, temperature=0.8)
     print(f"生成序列形状: {gen.shape}")  # [2,10]
+
+    # ----- 训练示例代码 -----
+    print("\n===== 开始训练示例 =====")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # 创建优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=1e-4,
+        weight_decay=0.01
+    )
+    
+    # 创建简单的虚拟数据集
+    batch_size = 2
+    seq_len = 16
+    num_batches = 10
+    
+    # 训练循环
+    model.train()
+    for epoch in range(3):  # 3个epoch
+        total_loss = 0.0
+        
+        for batch_idx in range(num_batches):
+            # 生成虚拟数据
+            input_ids = torch.randint(0, cfg.vocab_size, (batch_size, seq_len)).to(device)
+            labels = torch.randint(0, cfg.vocab_size, (batch_size, seq_len)).to(device)
+            attention_mask = torch.ones_like(input_ids)
+            
+            # 前向传播
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            
+            # 反向传播
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # 参数更新
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            print(f"Epoch {epoch+1} | Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f}")
+        
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch+1} 完成 | 平均损失: {avg_loss:.4f}")
