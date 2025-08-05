@@ -83,11 +83,11 @@ class ByteMLP(nn.Module):
         # 降维回原始维度
         x = self.w2(x)  # [batch_size, seq_len, dim]
 
-        # 残差连接
-        x = x + residual
+        # 应用Dropout
+        x = self.dropout(x)  # [batch_size, seq_len, dim]
 
-        # 应用Dropout并返回
-        output = self.dropout(x)  # [batch_size, seq_len, dim]
+        # 残差连接
+        output = x + residual
 
         return output
 
