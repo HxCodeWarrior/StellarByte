@@ -1,196 +1,143 @@
 import torch
-import torch.nn as nn
-from typing import Tuple, Optional
+import math
 
-class RotaryCache:
-    """
-    缓存 cos/sin/scale 三个张量，按 (device, dtype, dim, theta, scale_base) 为键，支持动态扩容
-    """
-    _store = {}
-
-    @classmethod
-    def get(
-        cls,
-        device: torch.device,
-        dtype: torch.dtype,
-        seq_len: int,
-        dim: int,
-        theta: float,
-        scale_base: float
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        key = (device, dtype, dim, theta, scale_base)
-        if key not in cls._store or cls._store[key][0].size(0) < seq_len:
-             # 计算位置索引t，长度为max_seq_len
-            t = torch.arange(seq_len, device=device, dtype=dtype)
-            # 计算频率inv_freq，步长为2（偶数维度）
-            inv_freq = 1.0 / (theta ** (
-                torch.arange(0, dim, 2, device=device, dtype=dtype) / dim
-            ))
-            # outer得到位置与频率的乘积freqs
-            freqs = torch.outer(t, inv_freq)         # [max_seq_len, dim/2]
-            # 复制频率到偶奇维度，得到freqs的2倍长度
-            emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, dim]
-            
-            cos = torch.cos(emb)    # [max_seq_len, dim]
-            sin = torch.sin(emb)    # [max_seq_len, dim]
-
-            # 计算位置归一化pos，基于中心对称原则
-            pos = (t - seq_len // 2) / scale_base
-            # 计算对数缩放因子log_s（XPos中的scale设计）
-            log_s = pos.unsqueeze(-1) * (
-                torch.arange(0, dim, 2, device=device, dtype=dtype) / dim
-            )
-             # 限制防止指数爆炸
-            log_s.clamp_(min=-12.0, max=12.0)   # [max_seq_len, dim/2]
-            scale_half = torch.exp(log_s)
-            scale = torch.cat([scale_half, scale_half], dim=-1) # 扩展到dim维
-
-            cls._store[key] = (cos, sin, scale)
-
-        cos, sin, scale = cls._store[key]
-        # 保证返回张量 dtype 与请求一致
-        if cos.dtype != dtype:
-            cos, sin, scale = [t.to(dtype) for t in (cos, sin, scale)]
-        return cos[:seq_len], sin[:seq_len], scale[:seq_len]
-
-
-
-class XPosRotaryEmbedding(nn.Module):
-    def __init__(self, 
-                 head_dim: int, 
-                 max_seq_len: int = 2048,
-                 scale_base: float = 512, 
-                 theta: float = 10000.0,
-                 learnable_scale: bool = True,
-                 extrapolation: Optional[str] = None
+# ByteDynamicRoPE: 动态旋转位置编码模块
+# 支持动态频率缩放（NTK-RoPE）与工业级缓存机制，用于长序列Transformer模型的Q/K编码
+class ByteDynamicRoPE:
+    def __init__(
+        self, 
+        dim: int, 
+        base_theta: float = 10000.0, 
+        ntk_alpha: float = 1.0,
+        max_seq_len: int = 2048, 
+        device=None
     ):
         """
-        基于XPos设计的RoPE位置编码
-        Args:
-            head_dim: 每个head的维度（应为偶数）
-            max_seq_len: 预计算最大序列长度，缓存cos/sin/scale
-            scale_base: 控制比例缩放因子，默认512是XPos推荐值
-            theta: 控制频率基数
-            learnable_scale: 是否使用可学习的缩放因子
-            extrapolation: 用于控制频率的线性插值方式
-        """
-        super().__init__()
-        assert head_dim % 2 == 0, "Dimension must be even for rotary embedding."
+        构造函数：
 
-        self.dim = head_dim
+        :param dim: attention head 维度(应为偶数)
+        :param base_theta: 控制频率衰减的基数(一般为 10000.0)
+        :param ntk_alpha: NTK动态缩放因子(>1时启用动态NTK)
+        :param max_seq_len: 最大序列长度(用于缓存 sin/cos 表)
+        :param device: 计算设备(默认优先使用 CUDA)
+        """
+        assert dim % 2 == 0, "RoPE 位置编码要求 dim 必须是偶数"
+
+        self.dim = dim
+        self.base_theta = base_theta
+        self.ntk_alpha = ntk_alpha
         self.max_seq_len = max_seq_len
-        self.scale_base = scale_base
-        self.theta = theta
-        self.learnable_scale = learnable_scale
-        self.extrapolation = extrapolation
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 预计算基础频率
+        self._compute_base_freq()
 
-        # 原始 RoPE 的频率,频率反函数，shape [dim/2]
-        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # 预计算静态频率，缓存下来用于旋转编码
+        self._build_cos_sin_table(max_seq_len)
 
-        # 可学习的log_scale_weight参数，初始化为线性分布
-        if self.learnable_scale:
-            init_scale = torch.arange(0, head_dim // 2).float() / (head_dim // 2)
-            self.log_scale_weight = nn.Parameter(init_scale)  # 形状 (dim/2,)
-        else:
-            self.register_buffer("log_scale_weight", torch.arange(0, head_dim // 2).float() / (head_dim // 2))
+    def _compute_base_freq(self):
+        """频率计算"""
+        dim_half = self.dim // 2
+        # 公式：theta_j = base_theta^{-2j/dim}
+        theta = self.base_theta ** (-2 * torch.arange(0, dim_half, 1) / self.dim)
+        self.base_freq = theta.to(self.device)
+        
+    def _ntk_scale_factor(self, seq_len: int) -> float:
+        """动态NTK缩放因子"""
+        if seq_len <= self.max_seq_len or self.ntk_alpha <= 0:
+            return 1.0
+        
+        # 公式：(L_curr/L_train)^(dim/(dim-2))
+        ratio = seq_len / self.max_seq_len
+        exponent = self.dim / (self.dim - 2)
+        return self.ntk_alpha * (ratio ** exponent)
 
-    def _get_cos_sin_scale(self, seq_len: int, device, dtype):
+    def _build_cos_sin_table(self, seq_len: int):
         """
-        获取cos, sin, scale三个张量的当前窗口切片。
-
-        Args:
-            seq_len: 当前序列长度
-            device: 当前设备
-            dtype: 当前数据类型
-        Returns:
-            cos, sin, scale: [seq_len, dim]
+        构建 cos/sin 表，用于后续旋转编码。
         """
-        # 从缓存取最大长度的cos/sin/scale
-        cos, sin, scale = RotaryCache.get(device, dtype, seq_len, self.dim, self.theta, self.scale_base)
+        # NTK 动态缩放
+        scale = self._ntk_scale_factor(seq_len)
+        inv_freq = self.base_freq / scale
 
-        # 如果使用learnable scale，需要覆盖scale
-        if self.learnable_scale:
-            scale = self._compute_xpos_scale(seq_len, device, dtype)
+        # 生成每个位置的索引(0 ~ seq_len - 1)
+        t = torch.arange(seq_len, device=self.device).float()  # [seq_len]
 
-        return cos, sin, scale
+        # 计算位置与频率的乘积：位置 * 频率(广播成二维矩阵)
+        freqs = torch.outer(t, inv_freq)  # [seq_len, dim_half]
 
-    def _compute_xpos_scale(self, seq_len: int, device, dtype):
+        # 预计算 cos 和 sin 值，缓存下来(RoPE 的核心)
+        self.cos_cached = freqs.cos()  # [seq_len, dim/2]
+        self.sin_cached = freqs.sin()  # [seq_len, dim/2]
+
+        # 预扩展维度用于广播 [1, max_seq_len, 1, dim/2]
+        self.cos_cached = self.cos_cached[None, :, None, :]
+        self.sin_cached = self.sin_cached[None, :, None, :]
+
+    def _apply_rotary_half(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """
-        计算XPos缩放因子scale
+        将 cos/sin 应用于向量 x 的旋转部分(即最后一维)
 
-        Args:
-            seq_len: 当前序列长度
+        :param x: [..., head_dim]
+        :param cos: [1, seq_len, 1, dim/2]
+        :param sin: [1, seq_len, 1, dim/2]
 
-        Returns:
-            scale: [seq_len, dim]
+        :return: 旋转后向量，形状与 x 相同[q_rot, k_rot]
         """
-        # 位置范围
-        pos = (torch.arange(seq_len, device=device, dtype=dtype) - seq_len // 2) / self.scale_base
-        pos = pos.unsqueeze(-1)  # [seq_len, 1]
+        # 将x的最后一维拆分为复数对：x = [x0, x1, x2, x3, ...] -> 
+        # x_complex = [[x0, x1], [x2, x3], ...]
+        x_complex = x.float().view(*x.shape[:-1], -1, 2)  # [..., dim/2, 2]
+        
+        # 分离实部和虚部
+        x_real = x_complex[..., 0]  # [..., dim/2]
+        x_imag = x_complex[..., 1]  # [..., dim/2]
+        
+        # 复数旋转：(x_real + i*x_imag) * (cos + i*sin)
+        # = (x_real*cos - x_imag*sin) + i*(x_real*sin + x_imag*cos)
+        x_rot_real = x_real * cos - x_imag * sin
+        x_rot_imag = x_real * sin + x_imag * cos
+        
+        # 重组旋转后向量
+        x_rotated = torch.stack([x_rot_real, x_rot_imag], dim=-1)  # [..., dim/2, 2]
+        return x_rotated.flatten(-2, -1).type_as(x)  # [..., dim]
 
-        # 利用log_scale_weight作为缩放权重，广播至seq_len
-        scale = torch.exp(pos * self.log_scale_weight.unsqueeze(0))  # [seq_len, dim/2]
-
-        # 复制到dim维度
-        scale = torch.cat([scale, scale], dim=-1)  # [seq_len, dim]
-
-        return scale
-
-    @staticmethod
-    def _rotate_half(x):
+    def apply_rotary(self, q: torch.Tensor, k: torch.Tensor, seq_offset: int = 0):
         """
-        旋转一半维度，形状不变，但交换偶数和奇数维。
-        用于XPos旋转编码计算。
+        同时处理 Q 和 K 的旋转位置编码
 
-        Args:
-            x: [*, dim]
+        :param q: Q 向量 [batch, seq_len, num_heads, head_dim]
+        :param k: K 向量 [batch, seq_len, num_heads, head_dim]
+        :param seq_offset: 位置偏移量
 
-        Returns:
-            [*, dim]
+        :return: (旋转后的Q, 旋转后的K)
         """
-        x1, x2 = x[..., ::2], x[..., 1::2]  # 偶数和奇数分离
-        return torch.cat([-x2, x1], dim=-1)
+        seq_len = q.shape[1]
+        head_dim = q.shape[-1]
+        assert head_dim == self.dim, "Head dim 必须和 RoPE 初始化时一致"
 
-    def forward(self, xq: torch.Tensor, xk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            xq: [batch, seq_len, n_head, head_dim]
-            xk: [batch, seq_len, n_head, head_dim]
-        Returns:
-            xq_rot, xk_rot: 同形状，加入了XPos嵌入
-        """
-        B, S, H, D = xq.shape
-        device, dtype = xq.device, xq.dtype
+        # 构建并缓存 cos/sin 编码表
+        if seq_len + seq_offset > self.max_seq_len:
+            self._build_cos_sin_table(seq_len + seq_offset)
 
-        if D != self.dim:
-            raise ValueError(f"head_dim mismatch: got {D}, expected {self.dim}")
+        # 从缓存中提取当前序列位置对应的 cos/sin
+        cos = self.cos_cached[:, seq_offset:seq_offset+seq_len, :, :]  # [1, seq_len, 1, dim/2]
+        sin = self.sin_cached[:, seq_offset:seq_offset+seq_len, :, :]  # [1, seq_len, 1, dim/2]
 
-        # 获取当前窗口对应的cos/sin/scale
-        cos, sin, scale = self._get_cos_sin_scale(S, device, dtype)  # [S, D]
+        # 统一应用旋转逻辑
+        q_rotated = self._apply_rotary_half(q, cos, sin)
+        k_rotated = self._apply_rotary_half(k, cos, sin)
+        
+        return q_rotated, k_rotated
 
-        # 增加batch和head维度，方便广播: [1, S, 1, D]
-        cos = cos[None, :, None, :]  # [1, seq_len, 1, dim]
-        sin = sin[None, :, None, :]
-        scale = scale[None, :, None, :]
+if __name__ == '__main__':
+    dim = 128
+    batch_size = 2
+    seq_len = 16
+    num_heads = 8
+    ntk_alpha = 1.0
+    rope = ByteDynamicRoPE(dim=dim, ntk_alpha=ntk_alpha)
 
-        # XPos核心设计：xq乘scale，xk除scale，保证稳定性
-        xq_scaled = xq * scale
-        xk_scaled = xk / scale  # 注意这里是除以scale，是XPos的核心稳定性设计
+    q = torch.randn(batch_size, seq_len, num_heads, dim) 
+    k = torch.randn(batch_size, seq_len, num_heads, dim)
 
-        # 旋转变换：x * cos + rotate_half(x) * sin
-        xq_out = xq_scaled * cos + self._rotate_half(xq_scaled) * sin
-        xk_out = xk_scaled * cos + self._rotate_half(xk_scaled) * sin
-
-        return xq_out, xk_out
-
-if __name__ == "__main__":
-    from config import ByteModelConfig
-    args = ByteModelConfig()
-
-    xq = torch.randn(1, 50, 6, args.model_dim) # bs, seq_len, dim//n_head, n_head_dim
-    xk = torch.randn(1, 50, 6, args.model_dim) # bs, seq_len, dim//n_head, n_head_dim
-
-    rotary = XPosRotaryEmbedding(args.model_dim, args.xpos_scale_base, args.xpos_rope_theta)
-    xq_rot, xk_rot = rotary(xq, xk)
-    print(xq_rot.shape, xk_rot.shape)   # torch.Size([1, 50, 6, 768]) torch.Size([1, 50, 6, 768])
+    print(f"Q shape : {q.shape}\nK shape : {k.shape}")
