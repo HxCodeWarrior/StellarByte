@@ -13,8 +13,7 @@ def _rms_norm(x: torch.Tensor,
     • clamp_min(eps) ⟹ 比 “+ eps” 更稳健，彻底杜绝 0 或极小分母
     • 不使用任何条件分支，方便 JIT / TorchDynamo 图优化
     """
-    rms = torch.mean(x.to(torch.float32).pow(2), dim=-1, keepdim=True)
-    eps = torch.tensor(eps, dtype=torch.float32, device=rms.device)
+    rms = torch.mean((x * x).float(), dim=-1, keepdim=True)
     inv_rms = torch.rsqrt(rms.clamp_min(eps))
     # 把 inv_rms 和 weight 都 cast 到 x.dtype
     inv_rms = inv_rms.to(x.dtype)
@@ -38,8 +37,8 @@ class ByteRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         # γ（可学习缩放因子）
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.register_buffer("eps", torch.tensor(eps, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:                # noqa: D401
         # 主逻辑完全委托给 TorchScript 函数，JIT 可原地融合 mul/rsqrt
