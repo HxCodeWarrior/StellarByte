@@ -1,4 +1,3 @@
-# decoder_layer_v2.py
 import math
 import torch
 import torch.nn as nn
@@ -6,14 +5,14 @@ from typing import Optional
 
 try:
     from .config           import ByteModelConfig
-    from .utils.KVCache    import KVCache
+    # from .utils.KVCache    import KVCache
     from .utils.DropPath   import DropPath
     from .RMSNorm          import ByteRMSNorm
     from .Attention        import ByteMultiHeadSelfAttention
     from .MLP              import ByteMLP
 except:
     from config           import ByteModelConfig
-    from utils.KVCache    import KVCache
+    # from utils.KVCache    import KVCache
     from utils.DropPath   import DropPath
     from RMSNorm          import ByteRMSNorm
     from Attention        import ByteMultiHeadSelfAttention
@@ -34,7 +33,6 @@ class ByteDecoderLayer(nn.Module):
         self,
         args: ByteModelConfig,
         layer_id: int = 0,      # 必传：当前层编号
-        kv_cache: Optional["KVCache"] = None
     ):
         super().__init__()
         self.args = args
@@ -48,7 +46,6 @@ class ByteDecoderLayer(nn.Module):
         # ---------------- Blocks --------------
         self.self_attn = ByteMultiHeadSelfAttention(
             args,
-            kv_cache=kv_cache,
             layer_id=layer_id,
             num_layers=args.num_layers
         )
@@ -82,24 +79,26 @@ class ByteDecoderLayer(nn.Module):
     def forward(
         self, 
         x: torch.Tensor,
-        additive_mask: Optional[torch.Tensor] = None
+        padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         x: [B, T, D]
-        additive_mask: 与 MultiHeadSelfAttention 相同
+        padding_mask: 与 MultiHeadSelfAttention 相同
         """
         if self.parallel_residual:
             # -------- Parallel Residual (PaLM / GPT‑NeoX 风格) ----------
             norm_x = self.norm_attn(x)           # 共享同一 RMSNorm
-            attn_out = self.self_attn(norm_x, additive_mask)
+            attn_out = self.self_attn(norm_x, padding_mask)
             ffn_out  = self.mlp(norm_x)
-            out = x + self.drop_path(self.ls_attn * attn_out * self.resid_scale
-                                    + self.ls_mlp  * ffn_out  * self.resid_scale)
+            out = x + self.drop_path(
+                self.ls_attn * attn_out * self.resid_scale
+                + self.ls_mlp  * ffn_out  * self.resid_scale
+            )
             return out
         else:
             # ------------------- 顺序 Residual -------------------------
             # 1) Self‑Attention
-            attn_out = self.self_attn(self.norm_attn(x), additive_mask)
+            attn_out = self.self_attn(self.norm_attn(x), padding_mask)
             x = x + self.drop_path(self.ls_attn * attn_out * self.resid_scale)
 
             # 2) Feed‑Forward
@@ -117,7 +116,7 @@ if __name__ == "__main__":
         parallel_residual=True,
         use_flash_attention=False      # CPU quick test
     )
-    layer = ByteDecoderLayer(cfg, kv_cache=None, layer_id=12)
+    layer = ByteDecoderLayer(cfg, layer_id=12)
     x = torch.randn(2, 16, cfg.model_dim)
     y = layer(x)          # 训练阶段不传 mask
-    print("output:", y.shape)   # torch.Size([2, 16, 512])
+    print(f"Input Shape: {x.shape}\nOutput Shape: {y.shape}")   # torch.Size([2, 16, 512])
