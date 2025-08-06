@@ -8,85 +8,94 @@ except ImportError:
     from RMSNorm import ByteRMSNorm
 
 class ByteMLP(nn.Module):
+    """
+    Gated ByteMLP 模块（门控多层感知机）。
+
+    该模块是 Transformer 中 FeedForward 层的改进版本，使用门控机制（如 GEGLU）
+    以及高效的 RMSNorm 替代传统 LayerNorm，提升数值稳定性与速度。
+
+    Attributes:
+        w13 (nn.Linear): 输入维度到 2 倍隐藏层维度的线性映射（用于门控结构）
+        w2 (nn.Linear): 从隐藏层还原回输出维度的线性映射
+        norm (ByteRMSNorm): RMSNorm 层，用于归一化输入
+        dropout (nn.Dropout): Dropout 层，用于防止过拟合
+
+    Args:
+        dim (int): 输入和输出的维度
+        hidden_dim (int, optional): 隐藏层维度；若为 None，将自动按 dim 推算并对齐
+        multiple_of (int, optional): 隐藏层维度对齐倍数（默认 256）
+        dropout (float, optional): dropout 概率（默认 0.1）
+        eps (float, optional): RMSNorm 中的数值稳定常数（默认 1e-6）
+        bias (bool, optional): 是否在线性层中使用偏置（默认 False）
+    """
+
     def __init__(
-        self, 
-        dim: int, 
-        hidden_dim: int = None, 
-        multiple_of: int = 256, 
-        dropout: float = 0.1, 
+        self,
+        dim: int,
+        hidden_dim: int = None,
+        multiple_of: int = 256,
+        dropout: float = 0.1,
         eps: float = 1e-6,
         bias: bool = False,
     ):
-        """
-        门控多层感知机模块 (Gated ByteMLP)
-        
-        参数:
-        dim: 输入/输出特征的维度
-        hidden_dim: 隐藏层维度（可选，默认自动计算）
-        multiple_of: 隐藏层维度的对齐基数（确保维度是此值的倍数）
-        dropout: Dropout概率（默认0.1）
-        bias: 是否在线性层使用偏置（默认False）
-        """
         super().__init__()
-        
-        # 自动计算隐藏层维度（若未指定）
+
+        # 若未指定 hidden_dim，则按 (8/3)*dim 向上取整为 multiple_of 的倍数
         if hidden_dim is None:
-            # 计算基础隐藏层维度（约为输入维度的8/3倍）
             hidden_dim = int(8 * dim / 3)
-            # 将维度对齐到最近的multiple_of倍数（向上取整）
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        # 定义线性变换层:
-        # w1: 输入层 → 隐藏层 + w3: 输入层 → 门控层（与w1输出同维度）,w1&w3共享参数
+        # 将输入投影为 2 倍 hidden_dim（用于门控机制：一半为值分支，一半为门控分支）
         self.w13 = nn.Linear(dim, hidden_dim * 2, bias=bias)
-        # w2: 隐藏层 → 输出层（恢复原始维度）
+
+        # 输出投影层，将 hidden_dim 降回 dim
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
 
-        # 归一化层: LayerNorm
+        # 使用 RMSNorm 进行归一化，更快且数值稳定
         self.norm = ByteRMSNorm(dim, eps)
 
-        # Dropout层: 防止过拟合
+        # Dropout 层，控制过拟合
         self.dropout = nn.Dropout(dropout)
 
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播过程
-        
-        参数:
-        x: 输入张量 [batch_size, seq_len, dim]
-        
-        返回:
-        处理后的张量 [batch_size, seq_len, dim]
+        前向传播函数。
+
+        Args:
+            x (torch.Tensor): 输入张量，形状为 [batch_size, seq_len, dim]
+
+        Returns:
+            torch.Tensor: 输出张量，形状为 [batch_size, seq_len, dim]
         """
-        # 保存残差连接
+        # 残差连接输入备份
         residual = x
 
-        # 归一化
+        # Step 1: 输入归一化处理
         x = self.norm(x)
 
-        # GEGLU 门控结构：先一次性输出 2×hidden_dim
-        x_proj = self.w13(x)  # [batch_size, seq_len, hidden_dim * 2]
+        # Step 2: 一次线性变换输出两份：值分支 + 门控分支（GEGLU结构）
+        x_proj = self.w13(x)  # [B, T, 2 * hidden_dim]
 
-        # 切分: [batch_size, seq_len, hidden_dim] + [batch_size, seq_len, hidden_dim]
+        # Step 3: 沿最后一个维度均分为两部分
         x_gate, x_value = x_proj.chunk(2, dim=-1)
 
-        # 路径1: 线性变换 + SiLU激活函数
-        x_value = F.silu(x_value)  # [batch_size, seq_len, hidden_dim]
-        
-        # 路径2: 线性变换 + 门控分支Sigmoid激活函数
-        x_gate = torch.sigmoid(x_gate)  # [batch_size, seq_len, hidden_dim]
-        
-        # 门控机制: 累乘
-        x = x_value * x_gate  # [batch_size, seq_len, hidden_dim]
-        
-        # 降维回原始维度
-        x = self.w2(x)  # [batch_size, seq_len, dim]
+        # Step 4: 对值分支使用 SiLU 激活函数（替代 ReLU，平滑且性能好）
+        x_value = F.silu(x_value)
 
-        # 应用Dropout
-        x = self.dropout(x)  # [batch_size, seq_len, dim]
+        # Step 5: 对门控分支使用 Sigmoid 激活，输出 (0,1) 区间的门控权重
+        x_gate = torch.sigmoid(x_gate)
 
-        # 残差连接
+        # Step 6: 门控机制：逐元素乘，控制信息流通强度
+        x = x_value * x_gate  # [B, T, hidden_dim]
+
+        # Step 7: 输出映射回原维度
+        x = self.w2(x)  # [B, T, dim]
+
+        # Step 8: Dropout 处理防止过拟合
+        x = self.dropout(x)
+
+        # Step 9: 残差连接
         output = x + residual
 
         return output
@@ -94,17 +103,23 @@ class ByteMLP(nn.Module):
 if __name__ == '__main__':
     from config import ByteModelConfig
 
+    # 初始化模型配置（假设 config 提供了基本结构参数）
     args = ByteModelConfig(
-        model_dim=128,                # 嵌入维度 E
-        num_attention_heads=8,        # 多头注意力 H
-        dim_multiplier=4,             # 隐藏层维度的对齐基数
-        residual_dropout_prob=0.1,    # 残差连接dropout率
+        model_dim=128,                # 输入维度
+        num_attention_heads=8,        # 多头注意力数（未使用于此 MLP）
+        dim_multiplier=4,             # 隐藏层维度放大倍率（未直接用到）
+        residual_dropout_prob=0.1,    # Dropout 概率
     )
 
+    # 创建 ByteMLP 实例
     ByteMLP = ByteMLP(args.model_dim)
 
+    # 构造输入张量 [batch=2, seq_len=16, dim=128]
     x = torch.randn(2, 16, args.model_dim)
 
+    # 前向传播
     output = ByteMLP(x)
-    print("Input shape : {}".format(x.shape))      # [batch_size, seq_len, model_dim]
-    print("Output shape: {}".format(output.shape)) # [batch_size, seq_len, model_dim
+
+    # 打印输入输出维度
+    print("Input shape : {}".format(x.shape))      # torch.Size([2, 16, 128])
+    print("Output shape: {}".format(output.shape)) # torch.Size([2, 16, 128])
