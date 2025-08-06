@@ -1,9 +1,20 @@
 import torch
 import math
 
-# ByteDynamicRoPE: 动态旋转位置编码模块
-# 支持动态频率缩放（NTK-RoPE）与工业级缓存机制，用于长序列Transformer模型的Q/K编码
 class ByteDynamicRoPE:
+    """ByteDynamicRoPE 动态旋转位置编码模块。
+
+    支持长序列的 Rotary Position Embedding（RoPE），引入了 NTK-RoPE 的动态频率缩放机制，
+    并配有工业级的缓存以加速长序列 Q/K 编码。
+
+    Attributes:
+        dim (int): 注意力头维度，必须为偶数。
+        base_theta (float): 控制频率衰减的基数，默认值为 10000。
+        ntk_alpha (float): NTK 动态缩放因子，大于 1 时启用动态频率缩放。
+        max_seq_len (int): 默认最大序列长度，用于构建和缓存 sin/cos 表。
+        device (torch.device): 模块运算使用的设备（CPU/GPU）。
+    """
+
     def __init__(
         self, 
         dim: int, 
@@ -12,14 +23,14 @@ class ByteDynamicRoPE:
         max_seq_len: int = 2048, 
         device=None
     ):
-        """
-        构造函数：
+        """初始化 ByteDynamicRoPE 模块。
 
-        :param dim: attention head 维度(应为偶数)
-        :param base_theta: 控制频率衰减的基数(一般为 10000.0)
-        :param ntk_alpha: NTK动态缩放因子(>1时启用动态NTK)
-        :param max_seq_len: 最大序列长度(用于缓存 sin/cos 表)
-        :param device: 计算设备(默认优先使用 CUDA)
+        Args:
+            dim (int): 每个注意力头的维度，必须为偶数。
+            base_theta (float, optional): 控制频率衰减的基数。默认为 10000.0。
+            ntk_alpha (float, optional): NTK 动态缩放系数，通常 >1 启用动态 NTK-RoPE。默认为 1.0。
+            max_seq_len (int, optional): 初始最大序列长度，用于缓存频率表。默认为 2048。
+            device (torch.device, optional): 使用的计算设备。默认自动选择 CUDA。
         """
         assert dim % 2 == 0, "RoPE 位置编码要求 dim 必须是偶数"
 
@@ -36,14 +47,21 @@ class ByteDynamicRoPE:
         self._build_cos_sin_table(max_seq_len)
 
     def _compute_base_freq(self):
-        """频率计算"""
+        """计算 RoPE 基础频率表，用于构建 sin/cos 表"""
         dim_half = self.dim // 2
         # 公式：theta_j = base_theta^{-2j/dim}
         theta = self.base_theta ** (-2 * torch.arange(0, dim_half, 1) / self.dim)
         self.base_freq = theta.to(self.device)
         
     def _ntk_scale_factor(self, seq_len: int) -> float:
-        """动态NTK缩放因子"""
+        """计算动态 NTK 缩放因子。
+
+        Args:
+            seq_len (int): 当前输入序列长度。
+
+        Returns:
+            float: 动态频率缩放因子，若不启用 NTK 或序列较短，则为 1.0。
+        """
         if seq_len <= self.max_seq_len or self.ntk_alpha <= 0:
             return 1.0
         
@@ -53,8 +71,10 @@ class ByteDynamicRoPE:
         return self.ntk_alpha * (ratio ** exponent)
 
     def _build_cos_sin_table(self, seq_len: int):
-        """
-        构建 cos/sin 表，用于后续旋转编码。
+        """构建并缓存给定序列长度的 cos/sin 表。
+
+        Args:
+            seq_len (int): 要构建的位置编码表的序列长度。
         """
         # NTK 动态缩放
         scale = self._ntk_scale_factor(seq_len)
@@ -75,14 +95,15 @@ class ByteDynamicRoPE:
         self.sin_cached = self.sin_cached[None, :, None, :]
 
     def _apply_rotary_half(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """
-        将 cos/sin 应用于向量 x 的旋转部分(即最后一维)
+        """对张量 x 应用旋转位置编码。
 
-        :param x: [..., head_dim]
-        :param cos: [1, seq_len, 1, dim/2]
-        :param sin: [1, seq_len, 1, dim/2]
+        Args:
+            x (torch.Tensor): 输入张量 [..., head_dim]。
+            cos (torch.Tensor): 对应位置的 cos 编码表 [1, seq_len, 1, dim/2]。
+            sin (torch.Tensor): 对应位置的 sin 编码表 [1, seq_len, 1, dim/2]。
 
-        :return: 旋转后向量，形状与 x 相同[q_rot, k_rot]
+        Returns:
+            torch.Tensor: 应用旋转位置编码后的张量，形状同 x。
         """
         # 将x的最后一维拆分为复数对：x = [x0, x1, x2, x3, ...] -> 
         # x_complex = [[x0, x1], [x2, x3], ...]
@@ -102,14 +123,15 @@ class ByteDynamicRoPE:
         return x_rotated.flatten(-2, -1).type_as(x)  # [..., dim]
 
     def apply_rotary(self, q: torch.Tensor, k: torch.Tensor, seq_offset: int = 0):
-        """
-        同时处理 Q 和 K 的旋转位置编码
+        """对 Q/K 向量应用 RoPE 编码。
 
-        :param q: Q 向量 [batch, seq_len, num_heads, head_dim]
-        :param k: K 向量 [batch, seq_len, num_heads, head_dim]
-        :param seq_offset: 位置偏移量
+        Args:
+            q (torch.Tensor): 查询向量 Q，形状为 [batch, seq_len, num_heads, head_dim]。
+            k (torch.Tensor): 键向量 K，形状为 [batch, seq_len, num_heads, head_dim]。
+            seq_offset (int, optional): 当前序列在整个上下文中的偏移位置。默认值为 0。
 
-        :return: (旋转后的Q, 旋转后的K)
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 旋转位置编码后的 (Q, K)。
         """
         seq_len = q.shape[1]
         head_dim = q.shape[-1]
