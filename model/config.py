@@ -6,7 +6,7 @@ class ByteModelConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int = 32000,              # 词汇表大小
+        vocab_size: int = 32768,              # 词汇表大小
         model_dim: int = 768,                 # 模型维度
         num_layers: int = 12,                 # Transformer层数
         num_attention_heads: int = 16,        # 多头注意力头数
