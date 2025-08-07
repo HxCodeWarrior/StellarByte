@@ -1194,11 +1194,43 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 修改了ByteMLP模块中Dropout和残差连接的执行顺序，先应用Dropout再进行残差连接。这种调整可以防止残差连接后的数值范围过大，有助于提升模型训练的稳定性。
 
 ### TODO
-1. 重新构建tokenizer的训练，适配多语种、多种编程语言，方案：SentencePiece + BPE + Byte Fallback + Code-aware Pretokenizer
-  - 适配多语种
-  - 适配多种编程语言
+1. 重新构建tokenizer的训练
 2. 主模型应用XPosRotoryEmbedding位置编码
 3. 完善模型顶层基础设计forward()、generate()
+
+</details>
+
+---
+
+<details>
+<summary>2025.8.8</summary>
+
+### DONE
+1. 重构tokenizer训练脚本
+- 对话模型配置
+- 特殊tokens配置
+- 角色标记配置
+- BPE算法训练+bytelevel回退
+2. 完善模型顶层设计forward函数和generate函数，并配置了自回归函数的辅助函数
+- forward向前传播函数，将模型组件进行组装
+- generate自回归生成函数
+- sample_next_token采样函数，top-k采样，生成时增加top-p、temperature参数，允许在生成时进行top-k、top-p采样操作，避免生成长尾token或低概率的token
+- repetition_penalty重复惩罚，在生成文本时，根据重复出现的token的频率对当前生成的token进行惩罚，从而避免生成文本出现低质量内容
+3. 构建模型预训练脚本
+- 构建了整体的主要函数
+  - set_environment() 模型训练环境配置函数
+  - cosine_annealing_lr() 学习率调度器函数
+  - parse_args() 解析脚本参数函数
+  - init_model() 初始化模型函数
+  - eval() 模型评估函数
+  - train_epoch() 单轮训练函数
+  - train() 模型训练函数
+
+### TODO
+1. tokenizer解决问题 - 后处理器模板只定义了single和pair格式，缺少对多轮对话或更复杂场景的支持，解码器和后处理器的token替换符需保持同步。
+2. 重构模型训练参数文件
+3. 完善模型预训练脚本并进行测试
+
 
 </details>
 
