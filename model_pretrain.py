@@ -17,6 +17,9 @@ from model.config import ByteModelConfig
 from datasets import PretrainDataset
 
 
+def parse_args():
+    pass
+
 def set_environment():
     pass
 
