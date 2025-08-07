@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,6 +51,9 @@ class ByteTransformer(PreTrainedModel):
         # 初始化权重
         self.apply(self._init_weights)
         # 残差投影层特殊缩放初始化
+        for pn, p in self.named_parameters():
+            if pn.endswith('w2.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.n_layers))
 
         # 初始化最后一次向前传播的损失属性
         self.last_loss = None
@@ -129,9 +133,69 @@ class ByteTransformer(PreTrainedModel):
         temperature: float = 1.0,
         top_k: int = 50,
         eos_token_id: int = None,
+        return_logits: bool = False,
         **kwargs
     ):
-        pass
+        """
+        自回归文本生成函数
+        
+        Args:
+            input_ids: 初始输入序列 [batch_size, seq_len]
+            max_seq_len: 生成的最大序列长度（包括输入长度）
+            temperature: 采样温度（>0）
+            top_k: 只考虑概率最高的k个token（0表示禁用）
+            eos_token_id: 结束符ID（遇到时停止生成）
+        
+        Return:
+            生成的完整序列 [batch_size, new_seq_len]
+        """
+        # 准备工作
+        device = next(self.parameters()).device
+        input_ids = input_ids.to(device)
+        batch_size = input_ids.shape[0]
+
+        # 存储生成的 token（初始为输入）
+        generated = input_ids.clone()
+        all_logits = [] if return_logits else None
+
+        for _ in range(max_seq_len):
+            # 模型前向传播，获取当前logits
+            output = self.forward(generated)
+
+            logits = output.logits  # [B, 1, vocab_size]
+            logits = logits[:, -1, :]  # 取出最后一个token位置的logits [B, vocab_size]
+
+            # 记录logits（如果需要）
+            if return_logits:
+                all_logits.append(logits)
+
+            # 应用temperature
+            logits = logits / temperature
+
+            # 应用top-k截断（Top-K Sampling）
+            if top_k > 0:
+                topk_values, _ = torch.topk(logits, top_k)
+                min_topk = topk_values[:, -1].unsqueeze(-1)
+                logits = torch.where(logits < min_topk, torch.full_like(logits, float('-inf')), logits)
+
+            # 采样下一token（multinomial采样）
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
+
+            # 拼接到已生成序列
+            generated = torch.cat((generated, next_token), dim=1)
+
+            # 检查是否遇到eos_token_id
+            if eos_token_id is not None:
+                if (next_token == eos_token_id).all():
+                    break
+
+        # 输出生成结果
+        if return_logits:
+            all_logits = torch.stack(all_logits, dim=1)  # [B, T, vocab_size]
+            return generated, all_logits
+        else:
+            return generated
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("tokenizer")
@@ -149,14 +213,19 @@ if __name__ == '__main__':
     text = f"{tokenizer.bos_token}{prompt}{tokenizer.eos_token}"
     print(f"Input text: {text}")
 
-    input_id = tokenizer(text).data['input_ids']
-    print("input_ids :", input_id)
-    print("dcode_str :", tokenizer.decode(input_id))
+    input_ids = tokenizer(text).data['input_ids']
+    print("input_ids :", input_ids)
+    print("dcode_str :", tokenizer.decode(input_ids))
 
-    X = torch.tensor(input_id[:-1]).unsqueeze(0)
-    Y = torch.tensor(input_id[1:]).unsqueeze(0)
+    X = torch.tensor(input_ids[:-1]).unsqueeze(0)
+    Y = torch.tensor(input_ids[1:]).unsqueeze(0)
     print("X shape :", X.shape)
     print("Y shape :", Y.shape)
 
     # 将输入张量传入模型
     output = model(X, Y)
+
+    # 自回归文本生成
+    input_ids = torch.tensor([tokenizer.encode("你好呀，今天吃什么呢？")]).to(model.device)
+    generated = model.generate(input_ids, max_seq_len=100, temperature=0.8, top_k=30, eos_token_id=tokenizer.eos_token_id)
+    print("输出结果：", tokenizer.decode(generated[0]))
