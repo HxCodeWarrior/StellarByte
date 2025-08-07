@@ -1162,6 +1162,46 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 ```
 
 </details>
+
+
+<details>
+<summary>2025.8.6</summary>
+
+### DONE
+1. 位置编码替换：Dynamic-RoPE替换XPosEmbedding
+2. 重构Attention 重构多头自注意力模块，优化张量并行和位置编码
+- 移除KVCache相关代码，简化注意力模块结构
+- 使用ByteDynamicRoPE替代XPosRotaryEmbedding实现动态位置编码
+- 重构张量并行逻辑，改进权重初始化和掩码生成
+- 优化代码结构，增强可读性和维护
+3. Model.py简化模型结构并移除冗余代码
+- 移除复杂的初始化逻辑和辅助方法
+- 简化前向传播和生成逻辑
+- 保留核心Transformer结构
+- 优化代码组织结构提高可读性
+4. DecoderLayer移除KVCache依赖并重命名mask参数
+- 删除未使用的KVCache相关导入和参数
+- 将additive_mask重命名为更明确的padding_mask
+- 优化并行残差块的代码格式
+- 更新测试输出格式以显示输入输出形状
+5. 改进 ByteMLP 模块的代码结构和文档
+- 重构 ByteMLP 模块的代码结构，使其更清晰易读
+- 重新组织类文档字符串，明确模块功能和参数说明
+- 优化前向传播过程的注释，分步骤解释门控机制
+- 统一代码格式和命名规范
+- 更新测试代码的注释说明
+6. MLP层调整Dropout和残差连接的顺序以提升模型稳定性
+修改了ByteMLP模块中Dropout和残差连接的执行顺序，先应用Dropout再进行残差连接。这种调整可以防止残差连接后的数值范围过大，有助于提升模型训练的稳定性。
+
+### TODO
+1. 重新构建tokenizer的训练，适配多语种、多种编程语言，方案：SentencePiece + BPE + Byte Fallback + Code-aware Pretokenizer
+  - 适配多语种
+  - 适配多种编程语言
+2. 主模型应用XPosRotoryEmbedding位置编码
+3. 完善模型顶层基础设计forward()、generate()
+
+</details>
+
 ---
 
 ## 🤝 贡献指南
