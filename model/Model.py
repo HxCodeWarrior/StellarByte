@@ -17,7 +17,7 @@ except ImportError:
     from RMSNorm            import ByteRMSNorm
     from config             import ByteModelConfig
 
-class ByteTransformer(PreTrainedModel):
+class ByteModel(PreTrainedModel):
     config_class = ByteModelConfig
     last_loss    = Optional[torch.Tensor]
 
@@ -132,6 +132,9 @@ class ByteTransformer(PreTrainedModel):
         max_seq_len: int = 512,
         temperature: float = 1.0,
         top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.2,
+        repetition_context: int = 512,
         eos_token_id: int = None,
         return_logits: bool = False,
         **kwargs
@@ -144,46 +147,65 @@ class ByteTransformer(PreTrainedModel):
             max_seq_len: 生成的最大序列长度（包括输入长度）
             temperature: 采样温度（>0）
             top_k: 只考虑概率最高的k个token（0表示禁用）
+            repetition_penalty: 重复惩罚因子（>1）
+            repetition_context: 应用重复惩罚的上下文长度（0表示禁用）
             eos_token_id: 结束符ID（遇到时停止生成）
+            return_logits: 是否返回每一步的logits
         
         Return:
             生成的完整序列 [batch_size, new_seq_len]
+            如果return_logits=True，同时返回logits [batch_size, gen_len, vocab_size]
         """
         # 准备工作
         device = next(self.parameters()).device
         input_ids = input_ids.to(device)
         batch_size = input_ids.shape[0]
 
+        # 结束符处理逻辑
+        if eos_token_id is None:
+            eos_token_id = -1  # 无效ID
+
+        # 预采样参数校验
+        temperature = max(temperature, 1e-5)  # 防止除零
+        top_k = max(top_k, 0)
+        repetition_penalty = max(repetition_penalty, 1.0)
+
         # 存储生成的 token（初始为输入）
         generated = input_ids.clone()
         all_logits = [] if return_logits else None
 
         for _ in range(max_seq_len):
-            # 模型前向传播，获取当前logits
+            # 模型前向传播
             output = self.forward(generated)
-
-            logits = output.logits  # [B, 1, vocab_size]
+            
+            # 获取当前logits
+            logits = output.logits     # [B, 1, vocab_size]
             logits = logits[:, -1, :]  # 取出最后一个token位置的logits [B, vocab_size]
+
+            # 应用重复惩罚
+            logits = self.repetition_penalty(
+                logits, 
+                generated,
+                penalty=repetition_penalty,
+                context_size=repetition_context
+            )
+
+            # 采样下一个token
+            next_token = self.sample_next_token(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
+            # 更新活动样本的生成序列
+            generated = torch.cat([generated, next_token], dim=1)
 
             # 记录logits（如果需要）
             if return_logits:
-                all_logits.append(logits)
-
-            # 应用temperature
-            logits = logits / temperature
-
-            # 应用top-k截断（Top-K Sampling）
-            if top_k > 0:
-                topk_values, _ = torch.topk(logits, top_k)
-                min_topk = topk_values[:, -1].unsqueeze(-1)
-                logits = torch.where(logits < min_topk, torch.full_like(logits, float('-inf')), logits)
-
-            # 采样下一token（multinomial采样）
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
-
-            # 拼接到已生成序列
-            generated = torch.cat((generated, next_token), dim=1)
+                full_logits = torch.full((batch_size, logits.shape[-1]), float('-inf'), device=device)
+                full_logits[output] = logits
+                all_logits.append(full_logits)
 
             # 检查是否遇到eos_token_id
             if eos_token_id is not None:
@@ -196,6 +218,126 @@ class ByteTransformer(PreTrainedModel):
             return generated, all_logits
         else:
             return generated
+    
+
+    def sample_next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        采样下一个token
+
+        Args:
+            logits: [batch_size, vocab_size] 当前步的logits
+            temperature: 采样温度
+            top_k: 保留概率最高的k个token
+            top_p: 保留累计概率达到p的最小token集合
+
+        Returns:
+            next_token: [batch_size, 1] 下一个token ID
+        """
+        # 温度调节
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        # Top-K过滤
+        if top_k > 0:
+            topk_values, _ = torch.topk(logits, top_k, dim=-1)
+            min_topk = topk_values[:, -1].unsqueeze(-1)
+            logits = torch.where(logits < min_topk, torch.full_like(logits, float('-inf')), logits)
+
+        # Top-p过滤
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # 创建移除掩码
+            removal_mask = cumulative_probs > top_p
+            removal_mask[:, 1:] = removal_mask[:, :-1].clone()
+            removal_mask[:, 0] = False
+
+            # 应用掩码
+            removal_mask = removal_mask.scatter(-1, sorted_indices, removal_mask)
+            logits = logits.masked_fill(removal_mask, float('-inf'))
+
+        # 概率采样
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def repetition_penalty(
+        self,
+        logits: torch.Tensor,
+        generated: torch.Tensor,
+        penalty: float = 1.2,
+        context_size: int = 512
+    ) -> torch.Tensor:
+        """
+        应用重复惩罚机制，降低已出现token的概率
+
+        Args:
+            logits: [batch_size, vocab_size] 当前步的logits
+            generated: [batch_size, seq_len] 已生成的序列
+            penalty: 重复惩罚因子(>1)
+            context_size: 考虑惩罚的上下文长度
+
+        Returns:
+            应用惩罚后的logits
+        """
+        if penalty <= 1.0:
+            return logits
+
+        batch_size, vocab_size = logits.shape
+        device = logits.device
+
+        # 仅考虑最近的上下文
+        recent_tokens = generated[:, -context_size:]
+
+        for b in range(batch_size):
+            # 获取当前样本的独特token
+            unique_tokens = torch.unique(recent_tokens[b])
+
+            # 对重复token应用惩罚
+            logits[b, unique_tokens] = logits[b, unique_tokens] / penalty
+
+        return logits
+
+
+    def model_info(self) -> dict:
+        """
+        返回模型基础信息字典，包含：
+        - 总参数量
+        - 可训练参数量
+        - 模型层数
+        - 隐藏层维度
+        - 注意力头数
+        - 词汇表大小
+        - 模型配置摘要
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        return {
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "num_layers": self.num_layers,
+            "hidden_size": self.args.model_dim,
+            "num_attention_heads": self.args.num_attention_heads,
+            "vocab_size": self.vocab_size,
+            "config_summary": {
+                "model_dim": self.args.model_dim,
+                "num_layers": self.args.num_layers,
+                "max_seq_len": self.args.max_seq_len,
+                "hidden_dropout": self.args.hidden_dropout_prob,
+                "attention_dropout": self.args.attention_dropout_prob,
+                "residual_dropout_prob": self.args.residual_dropout_prob,
+                "layer_norm_eps": self.args.layer_norm_eps,
+                "rope_theta": self.args.base_theta,
+                "ntk_alpha": self.args.ntk_alpha,
+            }
+        }
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("tokenizer")
@@ -204,10 +346,10 @@ if __name__ == '__main__':
         n_layers=18,
     )
     # 实例化Model
-    model = ByteTransformer(args=args)
+    model = ByteModel(args=args)
     # 计算model的全部参数
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f'LLM总参数量：{num_params / 1e6:.3f} 百万')
+    model_info = model.model_info()
+    print(f'模型基础信息：{model_info}')
 
     prompt = "你好呀，今天吃什么呢？你过得怎么样嘞？"
     text = f"{tokenizer.bos_token}{prompt}{tokenizer.eos_token}"
@@ -227,5 +369,14 @@ if __name__ == '__main__':
 
     # 自回归文本生成
     input_ids = torch.tensor([tokenizer.encode("你好呀，今天吃什么呢？")]).to(model.device)
-    generated = model.generate(input_ids, max_seq_len=100, temperature=0.8, top_k=30, eos_token_id=tokenizer.eos_token_id)
+    generated = model.generate(
+        input_ids, 
+        max_seq_len=100, 
+        temperature=0.8, 
+        top_k=30, 
+        top_p=0.8,
+        repetition_penalty=1.2,
+        repetition_context=512,
+        eos_token_id=tokenizer.eos_token_id
+    )
     print("输出结果：", tokenizer.decode(generated[0]))
