@@ -1163,6 +1163,7 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 
 </details>
 
+---
 
 <details>
 <summary>2025.8.6</summary>
@@ -1203,7 +1204,7 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 ---
 
 <details>
-<summary>2025.8.8</summary>
+<summary>2025.8.7</summary>
 
 ### DONE
 1. 重构tokenizer训练脚本
@@ -1231,6 +1232,31 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 2. 重构模型训练参数文件
 3. 完善模型预训练脚本并进行测试
 
+</details>
+
+---
+
+<details>
+<summary>2025.8.8</summary>
+
+### DONE
+1. 优化数据集加载器
+- 为BaseDataset添加BOS/EOS token自动注入逻辑
+- 改进_pad_and_mask方法返回类型为torch.Tensor
+- 在PretrainDataset中支持EOS token并优化token预留逻辑
+- 添加数据集测试用例便于验证功能
+2. 完善模型预训练脚本，优化代码结构和功能实现
+- 重构参数解析函数，支持YAML配置文件读取和嵌套命名空间转换
+- 优化环境设置函数，增强日志记录和设备选择逻辑
+- 重写学习率调度器，改进余弦退火算法实现
+- 完善模型初始化和评估函数，增加混合精度训练支持
+- 重构训练循环，支持梯度累积和周期性验证
+
+### TODO
+1. 模型预训练脚本优化与完善
+- 优化模型预训练脚本train_epoch中的损失函数与padding_mask设置与计算
+- 完善模型预训练脚本train()模型预训练主体函数
+2. 检查数据集加载器中attention_mask设计与模型主体中的padding_mask需求是否一致，如果不一致进行相对应的修复
 
 </details>
 
