@@ -13,47 +13,56 @@ class BaseDataset(Dataset):
     通用数据集基类：提供序列填充与损失掩码生成逻辑
     """
     def __init__(self, tokenizer: PreTrainedTokenizerBase, max_length: int = 512):
-        # 1) 保存配置
+        # 1. 保存配置
         self.tokenizer   = tokenizer
         self.max_length  = max_length
 
-        # 2) 若 tokenizer 没有 pad_token，则动态注入一个占位符
+        # 2. 若 tokenizer 没有 pad_token，则动态注入一个占位符
         if tokenizer.pad_token is None:
-            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|PAD|>'.")
-            tokenizer.add_special_tokens({"pad_token": "<|PAD|>"})
-            # ⬆️ 上层（model 初始化处）需调用 model.resize_token_embeddings
+            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|spad|>'.")
+            tokenizer.add_special_tokens({"pad_token": "<|spad|>"})
+        if tokenizer.bos_token is None:
+            tokenizer.add_special_tokens({"bos_token": "<|sbos|>"})
+        if tokenizer.eos_token is None:
+            tokenizer.add_special_tokens({"eos_token": "<|seos|>"})
 
-        # 3) 最终的 pad_token_id（注入后一定存在）
+        # 3. 最终的 pad_token_id（注入后一定存在）
         self.pad_token_id: int = tokenizer.pad_token_id
 
-    def _pad_and_mask(self, input_ids: List[int]) -> tuple[list[int], list[bool]]:
+        # 4. 预计算BOS/EOS
+        self.has_bos = tokenizer.bos_token is not None
+        self.has_eos = tokenizer.eos_token is not None
+
+    def _pad_and_mask(self, input_ids: List[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         截断 / 填充，并生成损失掩码。
 
         Returns
         -------
-        padded_ids : list[int]
-            长度恰为 `max_length` 的 token 序列。
-        loss_mask : list[bool]
-            与 `padded_ids` 同长；真实 token = True，PAD = False。
+        padded_ids : list[int],长度恰为 `max_length` 的 token 序列。
+        loss_mask : list[bool],与 `padded_ids` 同长；真实 token = True，PAD = False。
         """
         # ---------- 1. 截断 ----------
+        input_ids = input_ids[: self.max_length]
         seq_len = len(input_ids)
-        if seq_len > self.max_length:
-            input_ids = input_ids[: self.max_length]
 
         # ---------- 2. 计算 pad 长度 ----------
-        pad_len = self.max_length - len(input_ids)
+        pad_len = self.max_length - seq_len
 
         # ---------- 3. 拼接 PAD ----------
         padded_ids: List[int] = input_ids + [self.pad_token_id] * pad_len
 
         # ---------- 4. 生成掩码 ----------
-        # loss_mask: List[int] = [1] * len(input_ids) + [0] * pad_len
+        # mask: List[int] = [1] * len(input_ids) + [0] * pad_len
         # 真实 token → True，PAD → False；dtype 使用 bool 更节约显存
-        loss_mask: list[bool] = [True] * len(input_ids) + [False] * pad_len
+        attention_mask: list[int]  = [1] * seq_len + [0] * pad_len
+        loss_mask     : list[bool] = [True] * seq_len + [False] * pad_len
 
-        return padded_ids, loss_mask
+        return (
+            torch.tensor(padded_ids, dtype=torch.long),
+            torch.tensor(attention_mask, dtype=torch.long),
+            torch.tensor(loss_mask, dtype=torch.bool)
+        )
 
 
 class PretrainDataset(BaseDataset):
@@ -67,7 +76,8 @@ class PretrainDataset(BaseDataset):
         max_length: int = 512,
         fields: Optional[List[str]] = None,
         template: Optional[str] = None,
-        add_bos: bool = True
+        add_bos: bool = True,
+        add_eos: bool = True
     ):
         """
         :param data_path: 数据文件路径（支持 .json / .jsonl / .csv）
@@ -76,13 +86,30 @@ class PretrainDataset(BaseDataset):
         :param fields: 需要拼接的字段名，例如 ['input', 'thinking', 'output']
         :param template: 拼接模板，例如 "问：{input}\n想：{thinking}\n答：{output}"
         :param add_bos: 是否添加 BOS token
+        :param add_eos: 是否添加 EOS token
         """
         super().__init__(tokenizer, max_length)
         self.data_path = data_path
         self.fields = fields or ["input", "output"]
         self.template = template
         self.add_bos = add_bos
-        self.bos_token = tokenizer.bos_token or tokenizer.eos_token or ""
+        self.add_eos = add_eos
+        self.bos_token_id = tokenizer.bos_token_id or None
+        self.eos_token_id = tokenizer.eos_token_id or None
+
+        if self.add_bos and self.bos_token_id is None:
+            if self.eos_token_id is not None:
+                logging.warning("[Dataset] Tokenizer has no <bos>, fallback to <eos> as BOS.")
+                self.bos_token_id = self.eos_token_id
+            else:
+                raise ValueError("Tokenizer must have bos_token or eos_token if add_bos=True")
+
+        if self.add_eos and self.eos_token_id is None:
+            if self.bos_token_id is not None:
+                logging.warning("[Dataset] Tokenizer has no <eos>, fallback to <eos> as BOS.")
+                self.eos_token_id = self.bos_token_id
+            else:
+                raise ValueError("Tokenizer must have eos_token if add_eos=True")
 
         self.data = self._load_data()
         logging.info(f"[Dataset] Loaded {len(self)} samples from {data_path}")
@@ -137,25 +164,43 @@ class PretrainDataset(BaseDataset):
         if not text:
             text = "[EMPTY]"
 
+        # BOS 和 EOS 预留长度
+        reserve_len = int(self.add_bos) + int(self.add_eos)
+
         # 编码 & 截断
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if self.add_bos: # 添加 BOS（例如GPT风格）
-            input_ids = [self.tokenizer.bos_token_id] + input_ids
+        input_ids = self.tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            max_length=self.max_length - reserve_len,  # 预留 BOS 和 EOS 空间
+            truncation=True
+        )
+        if self.add_bos: # 添加 BOS
+            input_ids = [self.bos_token_id] + input_ids
+        if self.add_eos: # 添加 EOS
+            input_ids = input_ids + [self.eos_token_id]
 
         # 生成输入、标签、loss_mask
-        input_ids, loss_mask = self._pad_and_mask(input_ids)
+        # 1. 先拆分序列（避免填充污染）
+        input_ids_x = input_ids[:-1]  # X: [BOS, T1, ..., Tn-1]
+        input_ids_y = input_ids[1:]   # Y: [T1, ..., Tn-1, EOS]
+        
+        # 2. 分别处理X和Y序列
+        # X序列：模型输入上下文
+        input_tensor, attention_mask, _ = self._pad_and_mask(input_ids_x)
+        
+        # Y序列：模型预测目标
+        label_tensor, _, loss_mask = self._pad_and_mask(input_ids_y)
 
-        input_tensor = torch.tensor(input_ids[:-1], dtype=torch.long)
-        label_tensor = torch.tensor(input_ids[1:], dtype=torch.long)
-        mask_tensor  = torch.tensor(loss_mask[1:], dtype=torch.bool)
-
+        # 3. 设置忽略标签
         # mask 掩码中，-100 代表不计算损失，-100 以外的值代表计算损失，避免影响loss计算
-        label_tensor[~mask_tensor] = -100
+        label_tensor = label_tensor.clone()
+        label_tensor[~loss_mask] = -100 # 忽略 PAD 区损失
 
         return {
-            "input_ids": input_tensor,     # [seq_len-1]
-            "labels":    label_tensor,     # [seq_len-1]
-            "loss_mask": mask_tensor,      # [seq_len-1]
+            "input_ids"     : input_tensor,       # [seq_len-1]
+            "labels"        : label_tensor,       # [seq_len-1]
+            "attention_mask": attention_mask,     # [seq_len-1], 用于 padding 掩码
+            "loss_mask"     : loss_mask,          # [seq_len-1]
         }
 
 
@@ -320,4 +365,56 @@ class SFTDataset(BaseDataset):
 
 
 if __name__ == "__main__":
-    pass
+    from transformers import AutoTokenizer
+    from tempfile import NamedTemporaryFile
+    
+    # 创建一个临时 json 文件作为测试数据
+    sample_data = [
+        {"input": "今天天气如何？", "output": "今天天气晴朗，适合出行。"},
+        {"input": "你是谁？", "output": "我是一个人工智能助手。"}
+    ]
+    
+    with NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(sample_data, f, ensure_ascii=False)
+        temp_file_path = f.name
+    
+    # 使用预训练分词器
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-chinese")  # 或换成你模型对应的分词器
+    
+    # 确保 tokenizer 有 pad_token 和 bos_token
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "<|PAD|>"})
+    if tokenizer.bos_token is None:
+        tokenizer.add_special_tokens({"bos_token": "<|BOS|>"})
+    if tokenizer.eos_token is None:
+        tokenizer.add_special_tokens({"eos_token": "<|EOS|>"})
+    
+    # 初始化数据集
+    dataset = PretrainDataset(
+        data_path=temp_file_path,
+        tokenizer=tokenizer,
+        max_length=32,
+        fields=["input", "output"],
+        template="问：{input}\n答：{output}",
+        add_bos=True,
+        add_eos=True
+    )
+    
+    # 取出一个样本进行检查
+    sample = dataset[0]
+    
+    # 打印结果
+    print("Input IDs:", sample["input_ids"])
+    print("Labels:", sample["labels"])
+    print("Attention Mask:", sample["attention_mask"])
+    print("Loss Mask:", sample["loss_mask"])
+    
+    # 打印解码后原句，便于人工核对
+    print("Decoded Input:", tokenizer.decode(sample["input_ids"], skip_special_tokens=False))
+    print("Decoded Labels:", tokenizer.decode(
+        [x if x != -100 else tokenizer.pad_token_id for x in sample["labels"]],
+        skip_special_tokens=False
+    ))
+    
+    # 清理临时文件
+    os.remove(temp_file_path)
