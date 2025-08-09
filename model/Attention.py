@@ -162,7 +162,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
         Return:
         mask: 形状为(1, 1, seq_len, seq_len)的掩码张量
         """
-        min_val = torch.finfo(dtype).min
+        min_val = -1e9
 
         # === 情况1: 使用标准因果掩码 ===
         if self.window_size <= 0 or seq_len <= self.window_size:
@@ -190,29 +190,38 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         # === 情况2: 使用滑动窗口掩码 ===
         # 创建位置索引矩阵
-        rows = torch.arange(seq_len, device=device).view(-1, 1)
-        cols = torch.arange(seq_len, device=device).view(1, -1)
+        rows = torch.arange(seq_len, device=device).view(-1, 1) # [seq_len, 1]
+        cols = torch.arange(seq_len, device=device).view(1, -1) # [1, seq_len]
         
-        # 计算位置距离
+        # 计算相对位置距离(i - j)
         dist = rows - cols
         
         # 创建掩码条件:
-        # 1. 未来位置 (cols > rows) -> 屏蔽
-        # 2. 距离超过窗口 (dist >= window_size) -> 屏蔽
-        mask = (cols > rows) | (dist >= self.window_size)
+        # 1. 因果性：只允许关注过去位置 (j <= i)
+        # 2. 局部性：只允许关注 [i - window_size + 1, i] 范围内的位置
+        causal_cond = (cols <= rows)  # j <= i
+        window_cond = (dist < self.window_size)  # i - j < window_size
         
-        # 转换为加法掩码
-        mask = torch.zeros((seq_len, seq_len), device=device, dtype=dtype)
-        mask = mask.masked_fill(mask, min_val)
+        # 有效区域 = 因果性 AND 局部性
+        valid_mask = causal_cond & window_cond
+
+        # 反转逻辑：有效区域为0，无效区域为min_val
+        mask_matrix = torch.full(
+            (seq_len, seq_len), 
+            fill_value=min_val, 
+            device=device, 
+            dtype=dtype
+        )
+        mask_matrix.masked_fill_(valid_mask, 0)  # 有效区域置0
 
         # 添加必要的维度：适配多头注意力机制
         # (seq_len, seq_len) -> (1, 1, seq_len, seq_len)
         # 支持广播至 [batch_size, num_heads, seq_len, seq_len]
-        mask = mask.unsqueeze(0).unsqueeze(0)
+        mask = mask_matrix.unsqueeze(0).unsqueeze(0)
 
         return mask
     
-    def _adjust_padding_mask(self, padding_mask: torch.Tensor, seq_len: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+    def _adjust_attention_mask(self, attention_mask: torch.Tensor, seq_len: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
         """
         统一调整 padding 掩码的形状，适配后续 attention 操作。
         若未提供，则返回 None。
@@ -226,45 +235,53 @@ class ByteMultiHeadSelfAttention(nn.Module):
         返回:
             调整后的掩码张量: [B, 1, 1, T]
         """
-        if padding_mask is None:
+        min_val = -1e9
+
+        if attention_mask is None:
             return None
 
         # 若 shape 为 [B, T]，转换为 [B, 1, 1, T]
-        if padding_mask.dim() == 2:
-            padding_mask = padding_mask[:, None, None, :]
+        if attention_mask.dim() == 2:
+            attention_mask = attention_mask[:, None, None, :]
 
         # 确保形状正确
-        assert padding_mask.shape[-1] == seq_len, f"padding mask最后一维应与seq_len一致，但为 {padding_mask.shape[-1]} != {seq_len}"
+        assert attention_mask.shape[-1] == seq_len, f"padding mask最后一维应与seq_len一致，但为 {attention_mask.shape[-1]} != {seq_len}"
 
-        return padding_mask.to(dtype=dtype, device=device)
+        # 转换布尔掩码为加法掩码
+        if attention_mask.dtype == torch.bool:
+            zeros = torch.zeros_like(attention_mask, dtype=dtype)
+            neg_val = torch.full_like(zeros, min_val, dtype=dtype)
+            attention_mask = torch.where(attention_mask, zeros, neg_val)
 
-    def _merge_masks(self, causal_mask: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+        return attention_mask.to(dtype=dtype, device=device)
+
+    def _merge_masks(self, causal_mask: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         合并因果掩码和 padding 掩码，返回最终用于 attention 的掩码。
 
         参数:
         :param causal_mask: Tensor[1, 1, T, T]，下三角因果掩码
-        :param padding_mask: Tensor[B, 1, 1, T]，padding mask
+        :param attention_mask: Tensor[B, 1, 1, T]，padding mask
 
         返回:
             合并后的掩码: Tensor[B, 1, T, T]
         """
-        if padding_mask is None:
+        if attention_mask is None:
             return causal_mask
 
         # 将 padding mask 扩展到 query 维度： [B, 1, 1, T] -> [B, 1, T, T]
         # 即：每个 query token 都对所有 key 应用 padding 屏蔽
-        padding_mask = padding_mask.expand(-1, -1, causal_mask.size(-2), -1)  # [B, 1, T, T]
+        attention_mask = attention_mask.expand(-1, -1, causal_mask.size(-2), -1)  # [B, 1, T, T]
 
         # 广播加法合并两个 mask，注意类型必须一致
-        attn_mask = causal_mask + padding_mask
+        attn_mask = causal_mask + attention_mask
 
         return attn_mask
 
     def forward(
         self,
         x: torch.Tensor,                               # 输入张量，形状 [B, T, embed_dim]
-        padding_mask: torch.Tensor = None,            # 可选Padding掩码，形状 [B, 1, 1, T]
+        attention_mask: torch.Tensor = None,            # 可选Padding掩码，形状 [B, 1, 1, T]
     ) -> torch.Tensor:
         # ===== 1. 张量并行输入切分 =====
         if self.tp_size > 1:
@@ -304,13 +321,13 @@ class ByteMultiHeadSelfAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # ===== 6. 构建并自动调整 additive_mask 长度，和 KV 缓存长度同步 ===== 
-        padding_mask = self._adjust_padding_mask(padding_mask, seq_len, device, compute_dtype)
+        attention_mask = self._adjust_attention_mask(attention_mask, seq_len, device, compute_dtype)
         
         # ===== 7. 构建基础因果掩码 ===== 
         causal_mask = self._build_causal_mask(seq_len, device, compute_dtype)
         
         # ===== 8. 合并因果掩码和padding掩码 ===== 
-        attn_mask = self._merge_masks(causal_mask, padding_mask)
+        attn_mask = self._merge_masks(causal_mask, attention_mask)
 
         # ===== 9. 构建 Mask & Attention ===== 
         if self.use_flash:
