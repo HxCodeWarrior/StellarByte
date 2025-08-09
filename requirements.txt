@@ -4,6 +4,9 @@ torch==2.5.1
 torchvision==0.20.1
 transformers>=4.30.0
 
+# Tokenizer
+sentencepiece>=0.2.0
+
 # 算法优化
 torch_scatter>=2.1.2
 
@@ -17,6 +20,17 @@ pyyaml==6.0.2
 # ============= 模型组件 =============
 # DropPath实现
 timm==1.0.17
+
+# ============= NLP评估工具 =============
+nltk>=3.9.1
+rouge-score>=0.1.2
+
+# ============= Tokenizer 训练专用 =============
+# 高性能 tokenizer 库
+tokenizers>=0.21.0
+
+# 数据集处理
+datasets>=3.2.0
 
 # ============= 可视化与监控 =============
 # 实验追踪
