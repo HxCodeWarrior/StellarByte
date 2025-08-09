@@ -7,6 +7,14 @@ import math
 import random
 import numpy as np
 
+from tqdm import tqdm
+from types import SimpleNamespace
+
+import nltk
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+from nltk.translate.meteor_score import meteor_score
+
 import swanlab
 
 import torch
@@ -15,14 +23,16 @@ from torch.utils.data import DataLoader
 from contextlib import nullcontext
 from transformers import AutoTokenizer
 
-from tqdm import tqdm
-from types import SimpleNamespace
-
+from utils.logger import setup_logger
 from model.Model import ByteModel
 from model.config import ByteModelConfig
 from datasets import PretrainDataset
 
-# 创建日志记录器
+# nltk需要下载必要资
+nltk.download('./sources/wordnet')
+nltk.download('./sources/omw-1.4')
+
+# 设置全局logger
 logger = logging.getLogger(__name__)
 
 def parse_args(config_path: str):
@@ -69,11 +79,19 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
     os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 禁止 tokenizer 多线程警告
     os.environ["PYTHONWARNINGS"] = "ignore"         # 忽略所有 Python 警告
 
-    # 设置日志格式（如果未统一设定）
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    # 创建一个日志器（logger）
+    logger_config = config.logger
+    setup_logger(
+        name=logger_config.logger_name,               # 自定义logger名字，可为None使用root logger
+        log_dir=logger_config.log_dir,                # 日志文件保存目录
+        log_file=logger_config.log_file,              # 日志文件名
+        level=logger_config.log_level,                # logger总体日志等级
+        console_level=logger_config.console_level,    # 控制台日志等级
+        file_level=logger_config.file_level,          # 文件日志等级
+        use_color=logger_config.use_color,            # 控制台启用彩色日志
+        when=logger_config.rotation,                  # 文件轮转周期，午夜
+        backup_count=logger_config.backup_count,      # 保留最近7个日志文件
+        is_rank_0=logger_config.is_rank_0             # 是否为rank 0（多进程场景控制文件写入）
     )
 
     # 设置随机种子，保证可复现性
@@ -109,11 +127,12 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
 
     # 初始化 SwanLab 实验追踪
     try:
+        swanlab.login(api_key=config.experiment.api_key)
         swanlab.init(
-            project=config.experiment.name or "default_project",
+            project=config.experiment.project_name or "default_project",
             name=config.experiment.run_name or f"run_{int(time.time())}",
             config=config,  # 自动记录所有配置参数
-            mode="online",  # 改为 "offline" 可离线记录
+            logdir=logger_config.log_dir or None,
         )
         logger.info("SwanLab initialized.")
     except Exception as e:
@@ -127,19 +146,19 @@ def cosine_annealing_lr(
     warmup_ratio: float = 0.02,
     plateau_ratio: float = 0.01,
     max_lr: float = 1e-3,
-    min_lr: float = 1e-6,
+    min_lr_ratio: float = 0.10,
 ) -> float:
     """
-    标准 LLM 预训练学习率调度器: Warmup + Plateau  + Cosine Decay
+    LLM 预训练学习率调度器: Warmup + Plateau  + Cosine Decay
     
     Args:
         Args:
-        current_step (int): 当前步数（从0开始）
-        total_steps  (int): 总训练步数
-        warmup_ratio  (float): warmup阶段占总步数的比例（0~1）
-        plateau_ratio (float): 平台期步数比例（0~1之间）
-        max_lr (float): 最大学习率
-        min_lr (float): 最小学习率
+        current_step  (int)   : 当前步数（从0开始）
+        total_steps   (int)   : 总训练步数
+        warmup_ratio  (float) : warmup阶段占总步数的比例（0~1）,推荐 0.01 ~ 0.03
+        plateau_ratio (float) : 平台期步数比例（0~1之间）, 推荐 0.00 ~ 0.02
+        max_lr        (float) : 最大学习率
+        min_lr_ratio  (float) : 最小学习率比例（相对于max_lr）
     
     Return:
         float: 当前步对应的学习率
@@ -155,9 +174,12 @@ def cosine_annealing_lr(
         raise ValueError("warmup_ratio + plateau_ratio 必须小于 1")
     if current_step < 0:
         raise ValueError("current_step不能为负数")
-    if min_lr < 0 or max_lr < min_lr:
-        raise ValueError(f"无效的学习率范围: min_lr={min_lr}, max_lr={max_lr}")
+    if min_lr_ratio <= 0 or min_lr_ratio > 1.0:
+        raise ValueError("min_lr_ratio必须在(0, 1.0]之间")
     
+    # 动态计算最小学习率
+    min_lr = max_lr * min_lr_ratio
+
     # 步数换算
     warmup_steps = int(total_steps * warmup_ratio)
     plateau_steps = int(total_steps * plateau_ratio)
@@ -182,7 +204,7 @@ def cosine_annealing_lr(
     
     return current_lr
 
-def init_model(config):
+def init_model(config, device):
     """
     初始化分词器和模型，并移动到适当设备。
 
@@ -204,18 +226,18 @@ def init_model(config):
     tokenizer = AutoTokenizer.from_pretrained(config.data.tokenizer_path, use_fast=True)
 
     # ===== 4. 设备处理 =====
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     return model, tokenizer
 
-def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
+def evaluate(model, eval_dataset, tokenizer, batch_size=8, device="cuda"):
     f"""
     工业级的LLM预训练模型评估函数。
 
     Args:
         model (torch.nn.Module): 需要评估的模型。
         eval_dataset (torch.utils.data.Dataset): 用于评估的数据集。
+        tokenizer (AutoTokenizer): 分词器。
         batch_size (int): 每次评估的批次大小。
         device (str): 执行评估的设备（默认使用cuda）。
     Returns:
@@ -223,7 +245,11 @@ def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
         {
             "loss": final_loss,
             "perplexity": final_perplexity,
-            "accuracy": final_accuracy
+            "accuracy": final_accuracy,
+            "bleu": bleu_score,
+            "rouge-1": avg_rouge1,
+            "rouge-l": avg_rougeL,
+            "meteor": avg_meteor,
         }
     """
     
@@ -239,6 +265,16 @@ def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
     correct_predictions = 0      # 正确预测数量
     total_predictions = 0        # 总预测数量
 
+    # 准备存储生成文本与参考文本，供BLEU/ROUGE/METEOR计算
+    all_references = []  # list of list of references (tokenized)
+    all_hypotheses = []  # list of hypotheses (tokenized)
+
+    # Rouge scorer
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+    rouge1_scores = []
+    rougeL_scores = []
+    meteor_scores = []
+
     step = 0  # 当前评估步数
 
     # 禁用梯度计算，加快评估速度、减少显存占用
@@ -250,13 +286,9 @@ def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
             step += 1
 
             # 将batch中的输入转移到指定设备
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch.get("attention_mask", None)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-
-            # 如果没有显式提供labels，默认将input_ids作为labels（如自回归模型）
-            labels = batch.get("labels", input_ids).to(device)
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels         = batch["labels"].to(device)
 
             # 前向传播，获取损失和输出logits
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
@@ -268,20 +300,47 @@ def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
 
             # 创建mask用于忽略padding或-100标记
             mask = labels != -100
+            
+            # 计算预测的token数量
+            num_tokens   = mask.sum().item()
+            total_loss   += loss.item() * num_tokens  # 按token加权
+            total_tokens += num_tokens
 
-            # 计算正确预测的token数量
+            # 计算准确率
+            predictions = torch.argmax(logits, dim=-1)
             correct = (predictions == labels) & mask
             correct_predictions += correct.sum().item()
-            total_predictions += mask.sum().item()
-
-            # 累加损失和样本数（按样本个数加权）
-            total_loss += loss.item() * input_ids.size(0)
-            total_tokens += input_ids.size(0)
+            total_predictions += num_tokens
 
             # 动态计算当前平均loss、困惑度和准确率
             avg_loss = total_loss / total_tokens
             perplexity = math.exp(avg_loss) if avg_loss < 100 else float("inf")
             accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+
+            # --- 文本生成部分 ---
+            # 解码参考文本和生成文本（忽略-100）
+            for ref_ids, pred_ids in zip(labels.cpu().tolist(), predictions.cpu().tolist()):
+                # 过滤掉-100标签，转为token字符串
+                ref_tokens = [token for token in ref_ids if token != -100]
+                pred_tokens = pred_ids[:len(ref_tokens)]  # 预测长度与参考对齐
+                # 使用tokenizer解码为字符串（需要从外层传入tokenizer或定义为全局）
+                ref_text = tokenizer.decode(ref_tokens, skip_special_tokens=True).strip()
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+
+                # 分词（简单空格切分）
+                ref_tokens_split = ref_text.split()
+                pred_tokens_split = pred_text.split()
+
+                all_references.append([ref_tokens_split])  # BLEU要求参考是list of list
+                all_hypotheses.append(pred_tokens_split)
+
+                # 计算ROUGE分数
+                rouge_score = scorer.score(ref_text, pred_text)
+                rouge1_scores.append(rouge_score['rouge1'].fmeasure)
+                rougeL_scores.append(rouge_score['rougeL'].fmeasure)
+
+                # 计算METEOR分数
+                meteor_scores.append(meteor_score([ref_text], pred_text))
 
             # 更新进度条中的状态信息
             pbar.set_postfix({
@@ -295,14 +354,40 @@ def evaluate(model, eval_dataset, batch_size=8, device="cuda"):
     final_perplexity = math.exp(final_loss) if final_loss < 100 else float("inf")
     final_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
 
+    # 计算BLEU
+    # smoothing_method=4可避免0分问题
+    bleu_score = corpus_bleu(
+        all_references,
+        all_hypotheses,
+        smoothing_function=SmoothingFunction().method4
+    )
+
+    # 计算ROUGE均值
+    avg_rouge1 = sum(rouge1_scores) / len(rouge1_scores) if rouge1_scores else 0.0
+    avg_rougeL = sum(rougeL_scores) / len(rougeL_scores) if rougeL_scores else 0.0
+
+    # 计算METEOR均值
+    avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
+
     # 打印最终评估结果
-    logger.info(f"[Eval] Loss: {final_loss:.4f}, PPL: {final_perplexity:.2f}, Accuracy: {final_accuracy:.2%}")
+    logger.info(
+        f"[Eval] Loss: {final_loss:.4f}, "
+        f"PPL: {final_perplexity:.2f}, "
+        f"Accuracy: {final_accuracy:.2%}, "
+        f"BLEU: {bleu_score:.4f}, "
+        f"ROUGE-1: {avg_rouge1:.4f}, "
+        f"ROUGE-L: {avg_rougeL:.4f}, "
+        f"METEOR: {avg_meteor:.4f}")
 
     # 返回评估指标结果（可用于日志、保存等）
     return {
         "loss": final_loss,
         "perplexity": final_perplexity,
-        "accuracy": final_accuracy
+        "accuracy": final_accuracy,
+        "bleu": bleu_score,
+        "rouge-1": avg_rouge1,
+        "rouge-l": avg_rougeL,
+        "meteor": avg_meteor,
     }
 
 def train_epoch(
@@ -318,7 +403,7 @@ def train_epoch(
     eval_dataset: PretrainDataset = None
 ) -> int:
     """
-    工业级LLM单轮训练函数，支持混合精度、梯度累积等高级特性
+    LLM单轮训练函数，支持混合精度、梯度累积等高级特性
     
     Args:
         epoch (int): 当前训练轮次
@@ -342,9 +427,9 @@ def train_epoch(
     accumulation_steps = train_config.gradient_accumulation_steps  # 梯度累积步数
     max_grad_norm      = train_config.max_grad_norm                # 梯度裁剪阈值
     total_loss         = 0.0             # 累计整个epoch的总损失
+    total_token_count  = 0               # 累计整个epoch的token数量
     accumulated_loss   = 0.0             # 当前梯度累积周期内的损失
-    tokens_processed   = 0               # 当前梯度累积周期内处理的token总数
-    start_time         = time.time()     # 当前梯度累积周期的开始时间
+    accumulated_tokens = 0               # 当前梯度累积周期内处理的token总数
     
     # 从配置获取日志间隔（添加默认值）
     log_interval = getattr(train_config, 'log_interval', 10)
@@ -354,6 +439,7 @@ def train_epoch(
     # 创建进度条（显示epoch信息，以batch为单位）
     pbar = tqdm(
         train_dataloader, 
+        total=iter_per_epoch, 
         desc=f"Epoch {epoch+1}/{train_config.train_epochs}", 
         unit="batch"
     )
@@ -361,12 +447,20 @@ def train_epoch(
     # 混合精度上下文管理器
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if scaler else nullcontext()
     
+    # 确保在开始之前梯度清零
+    optimizer.zero_grad()
+
+    start_time         = time.time()     # 当前梯度累积周期的开始时间
+    epoch_start_time   = start_time      # 当前epoch的开始时间
+    local_start_time   = start_time  # 用于 tokens/sec 计算（每次累积重置）
+
     # ===== 2. 批次训练循环 =====
     for step, batch in enumerate(pbar):
         # 2.1 数据准备
-        input_ids   = batch["input_ids"].to(device, non_blocking=True) # 输入token IDs，异步传输到设备
-        labels      = batch["labels"].to(device, non_blocking=True)    # 标签token IDs，异步传输
-        loss_mask   = batch["loss_mask"].to(device, non_blocking=True) # 损失掩码，异步传输
+        input_ids      = batch["input_ids"].to(device, non_blocking=True)      # 输入token IDs，异步传输到设备
+        labels         = batch["labels"].to(device, non_blocking=True)         # 标签token IDs，异步传输
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True) # 注意力掩码，异步传输
+        loss_mask      = batch["loss_mask"].to(device, non_blocking=True)      # 损失掩码，异步传输
         batch_size, seq_len = input_ids.shape
         
         # 2.2 动态学习率更新（每一步都更新）
@@ -377,20 +471,27 @@ def train_epoch(
         # 2.3 混合精度前向传播
         with amp_ctx: # 进入混合精度上下文（自动管理FP16计算）
             outputs = model(
-                input_ids    = input_ids, 
-                labels       = labels,
-                padding_mask = loss_mask
+                input_ids      = input_ids, 
+                labels         = labels,
+                attention_mask = attention_mask,
             ) # 模型前向传播
-            loss = outputs.loss / accumulation_steps  # 梯度累积损失缩放
-        
+            loss      = outputs.loss / accumulation_steps  # 梯度累积损失缩放
+            # loss_mask = loss_mask.view(-1)
+            # loss      = torch.sum(loss * loss_mask) / loss_mask.sum()
+
         # 2.4 反向传播
         scaler.scale(loss).backward()
         
         # 2.4 损失统计
-        current_loss     = loss.item() * accumulation_steps  # 还原实际损失值（去除梯度累积的缩放）
-        accumulated_loss += current_loss                     # 累加到当前累积周期的损失
-        total_loss       += current_loss                     # 累加到epoch总损失
-        tokens_processed += batch_size * seq_len             # 累加处理的token数量
+        # 计算 activa tokens 数量
+        active_tokens = int(loss_mask.sum().item())
+
+        # 累计 token-level loss
+        batch_token_loss_sum = loss.detach().item() * active_tokens
+        acc_token_loss_sum   += batch_token_loss_sum
+        total_token_loss_sum += batch_token_loss_sum
+        acc_token_count      += active_tokens
+        total_token_count    += active_tokens
         
         # 2.5 梯度累积更新
         if (step + 1) % accumulation_steps == 0:
@@ -407,26 +508,29 @@ def train_epoch(
             
             # 2.6 指标计算与记录
             global_step    += 1  # 全局步数增加
-            step_time      = time.time() - start_time  # 计算当前累积周期的耗时
-            tokens_per_sec = tokens_processed / step_time  # 计算吞吐量（token/秒）
+            step_time      = time.time() - local_start_time  # 计算当前累积周期的耗时
+            tokens_per_sec = accumulated_tokens / step_time  # 计算吞吐量（token/秒）
             avg_loss       = accumulated_loss / accumulation_steps  # 计算平均损失
             
             # 2.7 重置累积状态（准备下一个累积周期）
-            accumulated_loss = 0.0          # 重置累积损失
-            tokens_processed = 0            # 重置token计数器
-            start_time       = time.time()  # 重置计时器
+            accumulated_loss   = 0.0          # 重置累积损失
+            accumulated_tokens = 0            # 重置token计数器
+            start_time         = time.time()  # 重置计时器
             
             # 2.8 日志记录（按全局步骤）
             if global_step % log_interval == 0:
                 # 计算剩余时间
-                elapsed_time = time.time() - step_time
-                batches_per_sec = (step + 1) / elapsed_time
-                remaining_batches = iter_per_epoch - step - 1
-                remaining_time = remaining_batches / batches_per_sec
+                elapsed_time      = time.time() - epoch_start_time
+                batches_per_sec   = (step + 1) / elapsed_time
+                remaining_batches = max(0, iter_per_epoch - step - 1)
+                remaining_time    = remaining_batches / batches_per_sec
                 
-                # 获取显存使用情况
-                mem_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3)  # GB
-                mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                # 获取显存信息（仅 cuda）
+                if device.type == "cuda":
+                    mem_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                    mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                else:
+                    mem_alloc = mem_reserved = 0.0
                 
                 logger.info(
                     f"Epoch:[{epoch+1}/{train_config.train_epochs}] "
@@ -468,8 +572,10 @@ def train_epoch(
             
             # 2.9 模型验证
             if eval_dataset and global_step % eval_interval == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None # 清空显存缓存（避免OOM）
+
                 logger.info(f"开始验证 @ step {global_step}")
-                eval_start = time.time()
+                eval_start_time = time.time()
                 eval_metrics = evaluate(
                     model, 
                     eval_dataset, 
@@ -482,13 +588,33 @@ def train_epoch(
                     "eval/loss": eval_metrics["loss"],
                     "eval/perplexity": eval_metrics["perplexity"],
                     "eval/accuracy": eval_metrics["accuracy"],
-                    "eval/duration": time.time() - eval_start
+                    "eval/duration": time.time() - eval_start_time
                 }, step=global_step)
                 
                 # 恢复训练模式
                 model.train()
-                logger.info(f"验证完成 | 耗时: {time.time()-eval_start:.1f}s")
+                logger.info(f"验证完成 | 耗时: {time.time()-eval_start_time:.1f}s")
     
+    # 2.10 处理残余梯度(如果最后没有整除accumulation_steps)
+    if accumulated_tokens > 0:
+        # 梯度裁剪（防止梯度爆炸）
+        if max_grad_norm > 0:  # 检查是否启用梯度裁剪
+            scaler.unscale_(optimizer)  # 取消缩放梯度（恢复原始梯度值）
+            # 裁剪梯度（L2范数不超过max_grad_norm）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        
+        # 取消缩放梯度（恢复原始梯度值）
+        scaler.step(optimizer) # 使用缩放后的梯度更新参数
+        scaler.update()        # 缩放器更新梯度缩放因子
+        
+        # 梯度清零
+        optimizer.zero_grad()
+        global_step += 1
+
+        # 日志记录
+        avg_loss = accumulated_loss / accumulated_tokens
+        logger.info(f"[Epoch End] Residual update done. Avg loss (residual): {avg_loss:.4f}")
+
     # ===== 3. 轮次结束处理 =====
     # 计算整个epoch的平均损失
     epoch_loss = total_loss / len(train_dataloader)
@@ -503,5 +629,132 @@ def train_epoch(
     
     return global_step
 
-def train():
-    pass
+def train(config_path: str):
+    """
+    LLM 预训练主函数，整合训练流程所有组件
+    
+    Args:
+        config_path (str): YAML 配置文件路径，默认为"./configs/pretrain.yaml"
+    """
+    # ==================== 1. 配置解析与环境设置 ====================
+    config = parse_args(config_path)
+    device = set_environment(config)
+    
+    # ==================== 2. 模型与数据初始化 ====================
+    model, tokenizer = init_model(config, device)
+    
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"模型总参数: {total_params:,} | 可训练参数: {trainable_params:,}")
+    
+    # 初始化数据集
+    train_dataset = PretrainDataset(
+        data_dir=config.data.train_data_dir,
+        max_length=config.model.max_seq_len,
+        tokenizer=tokenizer,
+        shuffle=True
+    )
+    
+    eval_dataset = PretrainDataset(
+        data_dir=config.data.eval_data_dir,
+        max_length=config.model.max_seq_len,
+        tokenizer=tokenizer,
+        shuffle=False
+    ) if config.data.eval_data_dir else None
+    
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.training.batch_size,
+        num_workers=config.training.num_workers,
+        pin_memory=True
+    )
+    
+    # ==================== 3. 训练基础设施初始化 ====================
+    # 优化器配置
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+        betas=(config.training.beta1, config.training.beta2)
+    )
+    
+    # 混合精度训练
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    
+    # 学习率调度器
+    total_steps = len(train_loader) * config.training.train_epochs
+    lr_scheduler = lambda step: cosine_annealing_lr(
+        current_step=step,
+        total_steps=total_steps,
+        warmup_ratio=config.training.warmup_ratio,
+        plateau_ratio=config.training.plateau_ratio,
+        max_lr=config.training.learning_rate,
+        min_lr_ratio=config.training.min_lr_ratio
+    )
+    
+    # ==================== 4. 训练循环 ====================
+    global_step = 0
+    start_epoch = 0
+    
+    # 创建输出目录
+    os.makedirs(config.training.output_dir, exist_ok=True)
+    
+    # 训练计时
+    total_start_time = time.time()
+    
+    logger.info(f"开始训练，共 {config.training.train_epochs} 个轮次，总步数 {total_steps}")
+    
+    for epoch in range(start_epoch, config.training.train_epochs):
+        epoch_start_time = time.time()
+        
+        global_step = train_epoch(
+            epoch=epoch,
+            model=model,
+            train_dataloader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            config=config,
+            global_step=global_step,
+            lr_scheduler=lr_scheduler,
+            scaler=scaler,
+            eval_dataset=eval_dataset
+        )
+        
+        # 轮次结束评估
+        if eval_dataset:
+            logger.info(f"轮次 {epoch+1} 结束，开始完整验证集评估...")
+            eval_metrics = evaluate(
+                model,
+                eval_dataset,
+                batch_size=config.training.eval_batch_size,
+                device=device
+            )
+            # 记录验证指标
+            swanlab.log({
+                "eval/epoch_loss": eval_metrics["loss"],
+                "eval/epoch_perplexity": eval_metrics["perplexity"],
+                "eval/epoch_accuracy": eval_metrics["accuracy"]
+            }, step=global_step)
+        
+        # 轮次结束保存
+        if (epoch + 1) % config.training.save_epochs == 0:
+            checkpoint_path = os.path.join(
+                config.training.output_dir,
+                f"model_epoch_{epoch+1}.pth"
+            )
+            pass
+            logger.info(f"保存检查点到: {checkpoint_path}")
+    
+    # ==================== 5. 训练结束处理 ====================
+    total_time = time.time() - total_start_time
+    logger.info(f"训练完成! 总耗时: {total_time/3600:.2f} 小时")
+    
+    # 保存最终模型
+    final_model_path = os.path.join(config.training.output_dir, "final_model.pth")
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"最终模型保存到: {final_model_path}")
+    
+    # 记录训练完成
+    swanlab.finish()
