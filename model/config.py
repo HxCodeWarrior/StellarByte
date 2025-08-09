@@ -19,7 +19,6 @@ class ByteModelConfig(PretrainedConfig):
         attention_dropout_prob: float = 0.1,  # 注意力dropout率
         residual_dropout_prob: float = 0.1,   # 残差连接dropout率
         layer_norm_eps: float = 1e-5,         # 层归一化epsilon值
-        tie_word_embeddings: bool = False,    # 是否绑定输入输出词嵌入
         base_theta: float = 10000.0,          # 位置编码theta参数
         ntk_alpha: float = 1.0,               # 位置编码NTK-alpha参数
         use_flash_attention: bool = False,    # 是否使用FlashAttention
@@ -73,6 +72,5 @@ class ByteModelConfig(PretrainedConfig):
         self.tensor_parallel_group = tensor_parallel_group
         
         super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
             **kwargs
         )
