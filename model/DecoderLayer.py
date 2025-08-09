@@ -79,17 +79,18 @@ class ByteDecoderLayer(nn.Module):
     def forward(
         self, 
         x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         x: [B, T, D]
-        padding_mask: 与 MultiHeadSelfAttention 相同
+        attention_mask: 与 MultiHeadSelfAttention 相同
         """
         if self.parallel_residual:
             # -------- Parallel Residual (PaLM / GPT‑NeoX 风格) ----------
-            norm_x = self.norm_attn(x)           # 共享同一 RMSNorm
-            attn_out = self.self_attn(norm_x, padding_mask)
-            ffn_out  = self.mlp(norm_x)
+            attn_norm_x = self.norm_attn(x)
+            ffn_norm_x  = self.norm_ffn(x)
+            attn_out = self.self_attn(attn_norm_x, attention_mask)
+            ffn_out  = self.mlp(ffn_norm_x)
             out = x + self.drop_path(
                 self.ls_attn * attn_out * self.resid_scale
                 + self.ls_mlp  * ffn_out  * self.resid_scale
@@ -98,13 +99,14 @@ class ByteDecoderLayer(nn.Module):
         else:
             # ------------------- 顺序 Residual -------------------------
             # 1) Self‑Attention
-            attn_out = self.self_attn(self.norm_attn(x), padding_mask)
+            attn_out = self.self_attn(self.norm_attn(x), attention_mask)
             x = x + self.drop_path(self.ls_attn * attn_out * self.resid_scale)
 
             # 2) Feed‑Forward
             ffn_out = self.mlp(self.norm_ffn(x))
             x = x + self.drop_path(self.ls_mlp * ffn_out * self.resid_scale)
             return x
+
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     cfg = ByteModelConfig(
