@@ -77,7 +77,7 @@ class ByteModel(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         # 获取输入张量的形状信息
@@ -91,7 +91,7 @@ class ByteModel(PreTrainedModel):
         
         # Decoder层
         for layer in self.layers:
-            hidden_states = layer(hidden_states, padding_mask)
+            hidden_states = layer(hidden_states, attention_mask)
 
         # 归一化
         hidden_states = self.norm(hidden_states)
@@ -102,14 +102,10 @@ class ByteModel(PreTrainedModel):
         # 损失计算
         loss = None
         if labels is not None:
-            # 移位标签和预测
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            
             # 计算交叉熵损失
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                logits.view(-1,logits.size(-1)),
+                labels.view(-1),
                 ignore_index=-100,  # 忽略特殊标签
                 reduction='mean'
             )
