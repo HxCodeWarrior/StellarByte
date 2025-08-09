@@ -39,8 +39,9 @@ class BaseDataset(Dataset):
 
         Returns
         -------
-        padded_ids : list[int],长度恰为 `max_length` 的 token 序列。
-        loss_mask : list[bool],与 `padded_ids` 同长；真实 token = True，PAD = False。
+        padded_ids     : list[int],长度恰为 `max_length` 的 token 序列。
+        attention_mask : list[bool],与 `padded_ids` 同长；真实 token = True，PAD = False。
+        loss_mask      : list[bool],与 `padded_ids` 同长；真实 token = True，PAD = False。
         """
         # ---------- 1. 截断 ----------
         input_ids = input_ids[: self.max_length]
@@ -55,12 +56,12 @@ class BaseDataset(Dataset):
         # ---------- 4. 生成掩码 ----------
         # mask: List[int] = [1] * len(input_ids) + [0] * pad_len
         # 真实 token → True，PAD → False；dtype 使用 bool 更节约显存
-        attention_mask: list[int]  = [1] * seq_len + [0] * pad_len
-        loss_mask     : list[bool] = [True] * seq_len + [False] * pad_len
+        attention_mask: list[int] = [1] * seq_len + [0] * pad_len
+        loss_mask     : list[int] = [1] * seq_len + [0] * pad_len
 
         return (
             torch.tensor(padded_ids, dtype=torch.long),
-            torch.tensor(attention_mask, dtype=torch.long),
+            torch.tensor(attention_mask, dtype=torch.bool),
             torch.tensor(loss_mask, dtype=torch.bool)
         )
 
@@ -206,9 +207,11 @@ class PretrainDataset(BaseDataset):
 
 
 class SFTDataset(BaseDataset):
-    def __init__(self, data_path, tokenizer, max_length=512):
+    def __init__(self, data_path, tokenizer, start_tokens, end_tokens, max_length=512):
         super().__init__(tokenizer, max_length)
-        self.data_path = data_path
+        self.data_path    = data_path
+        self.start_tokens = start_tokens
+        self.end_tokens   = end_tokens
         
         # 加载数据
         with open(data_path, 'r', encoding='utf-8') as f:
@@ -217,29 +220,27 @@ class SFTDataset(BaseDataset):
         # 动态生成特殊标记序列
         self._init_special_tokens()
         logging.info(f"Loaded {len(self)} SFT samples")
-        logging.info(f"Assistant start tokens: {self.assistant_start_tokens}")
-        logging.info(f"Im_end token: {self.im_end_token}")
+        logging.info(f"Assistant start tokens: {self.start_tokens}")
+        logging.info(f"Im_end token: {self.end_tokens}")
 
     def _init_special_tokens(self):
         """动态生成特殊标记序列，增强鲁棒性"""
-        # 生成assistant起始标记
-        assistant_start_str = "<|im_start|>assistant\n"
+        # 生成起始标记
         self.assistant_start_tokens = self.tokenizer.encode(
-            assistant_start_str, 
+            self.start_tokens, 
             add_special_tokens=False
         )
         
         # 生成消息结束标记
-        im_end_str = "<|im_end|>"
         self.im_end_token = self.tokenizer.encode(
-            im_end_str,
+            self.end_tokens,
             add_special_tokens=False
         )
 
         # 验证特殊标记
-        if not self.assistant_start_tokens:
+        if not self.start_tokens:
             logging.warning("Assistant start tokens are empty!")
-        if not self.im_end_token:
+        if not self.end_tokens:
             logging.warning("Im_end token is empty!")
 
     @staticmethod
@@ -281,17 +282,17 @@ class SFTDataset(BaseDataset):
                     j = lps[j - 1]           # 继续寻找下一个
         return res
 
-    def generate_loss_mask(self, input_ids: List[int]) -> List[bool]:
+    def _generate_loss_mask(self, input_ids: List[int]) -> List[bool]:
         """
         针对 SFT 模型，精确标记 **assistant 回复正文** 所在 token 位置：
         仅这些位置参与 loss 计算。
         """
         # 1) 先找到 assistant 起始标记 & 结束标记的所有出现位置
         start_positions = self._find_token_sequence(
-            self.assistant_start_tokens, input_ids
+            self.start_tokens, input_ids
         )
         end_positions = self._find_token_sequence(
-            self.im_end_token, input_ids
+            self.end_tokens, input_ids
         )
 
         # 2) 初始化全 False 掩码（不算 loss）
@@ -299,15 +300,14 @@ class SFTDataset(BaseDataset):
 
         # 3) 为每个起始点配对最近的结束点，并设置区间 True
         for start in start_positions:
-            content_start = start + len(self.assistant_start_tokens)
+            content_start = start + len(self.start_tokens)
 
             # 找到位于内容后的第一个 `<|im_end|>`
-            end = next((e for e in end_positions if e > content_start), len(input_ids))
+            content_end = next((e for e in end_positions if e > content_start), len(input_ids))
 
             # 有效性检查：防止空区间或越界
-            if content_start < end:
-                for i in range(content_start, end):
-                    mask[i] = True
+            if content_start < content_end:
+                mask[content_start:content_end] = [True] * (content_end - content_start)
 
         return mask
 
@@ -318,9 +318,10 @@ class SFTDataset(BaseDataset):
         """
         返回统一格式的字典：
         {
-            "input_ids": [seq_len-1],
-            "labels":    [seq_len-1],
-            "loss_mask": [seq_len-1] (bool)
+            "input_ids"     :   [seq_len-1],
+            "labels"        :   [seq_len-1],
+            "attention_mask":   [seq_len-1], (bool)
+            "loss_mask"     :   [seq_len-1]  (bool)
         }
         """
         sample = self.data[idx]
@@ -343,24 +344,32 @@ class SFTDataset(BaseDataset):
             max_length=self.max_length
         )
 
-        # ---------- 3. 填充 + 通用掩码 ----------
-        padded_ids, pad_mask = self._pad_and_mask(token_ids)
+        # ---------- 3. SFT 专属掩码 ----------
+        sft_mask = self._generate_loss_mask(token_ids)
 
-        # ---------- 4. SFT 专属掩码 ----------
-        sft_mask = self.generate_loss_mask(padded_ids)
+        # ---------- 4. 填充 + 通用掩码 ----------
+        padded_ids, attention_mask, pad_mask = self._pad_and_mask(sft_mask)
 
-        # ---------- 5. 合并掩码（AND） ----------
+        # ---------- 5. 扩展 SFT 掩码到填充长度 ----------
+        sft_mask = sft_mask + [False] * (self.max_length - len(sft_mask))
+
+        # ---------- 6. 合并掩码（AND） ----------
         final_mask = [p and s for p, s in zip(pad_mask, sft_mask)]
 
-        # ---------- 6. 构造训练对 (左移 1) ----------
-        input_ids = torch.tensor(padded_ids[:-1], dtype=torch.bool)
-        labels    = torch.tensor(padded_ids[1:],  dtype=torch.bool)
-        loss_mask = torch.tensor(final_mask[1:], dtype=torch.bool)  # 与 labels 对齐
+        # ---------- 7. 构造训练对 (左移 1) ----------
+        input_ids      = torch.tensor(padded_ids[:-1], dtype=torch.bool)
+        labels         = torch.tensor(padded_ids[1:],  dtype=torch.bool)
+        attention_mask = torch.tensor(attention_mask[:-1], dtype=torch.bool),  # 对齐input_ids长度
+        loss_mask      = torch.tensor(final_mask[1:], dtype=torch.bool)  # 与 labels 对齐
+
+        # labels 中非 loss_mask 位置设置为 -100，避免计算损失
+        labels[~loss_mask] = -100
 
         return {
-            "input_ids": input_ids,  # [seq_len-1]
-            "labels":    labels,     # [seq_len-1]
-            "loss_mask": loss_mask   # [seq_len-1]
+            "input_ids"     :   input_ids,       # [seq_len-1]
+            "labels"        :   labels,          # [seq_len-1]
+            "attention_mask":   attention_mask,  # [seq_len-1]
+            "loss_mask"     :   loss_mask        # [seq_len-1]
         }
 
 
