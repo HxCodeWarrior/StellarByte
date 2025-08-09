@@ -1257,6 +1257,77 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 - 优化模型预训练脚本train_epoch中的损失函数与padding_mask设置与计算
 - 完善模型预训练脚本train()模型预训练主体函数
 2. 检查数据集加载器中attention_mask设计与模型主体中的padding_mask需求是否一致，如果不一致进行相对应的修复
+3. 重构配置文件
+
+</details>
+
+---
+
+<details>
+<summary>2025.8.9</summary>
+
+### DONE
+1. PretrainDataset、SFTDatasset 数据集加载器修复
+重构数据集处理逻辑并优化掩码生成
+- 修复input_ids、labels、attention_mask、loss_mask生成逻辑
+  - 输入序列：[BOS, T1, T2, T3, T4, T5, T6, T7, EOS]
+  - 样本拆分：
+    - X：[BOS, T1, T2, T3, T4, T5, T6, T7] → 模型输入上下文
+    - Y：[T1, T2, T3, T4, T5, T6, T7, EOS] → 模型预测目标
+  - 损失掩码：
+    - 有效位置：[0, 1, 1, 1, 1, 1, 1, 1, 1] → 仅对T1-EOS计算损失
+- 将特殊标记从硬编码改为通过构造函数传入，提高灵活性
+- 重命名 `generate_loss_mask` 为 `_generate_loss_mask` 表示内部方法
+- 优化掩码生成逻辑，使用切片操作替代循环
+- 添加 attention_mask 到返回字典并统一使用 bool 类型
+- 在 labels 中非 loss_mask 位置设置为 -100 避免计算损失
+- 改进代码格式和注释清晰度
+2. MultiHeadSelfAttention 主要修复多头自注意力机制中attention_mask的调整以及attention_mask与causal_mask融合的逻辑
+- 优化注意力掩码生成逻辑并重命名参数
+- 重构注意力掩码生成逻辑，使用更清晰的变量命名和条件判断。
+- 将padding_mask参数重命名为attention_mask以更准确反映其用途，并改进掩码合并逻辑。
+- 将最小掩码值从torch.finfo(dtype).min改为固定值-1e9以提高稳定性。
+3. DecoderLayer层 调整修复，重命名padding_mask为attention_mask并优化并行残差路径
+- 将padding_mask参数重命名为更通用的attention_mask以提升代码可读性
+- 在并行残差路径中为FFN添加独立的归一化层，与顺序残差路径保持一致
+4. Model模型主体 调整修复，将padding_mask重命名为attention_mask并简化损失计算
+- 将参数名从padding_mask改为更通用的attention_mask以保持一致性
+- 移除不必要的标签移位操作，直接使用原始logits和labels计算损失
+5. model/config.py 移除未使用的tie_word_embeddings参数,清理模型配置中未使用的绑定词嵌入参数，简化配置逻辑
+6. configs/pretrain_config.yaml 重构预训练配置文件结构并更新参数
+- 重新组织配置文件结构，将相关配置分组更清晰
+- 更新模型参数和训练配置以匹配最新需求
+- 优化训练配置参数和日志设置
+- 添加生成配置用于推理场景
+- 移除冗余配置项，简化文件内容
+- 调整参数命名以保持一致性
+7. 重构日志模块，使用TimedRotatingFileHandler并改进彩色输出
+- 移除colorlog依赖，改用colorama实现彩色日志
+- 将RotatingFileHandler替换为TimedRotatingFileHandler以支持按时间轮转日志
+- 新增日志级别字符串转换功能
+- 简化日志配置接口，合并build_logger和get_logger功能
+- 改进异常处理逻辑，移除全局异常处理器
+8. 重构检查点管理器以支持原子保存和分布式训练
+- 使用 Path 替代字符串路径处理
+- 实现原子化保存机制防止损坏
+- 支持分布式训练的主进程判断
+- 改进最佳模型跟踪和旧检查点清理
+- 添加信号处理用于紧急保存
+- 增加类型注解和文档字符串
+9. model_pretrain.py 完善训练脚本，增强模型训练和评估功能
+- 构建整体的模型训练train()函数
+- 添加NLTK评估指标(BLEU/ROUGE/METEOR)支持
+- 重构日志系统使用setup_logger统一管理
+- 改进学习率调度器支持动态最小学习率计算
+- 优化训练过程增加梯度累积残余处理
+- 完善评估函数增加文本生成质量评估
+- 添加SwanLab实验跟踪集成
+
+### TODO
+1. 更新模型每个单元的测试脚本，对每个组件进行详细测试，并修复对应bug
+2. 更新模型预训练相关的组件测试脚本，并修复对应bug
+3. 测试模型预训练脚本，调试相关bug
+4. 更新代码文档，提升代码可读性和可维护性
 
 </details>
 
