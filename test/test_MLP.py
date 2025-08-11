@@ -1,5 +1,6 @@
 import sys
 import torch
+import torch.nn.functional as F
 import pytest
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from pathlib import Path
 root_dir = Path(__file__).parent.parent
 sys.path.append(str(root_dir))
 
-from model.MLP import MLP
+from model.MLP import ByteMLP
 from model.config import ByteModelConfig
 
 # 测试配置
@@ -26,7 +27,7 @@ def test_device_compatibility(device, config):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     
-    mlp = MLP(config.model_dim).to(device)
+    mlp = ByteMLP(config.model_dim).to(device)
     x = torch.randn(2, 16, config.model_dim).to(device)
     
     output = mlp(x)
@@ -36,7 +37,7 @@ def test_device_compatibility(device, config):
 
 # 测试输出形状
 def test_forward_shape(config):
-    mlp = MLP(config.model_dim)
+    mlp = ByteMLP(config.model_dim)
     x = torch.randn(2, 16, config.model_dim)
     
     output = mlp(x)
@@ -44,7 +45,7 @@ def test_forward_shape(config):
 
 # 测试数值稳定性
 def test_numerical_stability(config):
-    mlp = MLP(config.model_dim)
+    mlp = ByteMLP(config.model_dim)
     
     # 测试大数值输入
     x_large = torch.randn(2, 16, config.model_dim) * 1e6
@@ -61,13 +62,13 @@ def test_numerical_stability(config):
 # 测试dropout行为
 def test_dropout_behavior(config):
     # 训练模式
-    mlp_train = MLP(config.model_dim)
+    mlp_train = ByteMLP(config.model_dim)
     mlp_train.train()
     x = torch.randn(2, 16, config.model_dim)
     output_train = mlp_train(x)
     
     # 评估模式
-    mlp_eval = MLP(config.model_dim)
+    mlp_eval = ByteMLP(config.model_dim)
     mlp_eval.eval()
     output_eval = mlp_eval(x)
     
@@ -76,7 +77,7 @@ def test_dropout_behavior(config):
 
 # 测试梯度传播
 def test_gradient_flow(config):
-    mlp = MLP(config.model_dim)
+    mlp = ByteMLP(config.model_dim)
     x = torch.randn(2, 16, config.model_dim, requires_grad=True)
     
     output = mlp(x)
@@ -90,7 +91,7 @@ def test_gradient_flow(config):
 
 # 测试参数更新
 def test_parameter_update(config):
-    mlp = MLP(config.model_dim)
+    mlp = ByteMLP(config.model_dim)
     optimizer = torch.optim.SGD(mlp.parameters(), lr=0.01)
     
     # 获取初始参数
@@ -115,7 +116,11 @@ def test_parameter_update(config):
     (512, 1024)
 ])
 def test_dimension_config(dim, hidden_dim):
-    mlp = MLP(dim, hidden_dim=hidden_dim)
+    mlp = ByteMLP(
+        dim=dim,
+        hidden_dim=hidden_dim,
+        dropout=0.1
+    )
     x = torch.randn(2, 16, dim)
     
     output = mlp(x)
@@ -124,31 +129,44 @@ def test_dimension_config(dim, hidden_dim):
 # 测试门控机制
 def test_gate_mechanism(config):
     # 创建无偏置的MLP
-    mlp = MLP(config.model_dim, bias=False)
-    mlp.eval()  # 禁用dropout
+    mlp = ByteMLP(
+        dim=config.model_dim,
+        bias=False,
+        dropout=0  # 禁用dropout
+    )
+    mlp.eval()
     
-    # 获取权重并固定（只设置权重，忽略偏置）
+    # 固定权重
     with torch.no_grad():
-        mlp.w1.weight.fill_(1.0)
+        mlp.w13.weight.fill_(1.0)
         mlp.w2.weight.fill_(1.0)
-        mlp.w3.weight.fill_(1.0)
+        mlp.norm.weight.fill_(1.0)  # 归一化层权重设为1
     
     # 测试输入
     x = torch.ones(1, 1, config.model_dim)
+    
+    # 验证门控机制
     output = mlp(x)
     
-    # 验证门控机制：a = SiLU(w1(x)), b = w3(x), output = w2(a * b)
-    a = torch.nn.functional.silu(mlp.w1(x))
-    b = mlp.w3(x)
-    expected = mlp.w2(a * b)
+    # 计算期望值
+    residual = x
+    x_norm = mlp.norm(x)  # 归一化处理
+    x_proj = mlp.w13(x_norm)
+    x_gate, x_value = x_proj.chunk(2, dim=-1)
+    x_value = F.silu(x_value)
+    x_gate = torch.sigmoid(x_gate)
+    activated = x_value * x_gate
+    projected = mlp.w2(activated)
+    expected = projected + residual
     
-    assert torch.allclose(output, expected, atol=1e-6)
+    assert torch.allclose(output, expected, atol=1e-5)
+
 
 
 # 测试不同序列长度
 @pytest.mark.parametrize("seq_len", [1, 16, 64, 256])
 def test_variable_sequence_length(seq_len, config):
-    mlp = MLP(config.model_dim)
+    mlp = ByteMLP(config.model_dim)
     x = torch.randn(2, seq_len, config.model_dim)
     
     output = mlp(x)
