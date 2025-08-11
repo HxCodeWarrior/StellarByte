@@ -1,11 +1,13 @@
 import os
-import sys
 import json
 import tempfile
+import pandas as pd
 import pytest
 import torch
-from pathlib import Path
 from transformers import AutoTokenizer
+
+import sys
+from pathlib import Path
 
 # 将项目根目录添加到sys.path
 root_dir = Path(__file__).parent.parent
@@ -13,85 +15,110 @@ sys.path.insert(0, str(root_dir))
 
 from datasets import BaseDataset, PretrainDataset, SFTDataset
 
-tokenizer_path = "./tokenizer"
+# ==== Fixture：加载自训练 tokenizer ====
 @pytest.fixture(scope="session")
 def tokenizer():
-    return AutoTokenizer.from_pretrained(tokenizer_path)  # 使用本地路径
+    tokenizer_path = "./tokenizer"  # 这里改成你的实际路径
+    tok = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
-def test_pad_token_injection(tokenizer):
-    tokenizer.pad_token = None
-    dataset = BaseDataset(tokenizer, max_length=10)
-    assert dataset.pad_token_id is not None
-    assert tokenizer.pad_token == "<|PAD|>"
+    # 确保有 pad_token
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
 
-def test_pad_and_mask_correctness(tokenizer):
-    dataset = BaseDataset(tokenizer, max_length=5)
-    input_ids = [1, 2, 3]
-    padded, mask = dataset._pad_and_mask(input_ids)
-    assert padded == [1, 2, 3, dataset.pad_token_id, dataset.pad_token_id]
-    assert mask == [True, True, True, False, False]
+    return tok
 
-@pytest.fixture
-def temp_json_file():
-    data = [{"input": "你好", "output": "世界"}]
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as f:
-        json.dump(data, f)
-        f.flush()
-        yield f.name
-    os.remove(f.name)
 
-def test_loading_json(temp_json_file, tokenizer):
-    dataset = PretrainDataset(data_path=temp_json_file, tokenizer=tokenizer)
-    assert len(dataset) == 1
-    sample = dataset[0]
-    assert "input_ids" in sample
-    assert sample["input_ids"].shape[0] == tokenizer.model_max_length - 1 or dataset.max_length - 1
+# ==== 测试 BaseDataset ====
+def test_base_dataset_pad_and_mask(tokenizer):
+    ds = BaseDataset(tokenizer, max_length=5)
+    ids = [1, 2, 3]
+    padded_ids, attn_mask, loss_mask = ds._pad_and_mask(ids)
+    assert padded_ids.tolist() == [1, 2, 3, ds.pad_token_id, ds.pad_token_id]
+    assert attn_mask.tolist() == [1, 1, 1, 0, 0]
+    assert loss_mask.tolist() == [1, 1, 1, 0, 0]
+    assert padded_ids.dtype == torch.long
+    assert attn_mask.dtype == torch.bool
+    assert loss_mask.dtype == torch.bool
 
-def test_template_formatting(tokenizer):
-    test_dir = Path(__file__).parent
-    data = [{"input": "测试", "output": "结果"}]
-    with tempfile.NamedTemporaryFile(
-        mode="w+", suffix=".json", dir=test_dir, delete=False, encoding="utf-8"
-    ) as tmpfile:
-        import json
-        json.dump(data, tmpfile)
-        tmpfile.flush()
-        tmpfile.close()
 
-        dataset = PretrainDataset(data_path=tmpfile.name, tokenizer=tokenizer, template="问：{input} 答：{output}")
-        assert len(dataset) == 1
+# ==== 辅助函数：创建临时数据文件 ====
+def create_temp_file(ext, data):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, mode="w", encoding="utf-8")
+    if ext == ".json":
+        json.dump(data, tmp, ensure_ascii=False)
+    elif ext == ".jsonl":
+        for row in data:
+            tmp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    elif ext == ".csv":
+        pd.DataFrame(data).to_csv(tmp, index=False)
+    tmp.close()
+    return tmp.name
 
-        sample = dataset[0]
-        assert "input_ids" in sample
-        assert sample["input_ids"].shape[0] == dataset.max_length - 1
 
-    os.remove(tmpfile.name)
+@pytest.mark.parametrize("ext", [".json", ".jsonl", ".csv"])
+def test_pretrain_dataset_loading_and_format(tokenizer, ext):
+    data = [{"input": "Hello", "output": "World"}]
+    path = create_temp_file(ext, data)
 
-def create_sft_sample(path):
-    data = [{"role": "assistant", "content": "你好"}]
-    with open(path, "w", encoding="utf-8") as f:
-        for item in data:
-            json.dump(item, f)
-            f.write("\n")
+    ds = PretrainDataset(data_path=path, tokenizer=tokenizer, max_length=8, fields=["input", "output"])
+    assert len(ds) == 1
 
-def test_sft_dataset(tokenizer):
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".jsonl", delete=False) as f:
-        create_sft_sample(f.name)
-        f.flush()
+    sample = ds[0]
+    assert set(sample.keys()) == {"input_ids", "labels", "attention_mask", "loss_mask"}
+    assert sample["input_ids"].shape[0] == ds.max_length
+    assert torch.all(sample["labels"][sample["labels"] != -100] >= 0)
 
-        dataset = SFTDataset(data_path=f.name, tokenizer=tokenizer)
-        assert len(dataset) == 1
-        sample = dataset[0]
-        assert isinstance(sample["input_ids"], torch.Tensor)
-        assert sample["input_ids"].shape == sample["labels"].shape == sample["loss_mask"].shape
+    os.remove(path)
 
-    os.remove(f.name)
 
-def test_kmp_find():
-    arr = [1, 2, 3, 1, 2, 3, 4]
-    pattern = [1, 2, 3]
-    positions = SFTDataset._find_token_sequence(pattern, arr)
-    assert positions == [0, 3]
+def test_pretrain_dataset_template(tokenizer):
+    data = [{"input": "A", "output": "B"}]
+    path = create_temp_file(".json", data)
+    template = "Q: {input} A: {output}"
+    ds = PretrainDataset(path, tokenizer, max_length=8, fields=["input", "output"], template=template)
+    text = ds._format_sample(data[0])
+    assert text == "Q: A A: B"
+    os.remove(path)
 
-if __name__ == "__main__":
-    pytest.main(["-v", __file__])
+
+def test_pretrain_dataset_missing_field_in_template(tokenizer):
+    data = [{"input": "A"}]  # 缺失 output
+    path = create_temp_file(".json", data)
+    template = "Q: {input} A: {output}"
+    ds = PretrainDataset(path, tokenizer, max_length=8, fields=["input", "output"], template=template)
+    text = ds._format_sample(data[0])
+    assert text == "Q: A A:"  # 缺失字段应为空字符串
+    os.remove(path)
+
+
+# ==== 测试 SFTDataset ====
+def test_sftdataset_find_token_sequence():
+    arr = [1, 2, 3, 1, 2, 3]
+    pattern = [1, 2]
+    idxs = SFTDataset._find_token_sequence(pattern, arr)
+    assert idxs == [0, 3]
+
+
+def test_sftdataset_loss_mask(tokenizer):
+    # 构造 SFT 数据
+    sft_data = [{
+        "role": "user", "content": "Hi"
+    }, {
+        "role": "assistant", "content": "Hello!"
+    }]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl", mode="w", encoding="utf-8")
+    tmp.write(json.dumps(sft_data) + "\n")
+    tmp.close()
+
+    ds = SFTDataset(tmp.name, tokenizer, start_tokens="<|im_start|>assistant\n", end_tokens="<|im_end|>", max_length=16)
+    assert len(ds) == 1
+
+    sample = ds[0]
+    assert sample["input_ids"].shape[0] == ds.max_length - 1  # 因为右移
+    assert sample["labels"].shape == sample["input_ids"].shape
+    assert torch.all((sample["labels"] == -100) | (sample["labels"] >= 0))
+
+    os.remove(tmp.name)
+
+if __name__ == '__main__':
+    pytest.main(['-v', __file__])
