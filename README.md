@@ -1391,6 +1391,60 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 
 ---
 
+<details>
+<summary>2025.8.11</summary>
+
+### DONE
+1. 在.gitignore中添加sources/目录
+2. configs/model_pretrain.yaml 修正配置文件中参数错误并更新数据路径
+- 修复use_swanlab拼写错误
+- 更新训练和验证数据路径
+- 移除tie_word_embeddings参数并添加device配置
+3. ByteEmbedding 优化嵌入层参数命名并添加测试用例
+重构嵌入层参数命名以提高可读性，并添加测试用例验证功能正确性
+4. model_pretrain.py 重构配置解析和设备处理逻辑
+- 将嵌套配置展平为一级结构，简化参数访问
+- 新增设备解析函数，支持多GPU配置
+- 优化SwanLab初始化逻辑，增加配置检查
+- 统一训练参数访问方式，移除嵌套结构
+- 添加命令行参数支持，提升脚本可用性
+
+### TODO
+1. 模型预训练脚本中修复参数读取相关的BUG
+2. 测试模型预训练脚本，修复完善相关功能。
+
+### DEBUG
+1. 解决启动模型预训练脚本时报错：
+```
+Traceback (most recent call last):
+  File "d:\Objects\StellarByte\model_pretrain.py", line 845, in <module>        
+    train(args.config)
+  File "d:\Objects\StellarByte\model_pretrain.py", line 700, in train
+    model, tokenizer = init_model(config, device)
+  File "d:\Objects\StellarByte\model_pretrain.py", line 269, in init_model      
+    model = ByteModel(model_config)
+  File "d:\Objects\StellarByte\model\Model.py", line 34, in __init__
+    self.token_embedding = ByteEmbedding(args)
+  File "d:\Objects\StellarByte\model\EmbeddingLayer.py", line 43, in __init__   
+    self.embed_tokens  = nn.Embedding(
+  File "D:\Develop_Tools\Anconda3\envs\LLM\lib\site-packages\torch\nn\modules\sparse.py", line 167, in __init__
+    torch.empty((num_embeddings, embedding_dim), **factory_kwargs),
+TypeError: empty() received an invalid combination of arguments - got (tuple, dtype=NoneType, device=NoneType), but expected one of:
+ * (tuple of ints size, *, tuple of names names, torch.memory_format memory_format = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)
+ * (tuple of ints size, *, torch.memory_format memory_format = None, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)
+```
+ByteEMbedding 中提示信息：
+```
+vocab_size: namespace(use_swanlab='trua', project_name='ByteLM-Pretrain', run_name='baseline-158M', mode='cloud', api_key='', tokenizer_path='./tokenizer', train_data='./data/test/test_train.jsonl', eval_data='./data/test_eval.jsonl', vocab_size=32768, model_dim=768, num_layers=12, max_seq_len=2048, layer_norm_eps='1e-5', initializer_range=0.02, layerscale_init='1e-5', parallel_residual=True, num_heads=16, num_kv_heads=8, use_flash_attention=False, attention_window_size=0, attention_dropout_prob=0.1, base_theta=10000.0, ntk_alpha=1.0, use_cache=True, key_cache_dtype='float16', value_cache_dtype='float16', hidden_dim=3072, dim_multiplier=4, hidden_dropout_prob=0.1, residual_dropout_prob=0.1, drop_path_prob=0.0, tensor_parallel_size=1, train_epochs=10, batch_size=32, learning_rate='3e-4', min_lr_ratio=0.1, weight_decay=0.1, beta1=0.9, beta2=0.98, warmup_ratio=0.02, plateau_ratio=0.01, gradient_accumulation_steps=4, max_grad_norm=1.0, num_workers=8, use_cuda=True, device='cpu', mixed_precision=True, output_dir='./checkpoints', save_epochs=1, save_interval=1000, log_interval=50, eval_steps=500, eval_batch_size=16, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, repetition_context=512, logger_name='StellarByte', log_dir='logs', log_file='StellarByte_pretrain.log', log_level='DEBUG', console_level='INFO', file_level='DEBUG', use_color=True, rotation='midnight', backup_count=7, is_rank_0=True) (<class 'types.SimpleNamespace'>)
+model_dim: 768 (<class 'int'>)
+tp_size: 1 (<class 'int'>)
+embed_dim_per_partition: 768 (<class 'int'>)
+```
+
+</details>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
