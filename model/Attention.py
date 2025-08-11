@@ -139,8 +139,11 @@ class ByteMultiHeadSelfAttention(nn.Module):
         batch_size, seq_len, num_kv_heads, head_dim = kv.shape
 
         # 新形状: [batch_size, seq_len, num_kv_heads, n_rep, head_dim] → reshape 到 [batch_size, seq_len, num_kv_heads * n_rep, head_dim]
-        kv = kv.unsqueeze(3)                     # [batch_size, seq_len, num_kv_heads, 1, head_dim]
+        # 在第四个维度（头的维度前）添加一个新的维度
+        kv = kv[:, :, :, None, :]                                             # [batch_size, seq_len, num_kv_heads, 1, head_dim]
+        # 将新添加的维度扩展到n_rep大小，实现重复的效果
         kv = kv.expand(batch_size, seq_len, num_kv_heads, n_rep, head_dim)    # [batch_size, seq_len, num_kv_heads, n_rep, head_dim]
+        # 重新塑形，合并键/值对头的数量和重复次数的维度
         kv = kv.reshape(batch_size, seq_len, num_kv_heads * n_rep, head_dim)  # [batch_size, seq_len, num_heads, head_dim]
 
         return kv.contiguous()  # 确保内存连续，避免后续错误
@@ -342,6 +345,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
             attn_scores  = attn_scores + attn_mask
             attn_weights = F.softmax(attn_scores, dim=-1, dtype=compute_dtype)
             attn_weights = self.attn_dropout(attn_weights)
+            attn_weights = attn_weights.to(v.dtype)
             attn_out     = torch.matmul(attn_weights, v)
 
 
