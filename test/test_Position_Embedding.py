@@ -1,159 +1,115 @@
+# test_byterope_full.py
 import sys
+import pytest
+import torch
+import math
 from pathlib import Path
 
 # 将项目根目录添加到sys.path
 root_dir = Path(__file__).parent.parent
 sys.path.append(str(root_dir))
 
-from model.config import ByteModelConfig
-from model.Position_Embedding import XPosRotaryEmbedding
-import torch
-import torch.nn as nn
-import pytest
+from model.Position_Embedding import ByteDynamicRoPE
 
-# 测试配置
-@pytest.fixture
-def config():
-    return ByteModelConfig(
-        model_dim=64,
-        max_seq_len=2048,
-        xpos_rope_theta=10000.0,
-        xpos_scale_base=512
-    )
 
-# 测试初始化
-def test_initialization(config):
-    """测试位置编码模块初始化"""
-    head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
-    
-    # 验证缓冲区注册
-    assert hasattr(rotary, "inv_freq")
-    assert rotary.inv_freq.shape == (head_dim // 2,)
-    
-    # 验证参数设置
-    assert rotary.dim == head_dim
-    assert rotary.scale_base == config.xpos_scale_base
-    assert rotary.theta == config.xpos_rope_theta
+def test_init_odd_dim_raises():
+    """dim 必须是偶数，否则应触发断言"""
+    with pytest.raises(AssertionError):
+        ByteDynamicRoPE(dim=7)
 
-# 测试维度异常
-def test_odd_dimension_exception():
-    """测试奇数维度时的异常抛出"""
-    with pytest.raises(AssertionError, match="Dimension must be even for rotary embedding."):
-        XPosRotaryEmbedding(head_dim=63, max_seq_len=1024, scale_base=512, theta=10000.0)
 
-# 测试前向传播形状
-def test_forward_shape(config):
-    """测试输出形状一致性"""
-    head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
-    
-    # 创建测试输入
-    batch_size, seq_len, num_heads = 2, 128, 4
-    xq = torch.randn(batch_size, seq_len, num_heads, head_dim)
-    xk = torch.randn(batch_size, seq_len, num_heads, head_dim)
-    
-    # 执行前向传播
-    xq_rot, xk_rot = rotary(xq, xk)
-    
-    # 验证输出形状
-    assert xq_rot.shape == (batch_size, seq_len, num_heads, head_dim)
-    assert xk_rot.shape == (batch_size, seq_len, num_heads, head_dim)
+def test_base_freq_values():
+    """base_freq 计算结果与公式一致"""
+    dim = 8
+    rope = ByteDynamicRoPE(dim=dim, base_theta=10000.0, ntk_alpha=1.0, max_seq_len=16, device='cpu')
+    dim_half = dim // 2
+    expected = 10000.0 ** (-2 * torch.arange(0, dim_half, 1) / dim)
+    torch.testing.assert_close(rope.base_freq.cpu(), expected, rtol=1e-6, atol=1e-6)
 
-# 测试旋转不变性
-def test_xpos_numerical_stability(config):
-    """XPos 应该能够在较长序列上保持数值稳定而不爆炸"""
-    head_dim = config.model_dim // config.num_attention_heads
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
 
-    # 构造大序列
-    xq = torch.randn(1, 2048, config.num_attention_heads, head_dim)
-    xk = torch.randn(1, 2048, config.num_attention_heads, head_dim)
+def test_ntk_scale_factor_behaviour():
+    dim = 8
+    rope = ByteDynamicRoPE(dim=dim, ntk_alpha=2.0, max_seq_len=10, device='cpu')
+    # 短序列，返回 1.0
+    assert math.isclose(rope._ntk_scale_factor(5), 1.0)
+    # 长序列，按公式计算
+    seq_len = 20
+    ratio = seq_len / rope.max_seq_len
+    exponent = dim / (dim - 2)
+    expected = 2.0 * (ratio ** exponent)
+    assert math.isclose(rope._ntk_scale_factor(seq_len), expected)
 
-    xq_rot, xk_rot = rotary(xq, xk)
 
-    # 不应出现NaN或inf
-    assert torch.isfinite(xq_rot).all(), "xq_rot contains NaNs or Infs"
-    assert torch.isfinite(xk_rot).all(), "xk_rot contains NaNs or Infs"
+def test_build_cos_sin_table_shapes_and_values():
+    dim = 8
+    seq_len = 4
+    rope = ByteDynamicRoPE(dim=dim, base_theta=10000.0, device='cpu')
+    rope._build_cos_sin_table(seq_len)
+    # 检查形状
+    assert rope.cos_cached.shape == (1, seq_len, 1, dim // 2)
+    assert rope.sin_cached.shape == (1, seq_len, 1, dim // 2)
+    # 手动构建预期值并比较
+    inv_freq = rope.base_freq / rope._ntk_scale_factor(seq_len)
+    t = torch.arange(seq_len, device='cpu').float()
+    freqs = torch.outer(t, inv_freq)
+    torch.testing.assert_close(rope.cos_cached[0, :, 0, :], freqs.cos())
+    torch.testing.assert_close(rope.sin_cached[0, :, 0, :], freqs.sin())
 
-# 测试缩放因子影响
-def test_scale_effect(config):
-    """测试缩放因子对输出的影响"""
-    head_dim = config.model_dim
-    base_rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
-    
-    # 创建不同缩放因子的模块
-    scaled_rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base * 2, config.xpos_rope_theta)
-    
-    # 相同输入
-    xq = torch.randn(1, 10, 1, head_dim)
-    xk = torch.randn(1, 10, 1, head_dim)
-    
-    # 获取输出
-    base_xq, base_xk = base_rotary(xq, xk)
-    scaled_xq, scaled_xk = scaled_rotary(xq, xk)
-    
-    # 验证缩放因子改变导致输出不同
-    assert not torch.allclose(base_xq, scaled_xq, atol=1e-6)
-    assert not torch.allclose(base_xk, scaled_xk, atol=1e-6)
 
-# 测试设备兼容性
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_device_compatibility(config, device):
-    """测试不同设备上的兼容性"""
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    
-    head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta).to(device)
-    
-    # 创建测试输入
-    xq = torch.randn(2, 64, 2, head_dim, device=device)
-    xk = torch.randn(2, 64, 2, head_dim, device=device)
-    
-    # 执行前向传播
-    xq_rot, xk_rot = rotary(xq, xk)
-    
-    # 验证输出设备
-    assert xq_rot.device.type == device
-    assert xk_rot.device.type == device
+def test_apply_rotary_shapes_and_numerical():
+    dim = 8
+    batch = 1
+    seq_len = 3
+    heads = 2
+    rope = ByteDynamicRoPE(dim=dim, device='cpu')
+    q = torch.randn(batch, seq_len, heads, dim)
+    k = torch.randn(batch, seq_len, heads, dim)
+    q_rot, k_rot = rope.apply_rotary(q, k)
 
-# 测试不同序列长度
-@pytest.mark.parametrize("seq_len", [1, 16, 128, 1024])
-def test_variable_sequence_length(config, seq_len):
-    """测试不同序列长度的处理能力"""
-    head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
-    
-    # 创建测试输入
-    xq = torch.randn(1, seq_len, 1, head_dim)
-    xk = torch.randn(1, seq_len, 1, head_dim)
-    
-    # 执行前向传播
-    xq_rot, xk_rot = rotary(xq, xk)
-    
-    # 验证输出形状
-    assert xq_rot.shape == (1, seq_len, 1, head_dim)
-    assert xk_rot.shape == (1, seq_len, 1, head_dim)
+    # 检查形状
+    assert q_rot.shape == (batch, seq_len, heads, dim)
+    assert k_rot.shape == (batch, seq_len, heads, dim)
 
-# 测试数值稳定性
-def test_numerical_stability(config):
-    """测试极端条件下的数值稳定性"""
-    head_dim = config.model_dim
-    rotary = XPosRotaryEmbedding(head_dim, config.max_seq_len, config.xpos_scale_base, config.xpos_rope_theta)
-    
-    # 创建极端输入（大值）
-    xq = torch.randn(1, 2048, 8, head_dim) * 100
-    xk = torch.randn(1, 2048, 8, head_dim) * 100
-    
-    # 执行前向传播
-    xq_rot, xk_rot = rotary(xq, xk)
-    
-    # 验证无NaN/Inf
-    assert not torch.isnan(xq_rot).any()
-    assert not torch.isinf(xq_rot).any()
-    assert not torch.isnan(xk_rot).any()
-    assert not torch.isinf(xk_rot).any()
+    # 检查数值正确性（和手动旋转比较）
+    cos = rope.cos_cached[:, :seq_len, :, :]
+    sin = rope.sin_cached[:, :seq_len, :, :]
+    def manual_rot(x):
+        x_complex = x.float().view(*x.shape[:-1], -1, 2)
+        x_real = x_complex[..., 0]
+        x_imag = x_complex[..., 1]
+        xr = x_real * cos - x_imag * sin
+        xi = x_real * sin + x_imag * cos
+        return torch.stack([xr, xi], dim=-1).flatten(-2, -1).type_as(x)
+    torch.testing.assert_close(q_rot, manual_rot(q), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(k_rot, manual_rot(k), rtol=1e-5, atol=1e-5)
 
-if __name__ == "__main__":
-    pytest.main(["-v", __file__])
+
+def test_cache_rebuild_on_offset_exceed():
+    dim = 8
+    rope = ByteDynamicRoPE(dim=dim, max_seq_len=4, device='cpu')
+    old_len = rope.cos_cached.shape[1]
+    q = torch.randn(1, 3, 1, dim)
+    k = torch.randn(1, 3, 1, dim)
+    # seq_len + seq_offset > max_seq_len -> 重建缓存
+    _ = rope.apply_rotary(q, k, seq_offset=5)
+    new_len = rope.cos_cached.shape[1]
+    assert new_len >= 3 + 5
+    assert new_len != old_len
+
+
+def test_rotation_preserves_norm():
+    dim = 8
+    rope = ByteDynamicRoPE(dim=dim, device='cpu')
+    q = torch.randn(2, 5, 3, dim)
+    k = torch.randn(2, 5, 3, dim)
+    q_rot, k_rot = rope.apply_rotary(q, k)
+    # 最后一维范数应保持
+    norm_before_q = q.norm(dim=-1)
+    norm_after_q = q_rot.norm(dim=-1)
+    norm_before_k = k.norm(dim=-1)
+    norm_after_k = k_rot.norm(dim=-1)
+    torch.testing.assert_close(norm_before_q, norm_after_q, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(norm_before_k, norm_after_k, rtol=1e-6, atol=1e-6)
+
+if __name__ == '__main__':
+    pytest.main(['-v', __file__])
