@@ -6,7 +6,7 @@ root_dir = Path(__file__).parent.parent
 sys.path.append(str(root_dir))
 
 from model.config import ByteModelConfig
-from model.RMSNorm import RMSNorm
+from model.RMSNorm import ByteRMSNorm
 import torch
 import torch.nn as nn
 import pytest
@@ -23,7 +23,7 @@ class TestRMSNorm:
     @pytest.fixture
     def rms_norm(self, config):
         """创建RMSNorm实例fixture"""
-        return RMSNorm(config.model_dim, config.layer_norm_eps)
+        return ByteRMSNorm(config.model_dim, config.layer_norm_eps)
     
     def test_forward_shape(self, rms_norm):
         """测试输出形状是否正确"""
@@ -63,7 +63,7 @@ class TestRMSNorm:
     def test_eps_handling(self, config):
         """测试极小值处理"""
         # 使用极小的eps值
-        rms_norm = RMSNorm(config.model_dim, eps=1e-10)
+        rms_norm = ByteRMSNorm(config.model_dim, eps=1e-10)
         
         # 创建接近零的输入
         x = torch.full((1, 1, 768), 1e-8)
