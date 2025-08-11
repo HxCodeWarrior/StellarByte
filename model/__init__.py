@@ -8,26 +8,28 @@
 __version__ = "0.1.0"
 
 # 导出主要模块
-from .Model import ByteTransformer
+from .Model import ByteModel
 from .config import ByteModelConfig
+from .EmbeddingLayer import ByteEmbedding
 from .Attention import ByteMultiHeadSelfAttention
 from .DecoderLayer import ByteDecoderLayer
 from .MLP import ByteMLP
 from .RMSNorm import ByteRMSNorm
-from .Position_Embedding import XPosRotaryEmbedding
+from .Position_Embedding import ByteDynamicRoPE
 
 # 导出工具模块
-from .utils.KVCache import KVCache
+from .utils.KVCache import ByteKVCache
 from .utils.LoRA import LoRALinear
 
 __all__ = [
-    "ByteTransformer",
+    "ByteModel",
     "ByteModelConfig",
+    "ByteEmbedding",
     "ByteMultiHeadSelfAttention",
     "ByteDecoderLayer",
     "ByteMLP",
     "ByteRMSNorm",
-    "XPosRotaryEmbedding",
-    "KVCache",
+    "ByteDynamicRoPE",
+    "ByteKVCache",
     "LoRALinear",
 ]
