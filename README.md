@@ -1333,6 +1333,61 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 
 ---
 
+<details>
+<summary>2025.8.10</summary>
+
+### DONE
+1. 完善依赖包相关配置
+- 添加NLP相关依赖包,添加sentencepiece、nltk、rouge-score等NLP评估
+- 添加tokenizer训练所需的依赖项,添加tokenizers、datasets
+2. MultiHeadSelfAttention修复多头注意力计算中的数据类型不一致问题
+- 将注意力权重转换为与值张量相同的数据类型，避免计算时出现类型不匹配错误
+3. model/__init__ 模型导出文件,统一模块命名规范并添加ByteEmbedding导出
+- 将主要类和模块重命名以统一使用"Byte"前缀，提高代码一致性
+- 添加ByteEmbedding到导出列表以支持新的嵌入层功能
+4. 更新并测试每个单元模块
+- 更新Attention多头自注意力机制测试模块
+  - 添加测试辅助函数和 fixture 以支持多种数据类型测试
+  - 增加对重复KV、因果掩码、窗口注意力等辅助方法的测试
+  - 添加前向传播的形状和稳定性测试
+  - 移除过时的 KVCache 相关测试
+- 重构BaseDatasets、PretrainDatasets、SFTDatasets数据集加载器测试模块，并增加更多测试用例
+  - 重构测试文件结构，增加对BaseDataset、PretrainDataset和SFTDataset的测试覆盖
+  - 添加对CSV格式数据的支持测试
+  - 完善tokenizer处理逻辑的测试
+  - 增加对模板格式化和缺失字段的测试
+- 更新ByteMLP测试
+  - 更新所有测试用例以使用新的ByteMLP类，验证门控机制和归一化层的正确性。
+  - 移除对旧MLP类的引用，并添加对新功能的测试覆盖。
+- 重构Position_Embedding测试文件并添加新测试用例
+  - 将测试类从XPosRotaryEmbedding改为ByteDynamicRoPE
+  - 新增测试用例验证初始化、基础频率计算、NTK缩放因子行为等
+  - 添加旋转形状和数值正确性测试
+  - 包含缓存重建和范数保持的验证
+- 更新层归一化测试用例以使用ByteRMSNorm替代RMSNorm
+5. 修复多头注意力计算中的数据类型不一致问题
+- 将注意力权重转换为与值张量相同的数据类型，避免计算错误
+6. 修复SFT数据集加载器
+- 优化特殊标记处理并改进掩码计算逻辑
+- 将 start_tokens 和 end_tokens 处理逻辑统一为支持字符串或ID列表
+- 改进掩码计算方式，使用张量操作替代列表操作提高效率
+- 修复标签处理中的类型不一致问题
+- 更新测试用例以验证修改后的功能
+
+### TODO
+1. 优化tokenizer训练
+- 支持中文编码
+- 更新对话模板
+- 解决token_end和pad使用同样的标记错误问题
+- 提升训练速度
+- 尝试进行tokenizer进行训练
+2. 测试并修复模型预训练脚本，给出最终的模型预训练脚本
+- 支持使用命令行 + configs/model_pretrain.yaml 对训练参数进行配置，并直接进行模型训练
+
+</details>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
