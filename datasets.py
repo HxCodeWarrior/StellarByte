@@ -224,18 +224,22 @@ class SFTDataset(BaseDataset):
         logging.info(f"Im_end token: {self.end_tokens}")
 
     def _init_special_tokens(self):
-        """动态生成特殊标记序列，增强鲁棒性"""
+        """
+        动态生成特殊标记序列，增强鲁棒性
+        将传入的 start/end token (文本或 ids) 转为 token id 列表，供后续 KMP 匹配使用。
+
+        """
         # 生成起始标记
-        self.assistant_start_tokens = self.tokenizer.encode(
-            self.start_tokens, 
-            add_special_tokens=False
-        )
+        if isinstance(self.start_tokens, str):
+            self.start_token_ids = self.tokenizer.encode(self.start_tokens, add_special_tokens=False)
+        else:
+            self.start_token_ids = list(self.start_tokens)
         
         # 生成消息结束标记
-        self.im_end_token = self.tokenizer.encode(
-            self.end_tokens,
-            add_special_tokens=False
-        )
+        if isinstance(self.end_tokens, str):
+            self.end_token_ids = self.tokenizer.encode(self.end_tokens, add_special_tokens=False)
+        else:
+            self.end_token_ids = list(self.end_tokens)
 
         # 验证特殊标记
         if not self.start_tokens:
@@ -289,10 +293,10 @@ class SFTDataset(BaseDataset):
         """
         # 1) 先找到 assistant 起始标记 & 结束标记的所有出现位置
         start_positions = self._find_token_sequence(
-            self.start_tokens, input_ids
+            self.start_token_ids, input_ids
         )
         end_positions = self._find_token_sequence(
-            self.end_tokens, input_ids
+            self.end_token_ids, input_ids
         )
 
         # 2) 初始化全 False 掩码（不算 loss）
@@ -300,7 +304,7 @@ class SFTDataset(BaseDataset):
 
         # 3) 为每个起始点配对最近的结束点，并设置区间 True
         for start in start_positions:
-            content_start = start + len(self.start_tokens)
+            content_start = start + len(self.start_token_ids)
 
             # 找到位于内容后的第一个 `<|im_end|>`
             content_end = next((e for e in end_positions if e > content_start), len(input_ids))
@@ -352,17 +356,19 @@ class SFTDataset(BaseDataset):
 
         # ---------- 5. 扩展 SFT 掩码到填充长度 ----------
         sft_mask = sft_mask + [False] * (self.max_length - len(sft_mask))
+        sft_mask = torch.tensor(sft_mask, dtype=torch.bool)
 
         # ---------- 6. 合并掩码（AND） ----------
-        final_mask = [p and s for p, s in zip(pad_mask, sft_mask)]
+        final_mask = pad_mask & sft_mask
 
         # ---------- 7. 构造训练对 (左移 1) ----------
-        input_ids      = torch.tensor(padded_ids[:-1], dtype=torch.bool)
-        labels         = torch.tensor(padded_ids[1:],  dtype=torch.bool)
-        attention_mask = torch.tensor(attention_mask[:-1], dtype=torch.bool),  # 对齐input_ids长度
-        loss_mask      = torch.tensor(final_mask[1:], dtype=torch.bool)  # 与 labels 对齐
+        input_ids      = padded_ids[:-1]
+        labels         = padded_ids[1:]
+        attention_mask = attention_mask[:-1]  # 对齐input_ids长度
+        loss_mask      = final_mask[1:]  # 与 labels 对齐
 
         # labels 中非 loss_mask 位置设置为 -100，避免计算损失
+        labels = labels.clone()
         labels[~loss_mask] = -100
 
         return {
@@ -377,6 +383,9 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
     from tempfile import NamedTemporaryFile
     
+    # -------------------------
+    # 测试 PretrainDataset
+    # -------------------------
     # 创建一个临时 json 文件作为测试数据
     sample_data = [
         {"input": "今天天气如何？", "output": "今天天气晴朗，适合出行。"},
@@ -388,7 +397,7 @@ if __name__ == "__main__":
         temp_file_path = f.name
     
     # 使用预训练分词器
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-chinese")  # 或换成你模型对应的分词器
+    tokenizer = AutoTokenizer.from_pretrained("./tokenizer")  # 或换成你模型对应的分词器
     
     # 确保 tokenizer 有 pad_token 和 bos_token
     if tokenizer.pad_token is None:
@@ -409,6 +418,7 @@ if __name__ == "__main__":
         add_eos=True
     )
     
+    print("\n=== PretrainDataset 样本检查 ===")
     # 取出一个样本进行检查
     sample = dataset[0]
     
@@ -427,3 +437,49 @@ if __name__ == "__main__":
     
     # 清理临时文件
     os.remove(temp_file_path)
+
+    # -------------------------
+    # 测试 SFTDataset
+    # -------------------------
+    sft_sample_data = [
+        {
+            "role": "user", "content": "你好，今天天气怎么样？"
+        },
+        {
+            "role": "assistant", "content": "今天天气晴朗，适合出门散步。"
+        }
+    ]
+    # SFTDataset 期望是多轮对话格式，这里用一个简单单轮
+    # 假设 token 标记为 <|im_start|>assistant / <|im_end|>
+    start_token_text = "<|im_start|>assistant"
+    end_token_text = "<|im_end|>"
+
+    with NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
+        f.write(json.dumps(sft_sample_data, ensure_ascii=False) + "\n")
+        temp_sft_path = f.name
+
+    tokenizer.add_special_tokens({
+        "additional_special_tokens": [start_token_text, end_token_text]
+    })
+
+    sft_dataset = SFTDataset(
+        data_path=temp_sft_path,
+        tokenizer=tokenizer,
+        start_tokens=start_token_text,
+        end_tokens=end_token_text,
+        max_length=32
+    )
+
+    print("\n=== SFTDataset 样本检查 ===")
+    sft_item = sft_dataset[0]
+    print("Input IDs:", sft_item["input_ids"])
+    print("Labels:", sft_item["labels"])
+    print("Attention Mask:", sft_item["attention_mask"])
+    print("Loss Mask:", sft_item["loss_mask"])
+    print("Decoded Input:", tokenizer.decode(sft_item["input_ids"], skip_special_tokens=False))
+    print("Decoded Labels:", tokenizer.decode(
+        [x if x != -100 else tokenizer.pad_token_id for x in sft_item["labels"]],
+        skip_special_tokens=False
+    ))
+
+    os.remove(temp_sft_path)
