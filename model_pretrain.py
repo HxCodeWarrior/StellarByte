@@ -1,4 +1,5 @@
 import os
+import argparse
 import logging
 import yaml
 import time
@@ -21,7 +22,7 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader
 from contextlib import nullcontext
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from utils.logger import setup_logger
 from model.Model import ByteModel
@@ -29,15 +30,16 @@ from model.config import ByteModelConfig
 from datasets import PretrainDataset
 
 # nltk需要下载必要资
-nltk.download('./sources/wordnet')
-nltk.download('./sources/omw-1.4')
+nltk.data.path.append('./sources/')
+nltk.download('wordnet', download_dir='./sources')
+nltk.download('omw-1.4', download_dir='./sources')
 
 # 设置全局logger
 logger = logging.getLogger(__name__)
 
 def parse_args(config_path: str):
     """
-    读取并解析两级结构的 YAML 配置文件为嵌套对象。
+    读取并解析 YAML 配置文件，将所有嵌套字典的键值直接拉平到一级 SimpleNamespace对象，所有参数都在同一级。
 
     Args:
         config_path (str): YAML 配置文件路径。
@@ -47,23 +49,60 @@ def parse_args(config_path: str):
     
     Usage:
         >>> config=parse_args(config_path="./configs/pretrain.yaml")
-        >>> config.training.train_epochs
+        >>> config.train_epochs
         3
         >>> model = AutoModel(config=config)
     """
-    def dict_to_namespace(d):
-        """
-        将字典递归转换为 SimpleNamespace。
-        """
-        if isinstance(d, dict):
-            return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
-        else:
-            return d
+    def flatten_dict_no_prefix(d):
+        flat = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                flat.update(flatten_dict_no_prefix(v))
+            else:
+                flat[k] = v
+        return flat
 
     with open(config_path, 'r', encoding='utf-8') as f:
         config_dict = yaml.safe_load(f)
     
-    return dict_to_namespace(config_dict)
+    # 递归处理，将嵌套字典展平成一维字典
+    flat_config = flatten_dict_no_prefix(config_dict)
+    return SimpleNamespace(**flat_config)
+
+def parse_device(config):
+    """
+    直接从 config 对象中读取 device 字符串并解析，
+    支持：
+      - "cpu"
+      - "cuda:0"
+      - "cuda:[0,1,2]"
+      
+    返回:
+      device (torch.device): 主设备
+      device_ids (List[int]): 多设备ID列表
+    """
+    device_str = getattr(config, "device", "cpu").lower().strip()
+    
+    import re
+    if device_str == "cpu":
+        return torch.device("cpu"), []
+    
+    multi_gpu_match = re.match(r"cuda:\[(.*)\]", device_str)
+    if multi_gpu_match:
+        device_ids_str = multi_gpu_match.group(1)
+        device_ids = [int(x.strip()) for x in device_ids_str.split(",") if x.strip().isdigit()]
+        if not device_ids:
+            raise ValueError(f"Invalid cuda device list in '{device_str}'")
+        main_device = torch.device(f"cuda:{device_ids[0]}")
+        return main_device, device_ids
+    
+    single_gpu_match = re.match(r"cuda:(\d+)", device_str)
+    if single_gpu_match:
+        device_id = int(single_gpu_match.group(1))
+        return torch.device(f"cuda:{device_id}"), [device_id]
+    
+    # 兜底使用cpu
+    return torch.device("cpu"), []
 
 def set_environment(config, seed: int = 42, use_cuda: bool = True):
     """
@@ -80,7 +119,7 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
     os.environ["PYTHONWARNINGS"] = "ignore"         # 忽略所有 Python 警告
 
     # 创建一个日志器（logger）
-    logger_config = config.logger
+    logger_config = config
     setup_logger(
         name=logger_config.logger_name,               # 自定义logger名字，可为None使用root logger
         log_dir=logger_config.log_dir,                # 日志文件保存目录
@@ -104,13 +143,15 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # 解析设备
+    device, device_ids = parse_device(config)
+
     # 设备选择
     if use_cuda and torch.cuda.is_available():
-        device_count = torch.cuda.device_count()
-        device = torch.device("cuda")
+        torch.cuda.set_device(device)
         torch.set_default_tensor_type(torch.cuda.FloatTensor)
-        logger.info(f"Using CUDA device(s): {device_count} GPU(s) detected.")
-        for i in range(device_count):
+        logger.info(f"Using CUDA device(s): {device_ids}")
+        for i in device_ids:
             logger.info(f"  - [{i}] {torch.cuda.get_device_name(i)}")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -126,17 +167,23 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
     warnings.filterwarnings("ignore", category=UserWarning)
 
     # 初始化 SwanLab 实验追踪
-    try:
-        swanlab.login(api_key=config.experiment.api_key)
-        swanlab.init(
-            project=config.experiment.project_name or "default_project",
-            name=config.experiment.run_name or f"run_{int(time.time())}",
-            config=config,  # 自动记录所有配置参数
-            logdir=logger_config.log_dir or None,
-        )
-        logger.info("SwanLab initialized.")
-    except Exception as e:
-        logger.warning(f"Failed to initialize SwanLab: {e}")
+    if config.use_swanlab and config.api_key:
+        try:
+            swanlab.login(api_key=config.api_key)
+            swanlab.init(
+                project=config.project_name or "default_project",
+                name=config.run_name or f"run_{int(time.time())}",
+                config=config,  # 自动记录所有配置参数
+                logdir=logger_config.log_dir or None,
+            )
+            logger.info("SwanLab initialized.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize SwanLab: {e}")
+    else:
+        if not config.use_swanlab:
+            logger.info("SwanLab tracking is disabled in configuration.")
+        elif not config.api_key:
+            logger.warning("SwanLab API key is missing. Tracking disabled.")
 
     return device
 
@@ -223,14 +270,14 @@ def init_model(config, device):
 
     # ===== 3. 初始化Tokenizer =====
     # config.model.tokenizer_path 应指向已有的 tokenizer 路径或预训练模型名
-    tokenizer = AutoTokenizer.from_pretrained(config.data.tokenizer_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path, use_fast=True)
 
     # ===== 4. 设备处理 =====
     model.to(device)
 
     return model, tokenizer
 
-def evaluate(model, eval_dataset, tokenizer, batch_size=8, device="cuda"):
+def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("cpu")):
     f"""
     工业级的LLM预训练模型评估函数。
 
@@ -239,7 +286,7 @@ def evaluate(model, eval_dataset, tokenizer, batch_size=8, device="cuda"):
         eval_dataset (torch.utils.data.Dataset): 用于评估的数据集。
         tokenizer (AutoTokenizer): 分词器。
         batch_size (int): 每次评估的批次大小。
-        device (str): 执行评估的设备（默认使用cuda）。
+        device (torch.device): 执行评估的设备（默认使用cpu）。
     Returns:
         type: dict
         {
@@ -400,7 +447,8 @@ def train_epoch(
     global_step: int,
     lr_scheduler: callable,
     scaler: torch.cuda.amp.GradScaler,
-    eval_dataset: PretrainDataset = None
+    tokenizer: PreTrainedTokenizerBase,
+    eval_dataset: PretrainDataset = None,
 ) -> int:
     """
     LLM单轮训练函数，支持混合精度、梯度累积等高级特性
@@ -421,8 +469,8 @@ def train_epoch(
         int: 更新后的全局训练步数
     """
     # ===== 1. 训练准备 =====
-    model.train()  # 设置模型为训练模式（启用dropout等）
-    train_config       = config.training # 获取训练相关配置
+    model.train()               # 设置模型为训练模式（启用dropout等）
+    train_config       = config # 获取训练相关配置
     iter_per_epoch     = len(train_dataloader)  # 每epoch的迭代次数
     accumulation_steps = train_config.gradient_accumulation_steps  # 梯度累积步数
     max_grad_norm      = train_config.max_grad_norm                # 梯度裁剪阈值
@@ -445,7 +493,7 @@ def train_epoch(
     )
     
     # 混合精度上下文管理器
-    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if scaler else nullcontext()
+    amp_ctx = torch.autocast(device_type=device.type, dtype=torch.float16) if scaler else nullcontext()
     
     # 确保在开始之前梯度清零
     optimizer.zero_grad()
@@ -542,15 +590,16 @@ def train_epoch(
                     f"Remaining:[{int(remaining_time)} secs]"
                 )
                 
-                # SwanLab记录
-                swanlab.log({
-                    "train/loss"        : avg_loss,
-                    "train/lr"          : current_lr,
-                    "train/speed"       : tokens_per_sec,
-                    "train/step_time"   : step_time,
-                    "train/mem_alloc"   : mem_alloc,
-                    "train/mem_reserved": mem_reserved
-                }, step=global_step)
+                if config.use_swanlab:
+                    # SwanLab记录
+                    swanlab.log({
+                        "train/loss"        : avg_loss,
+                        "train/lr"          : current_lr,
+                        "train/speed"       : tokens_per_sec,
+                        "train/step_time"   : step_time,
+                        "train/mem_alloc"   : mem_alloc,
+                        "train/mem_reserved": mem_reserved
+                    }, step=global_step)
 
             # 更新进度条
             pbar.set_postfix({
@@ -578,18 +627,24 @@ def train_epoch(
                 eval_start_time = time.time()
                 eval_metrics = evaluate(
                     model, 
-                    eval_dataset, 
+                    eval_dataset,
+                    tokenizer, 
                     batch_size=train_config.eval_batch_size,
                     device=device
                 )
                 
                 # 记录验证指标
-                swanlab.log({
-                    "eval/loss": eval_metrics["loss"],
-                    "eval/perplexity": eval_metrics["perplexity"],
-                    "eval/accuracy": eval_metrics["accuracy"],
-                    "eval/duration": time.time() - eval_start_time
-                }, step=global_step)
+                if config.use_swanlab:
+                    swanlab.log({
+                        "eval/loss": eval_metrics["loss"],
+                        "eval/perplexity": eval_metrics["perplexity"],
+                        "eval/accuracy": eval_metrics["accuracy"],
+                        "eval/bleu": eval_metrics["bleu"],
+                        "eval/rouge-1": eval_metrics["rouge-1"],
+                        "eval/rouge-l": eval_metrics["rouge-l"],
+                        "eval/meteor": eval_metrics["meteor"],
+                        "eval/duration": time.time() - eval_start_time
+                    }, step=global_step)
                 
                 # 恢复训练模式
                 model.train()
@@ -621,7 +676,8 @@ def train_epoch(
     # 记录epoch完成日志
     logger.info(f"Epoch {epoch+1} completed | Avg Loss: {epoch_loss:.4f}")
     # 记录epoch损失到SwanLab
-    swanlab.log({"train/epoch_loss": epoch_loss}, step=global_step)
+    if config.use_swanlab:
+        swanlab.log({"train/epoch_loss": epoch_loss}, step=global_step)
     
     # 保存最终检查点
     if (epoch + 1) % train_config.save_epochs == 0:
@@ -650,15 +706,15 @@ def train(config_path: str):
     
     # 初始化数据集
     train_dataset = PretrainDataset(
-        data_dir=config.data.train_data_dir,
-        max_length=config.model.max_seq_len,
+        data_dir=config.train_data,
+        max_length=config.max_seq_len,
         tokenizer=tokenizer,
         shuffle=True
     )
     
     eval_dataset = PretrainDataset(
-        data_dir=config.data.eval_data_dir,
-        max_length=config.model.max_seq_len,
+        data_dir=config.eval_data,
+        max_length=config.max_seq_len,
         tokenizer=tokenizer,
         shuffle=False
     ) if config.data.eval_data_dir else None
@@ -666,8 +722,8 @@ def train(config_path: str):
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.training.batch_size,
-        num_workers=config.training.num_workers,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
         pin_memory=True
     )
     
@@ -675,23 +731,23 @@ def train(config_path: str):
     # 优化器配置
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-        betas=(config.training.beta1, config.training.beta2)
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+        betas=(config.beta1, config.beta2)
     )
     
     # 混合精度训练
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
     
     # 学习率调度器
-    total_steps = len(train_loader) * config.training.train_epochs
+    total_steps  = len(train_loader) * config.train_epochs
     lr_scheduler = lambda step: cosine_annealing_lr(
-        current_step=step,
-        total_steps=total_steps,
-        warmup_ratio=config.training.warmup_ratio,
-        plateau_ratio=config.training.plateau_ratio,
-        max_lr=config.training.learning_rate,
-        min_lr_ratio=config.training.min_lr_ratio
+        current_step  = step,
+        total_steps   = total_steps,
+        warmup_ratio  = config.warmup_ratio,
+        plateau_ratio = config.plateau_ratio,
+        max_lr        = config.learning_rate,
+        min_lr_ratio  = config.min_lr_ratio
     )
     
     # ==================== 4. 训练循环 ====================
@@ -699,27 +755,28 @@ def train(config_path: str):
     start_epoch = 0
     
     # 创建输出目录
-    os.makedirs(config.training.output_dir, exist_ok=True)
+    os.makedirs(config.output_dir, exist_ok=True)
     
     # 训练计时
     total_start_time = time.time()
     
-    logger.info(f"开始训练，共 {config.training.train_epochs} 个轮次，总步数 {total_steps}")
+    logger.info(f"开始训练，共 {config.train_epochs} 个轮次，总步数 {total_steps}")
     
-    for epoch in range(start_epoch, config.training.train_epochs):
+    for epoch in range(start_epoch, config.train_epochs):
         epoch_start_time = time.time()
         
         global_step = train_epoch(
-            epoch=epoch,
-            model=model,
-            train_dataloader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            config=config,
-            global_step=global_step,
-            lr_scheduler=lr_scheduler,
-            scaler=scaler,
-            eval_dataset=eval_dataset
+            epoch            = epoch,
+            model            = model,
+            train_dataloader = train_loader,
+            optimizer        = optimizer,
+            device           = device,
+            config           = config,
+            global_step      = global_step,
+            lr_scheduler     = lr_scheduler,
+            scaler           = scaler,
+            tokenizer        = tokenizer,
+            eval_dataset     = eval_dataset
         )
         
         # 轮次结束评估
@@ -728,20 +785,21 @@ def train(config_path: str):
             eval_metrics = evaluate(
                 model,
                 eval_dataset,
-                batch_size=config.training.eval_batch_size,
+                batch_size=config.eval_batch_size,
                 device=device
             )
             # 记录验证指标
-            swanlab.log({
-                "eval/epoch_loss": eval_metrics["loss"],
-                "eval/epoch_perplexity": eval_metrics["perplexity"],
-                "eval/epoch_accuracy": eval_metrics["accuracy"]
-            }, step=global_step)
+            if config.use_swanlab:
+                swanlab.log({
+                    "eval/epoch_loss": eval_metrics["loss"],
+                    "eval/epoch_perplexity": eval_metrics["perplexity"],
+                    "eval/epoch_accuracy": eval_metrics["accuracy"]
+                }, step=global_step)
         
         # 轮次结束保存
-        if (epoch + 1) % config.training.save_epochs == 0:
+        if (epoch + 1) % config.save_epochs == 0:
             checkpoint_path = os.path.join(
-                config.training.output_dir,
+                config.output_dir,
                 f"model_epoch_{epoch+1}.pth"
             )
             pass
@@ -752,9 +810,36 @@ def train(config_path: str):
     logger.info(f"训练完成! 总耗时: {total_time/3600:.2f} 小时")
     
     # 保存最终模型
-    final_model_path = os.path.join(config.training.output_dir, "final_model.pth")
+    final_model_path = os.path.join(config.output_dir, "final_model.pth")
     torch.save(model.state_dict(), final_model_path)
     logger.info(f"最终模型保存到: {final_model_path}")
     
     # 记录训练完成
-    swanlab.finish()
+    if config.use_swanlab:
+        swanlab.finish()
+
+if __name__ == "__main__":
+    # 创建命令行参数解析器
+    parser = argparse.ArgumentParser(
+        description="StellarByte-LLM PreTraining",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # 添加配置文件参数
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="./configs/model_pretrain.yaml",
+        help="模型预训练参数配置YAML文件路径"
+    )
+    
+    # 解析命令行参数
+    args = parser.parse_args()
+    
+    # 检查配置文件是否存在
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"配置文件不存在: {args.config}")
+    
+    # 启动训练
+    print(f"使用配置文件: {args.config}")
+    train(args.config)
