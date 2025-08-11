@@ -1373,6 +1373,9 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 
 - 改进掩码计算方式，使用张量操作替代列表操作提高效率
 - 修复标签处理中的类型不一致问题
 - 更新测试用例以验证修改后的功能
+7. 重构Byte-Transformer模型预训练配置文件
+- 添加统一的预训练/继续训练配置文件，包含实验、数据、模型架构、训练、生成和日志等模块的配置参数
+- 让配置文件结构更清晰，更具有可读性、可维护性
 
 ### TODO
 1. 优化tokenizer训练
