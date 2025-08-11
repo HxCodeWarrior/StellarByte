@@ -5,20 +5,22 @@
 #        └─ 二级键 :  具体超参
 #  ⚠️注意：YAML 规范要求键和值之间必须有一个空格
 #         可按需增删；键名若改动，记得调整代码中的读取逻辑
+#         参数命名不可冲突，若有一致推荐：上一级前缀+参数命
 # : : : : : : : : : : : : : : : : : : : : : : : : : : : : : : 
 
 # 实验配置
 experiment:
+  use_swanlab: trua                        # 是否启用swanlab
   project_name: "ByteLM-Pretrain"  # 项目名称
   run_name: "baseline-158M"        # 实验运行名称
-  mode: "cloud"                   # SwanLab记录模式: 'cloud','cloud-only','local','disabled'
-  api_key: "<KEY>"                 # SwanLab API密钥
+  mode: "cloud"                    # SwanLab记录模式: 'cloud','cloud-only','local','disabled'
+  api_key: ""                      # SwanLab API密钥
 
 # 数据配置
 data:
   tokenizer_path: "./tokenizer"  # 分词器路径
-  train_data_dir: "./data/train" # 训练数据目录
-  eval_data_dir: "./data/eval"   # 验证数据目录
+  train_data: "./data/test/test_train.jsonl" # 训练数据目录
+  eval_data: "./data/test_eval.jsonl"   # 验证数据目录
 
 # 模型架构配置
 model:
@@ -28,7 +30,6 @@ model:
   num_layers: 12                # Transformer层数
   max_seq_len: 2048             # 最大序列长度
   layer_norm_eps: 1e-5          # LayerNorm的epsilon值
-  tie_word_embeddings: false    # 是否绑定输入输出词嵌入权重
   initializer_range: 0.02       # 权重初始化标准差
   layerscale_init: 1e-5         # 层缩放参数γ的初始值
   parallel_residual: true       # 是否使用并行残差连接
@@ -85,6 +86,7 @@ training:
   # 资源管理
   num_workers: 8                 # 数据加载线程数
   use_cuda: true                 # 是否使用GPU
+  device: "cpu"                  # 设备名称：cpu / cuda:0 / cuda:1 / cuda:[0,1]
   mixed_precision: true          # 是否使用混合精度
   
   # 检查点设置
