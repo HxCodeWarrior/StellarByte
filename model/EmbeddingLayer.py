@@ -32,12 +32,12 @@ class ByteEmbedding(nn.Module):
         
         # 计算每个分区的嵌入维度
         self.embed_dim_per_partition = args.model_dim // self.tp_size
-        
+
         # 嵌入层 - 每个设备存储完整词表的部分特征
-        self.embed_tokens = nn.Embedding(
-            args.vocab_size, 
-            self.embed_dim_per_partition,
-            dtype=torch.float32  # 保持FP32精度避免精度损失
+        self.embed_tokens  = nn.Embedding(
+            num_embeddings = args.vocab_size, 
+            embedding_dim  = self.embed_dim_per_partition,
+            dtype  = torch.float32,
         )
         
         # 初始化权重
@@ -71,3 +71,24 @@ class ByteEmbedding(nn.Module):
         x = x * math.sqrt(self.embed_dim_per_partition)
         
         return x
+
+if __name__ == '__main__':
+    # 测试用例
+    config = ByteModelConfig(
+        vocab_size = 1000,
+        model_dim  = 128,
+        tensor_parallel_size  = 1,
+        tensor_parallel_group = None
+    )
+    embedding_layer = ByteEmbedding(config)
+
+    batch_size = 2
+    seq_len    = 16
+    input_ids = torch.randint(low=0, high=config.vocab_size, size=(batch_size, seq_len), dtype=torch.long)
+
+    # 前向计算
+    output = embedding_layer(input_ids)
+    
+    print(f"Input_ids: {input_ids}")
+    print(f"Embedding shape: {output.shape}")  # 期望: [2, 16, 128]
+    print("输出示例 (第一个样本第一个token的向量前5维):", output[0,0,:5])
