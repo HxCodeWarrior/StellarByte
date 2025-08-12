@@ -1449,7 +1449,7 @@ embed_dim_per_partition: 768 (<class 'int'>)
 <summary>20025.8.12</summary>
 
 ### DONE
-1. model_pretrain.py 优化配置处理和数据集初始化,修复训练损失计算和nltk资源下载问题
+1. model_pretrain.py 优化配置处理和数据集初始化,修复训练损失计算和nltk资源下载问题,添加检查点管理功能以支持模型恢复和最佳模型保存
 - 添加环境变量检查避免NLTK资源重复下载
 - 改进配置参数转换逻辑，支持自动类型推断
 - 重构模型配置初始化，显式提取所需参数，解决启动模型预训练脚本时报错
@@ -1457,10 +1457,15 @@ embed_dim_per_partition: 768 (<class 'int'>)
 - 修复训练过程中损失计算不准确的问题，调整梯度累积逻辑以正确统计token级损失
 - 添加nltk punkt分词器资源下载，改进分词方式从空格切分到nltk分词
 - 修复meteor_score计算时参数传递错误的问题
+- 引入CheckpointManager类实现模型检查点管理
+- 支持训练中断恢复和最佳模型自动保存
+- 添加多进程安全检查和信号处理
+- 改进训练日志记录和评估指标跟踪
 2. configs/model_pretrain.yaml 修正训练和验证数据路径配置错误
 - 将训练数据和验证数据的路径从"./data"更正为"./datasets"，以匹配实际项目目录结构
 - 完善实验设置部分的参数配置
 - 添加实验部分使用说明注释
+- 将检查点相关配置从 training 部分提取到独立的 checkpoints 部分，并增加更多控制选项如最大保存数量、监控指标等。同时调整了日志保存的层级结构以提高配置文件的可读性和可维护性。
 3. Model.py 统一使用num_layers代替n_layers参数名
 - 将模型初始化中的参数名从n_layers统一改为num_layers以保持命名一致性，并更新相关初始化逻辑
 4. model/utils/DropPath.py 增强DropPath模块功能并添加衰减计划
