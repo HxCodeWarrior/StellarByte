@@ -1498,6 +1498,23 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 本项目采用 CC BY-NC 4.0 许可证 - 详情请参阅 [LICENSE](LICENSE) 文件。
 
+## 📖 引用
+
+如果您在研究或项目中使用了本仓库，请按以下方式引用：
+
+```bibtex
+@misc{StellarByte,
+  author       = {Yao Xiang Zhang},
+  title        = {StellarByte},
+  year         = {2025},
+  publisher    = {GitHub},
+  journal      = {GitHub repository},
+  howpublished = {\url{https://github.com/HxCodeWarrior/StellarByte}}
+}
+```
+
+---
+
 ## 🌟 致谢
 
 - 感谢所有为 Transformer 架构发展做出贡献的研究者
