@@ -10,10 +10,18 @@
 
 # 实验配置
 experiment:
-  use_swanlab: trua                        # 是否启用swanlab
+  # : : : : : : : : : : : 
+  # 注意：1. 如果要启用SwanLab记录，必须启用use_swanlab，设置为True
+  #      2. 如果要启用SwanLab云模式，需要设置mode: 'cloud'或者'mode: cloud-only'，同时也需要填入api_key
+  #      3. 如果要启用SwanLab本地模式，需要设置mode: 'local',同时需要配置logdir(如果不配置会自动生成)，不需要配置api_key
+  #      4. 详细请参考：https://docs.swanlab.cn/guide_cloud/general/what-is-swanlab.html
+  # 项目名可设置为None使用随机字符串，建议不设置以使用随机生成字符串
+  # : : : : : : : : : : : 
+  use_swanlab: False               # 是否启用swanlab
   project_name: "ByteLM-Pretrain"  # 项目名称
   run_name: "baseline-158M"        # 实验运行名称
   mode: "cloud"                    # SwanLab记录模式: 'cloud','cloud-only','local','disabled'
+  logdir: "./swanlab_run"          # SwanLab记录日志保存路径
   api_key: ""                      # SwanLab API密钥
 
 # 数据配置
