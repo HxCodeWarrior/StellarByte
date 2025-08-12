@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 import argparse
 import logging
 import yaml
@@ -26,6 +27,7 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from utils.logger import setup_logger
+from utils.checkpoint import CheckpointManager 
 from model.Model import ByteModel
 from model.config import ByteModelConfig
 from datasets import PretrainDataset
@@ -336,7 +338,7 @@ def init_model(config, device):
     return model, tokenizer
 
 def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("cpu")):
-    f"""
+    """
     工业级的LLM预训练模型评估函数。
 
     Args:
@@ -506,6 +508,7 @@ def train_epoch(
     lr_scheduler: callable,
     scaler: torch.cuda.amp.GradScaler,
     tokenizer: PreTrainedTokenizerBase,
+    checkpoint_manager: CheckpointManager,
     eval_dataset: PretrainDataset = None,
 ) -> int:
     """
@@ -525,6 +528,7 @@ def train_epoch(
         
     Returns:
         int: 更新后的全局训练步数
+        float: 当前epoch的平均
     """
     # ===== 1. 训练准备 =====
     model.train()               # 设置模型为训练模式（启用dropout等）
@@ -681,14 +685,29 @@ def train_epoch(
             # 2.8 模型保存
             if global_step % save_interval == 0:
                 model.eval()
-                save_path = f"{train_config.output_dir}/model_step_{global_step}.pth"
                 
                 # 自定义模型保存
+                checkpoint_path = checkpoint_manager.save_checkpoint(
+                    epoch=epoch,
+                    global_step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    metrics={"train_loss": avg_loss}  # 记录当前训练损失
+                )
                 
                 # 恢复训练
                 model.train()
-            
-            # 2.9 模型验证
+
+                # 记录保存信息
+                if checkpoint_path:
+                    logger.info(f"已保存检查点: {checkpoint_path}")
+
+                # 可选：SwanLab记录
+                if config.use_swanlab:
+                    swanlab.log({"train/checkpoint_saved": 1}, step=global_step)
+
+            # 2.9 模型验证与最佳模型保存
             if eval_dataset and global_step % eval_interval == 0:
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None # 清空显存缓存（避免OOM）
 
@@ -701,6 +720,21 @@ def train_epoch(
                     batch_size=train_config.eval_batch_size,
                     device=device
                 )
+                
+                # 保存最佳模型（基于验证损失）
+                best_path = checkpoint_manager.save_best(
+                    metric_name="loss",
+                    metric_value=eval_metrics["loss"],
+                    epoch=epoch,
+                    global_step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    extra={"eval_metrics": eval_metrics}  # 保存完整评估指标
+                )
+
+                if best_path:
+                    logger.info(f"保存新的最佳模型: {best_path}")
                 
                 # 记录验证指标
                 if config.use_swanlab:
@@ -750,11 +784,7 @@ def train_epoch(
     if config.use_swanlab:
         swanlab.log({"train/epoch_loss": epoch_loss}, step=global_step)
     
-    # 保存最终检查点
-    if (epoch + 1) % train_config.save_epochs == 0:
-        pass
-    
-    return global_step
+    return global_step, epoch_loss
 
 def train(config_path: str):
     """
@@ -766,8 +796,26 @@ def train(config_path: str):
     # ==================== 1. 配置解析与环境设置 ====================
     config = parse_args(config_path)
     device = set_environment(config)
+
+    # ==================== 2. 检查点管理器初始化 ====================
+    # 确保检查点目录存在
+    checkpoint_dir = getattr(config, "checkpoints_dir", config.output_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info(f"检查点保存目录: {checkpoint_dir}")
+
+    checkpoint_manager = CheckpointManager(
+        output_dir      = config.checkpoints_dir,
+        monitor         = config.checkpoints_monitor,  # 用于性能指标监控的字段名
+        mode            = config.checkpoints_mode,     # 监控模式："min" | "max"
+        max_checkpoints = config.max_checkpoints,      # 最多保存的检查点数
+        prefix          = config.model_type,           # 检查点命名前缀
+        keep_last_n     = config.keep_last_n,          # 保存最近n个检查点
+        is_master       = config.is_master,           # 主进程
+    )
+    # 注册信号处理器 (Ctrl+C/SIGTERM时保存紧急检查点)
+    checkpoint_manager.register_signal_handlers()
     
-    # ==================== 2. 模型与数据初始化 ====================
+    # ==================== 3. 模型与数据初始化 ====================
     model, tokenizer = init_model(config, device)
     
     # 打印模型参数量
@@ -796,7 +844,7 @@ def train(config_path: str):
         pin_memory=True
     )
     
-    # ==================== 3. 训练基础设施初始化 ====================
+    # ==================== 4. 训练基础设施初始化 ====================
     # 优化器配置
     optimizer = optim.AdamW(
         model.parameters(),
@@ -819,22 +867,42 @@ def train(config_path: str):
         min_lr_ratio  = config.min_lr_ratio
     )
     
-    # ==================== 4. 训练循环 ====================
+    # ==================== 5. 恢复训练状态 ====================
     global_step = 0
     start_epoch = 0
     
-    # 创建输出目录
-    os.makedirs(config.output_dir, exist_ok=True)
+    # 尝试加载最新检查点
+    resume_training = getattr(config, "resume_training", False)
+    if resume_training:
+        latest_ckpt = checkpoint_manager.latest_checkpoint()
+        if latest_ckpt:
+            logger.info(f"恢复训练: {latest_ckpt}")
+            ckpt = checkpoint_manager.load_checkpoint(
+                str(latest_ckpt),
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                map_location=device
+            )
+            global_step = ckpt.get("global_step", 0)
+            start_epoch = ckpt.get("epoch", 0) + 1
+            # 恢复最佳指标
+            if "metrics" in ckpt and "loss" in ckpt["metrics"]:
+                checkpoint_manager.best_metric = ckpt["metrics"]["loss"]
+                logger.info(f"恢复最佳验证损失: {checkpoint_manager.best_metric:.4f}")
+        else:
+            logger.info("没有找到可恢复的检查点，从头开始训练")
     
+    # ==================== 6. 训练循环 ====================
     # 训练计时
     total_start_time = time.time()
-    
+
     logger.info(f"开始训练，共 {config.train_epochs} 个轮次，总步数 {total_steps}")
     
     for epoch in range(start_epoch, config.train_epochs):
         epoch_start_time = time.time()
         
-        global_step = train_epoch(
+        global_step, epoch_loss = train_epoch(
             epoch            = epoch,
             model            = model,
             train_dataloader = train_loader,
@@ -845,9 +913,26 @@ def train(config_path: str):
             lr_scheduler     = lr_scheduler,
             scaler           = scaler,
             tokenizer        = tokenizer,
+            checkpoint_manager = checkpoint_manager,
             eval_dataset     = eval_dataset
         )
-        
+
+        # 计算epoch耗时
+        epoch_duration = time.time() - epoch_start_time
+
+        # 轮次结束保存
+        if (epoch + 1) %  getattr(config, "save_epochs", 1) == 0:
+            checkpoint_path = checkpoint_manager.save_checkpoint(
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                tag=f"epoch{epoch+1}",
+                metrics={"epoch_loss": epoch_loss}
+            )
+            logger.info(f"轮次 {epoch+1} 结束 | 保存检查点: {checkpoint_path}")
+
         # 轮次结束评估
         if eval_dataset:
             logger.info(f"轮次 {epoch+1} 结束，开始完整验证集评估...")
@@ -858,31 +943,49 @@ def train(config_path: str):
                 batch_size   = config.eval_batch_size,
                 device       = device
             )
+
+            # 保存最佳模型（基于验证损失）
+            best_path = checkpoint_manager.save_best(
+                metric_name="loss",
+                metric_value=eval_metrics["loss"],
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                extra={"full_eval_metrics": eval_metrics}
+            )
+
+            if best_path:
+                logger.info(f"新的最佳模型 @ loss={eval_metrics['loss']:.4f}: {best_path}")
+
             # 记录验证指标
             if config.use_swanlab:
                 swanlab.log({
                     "eval/epoch_loss": eval_metrics["loss"],
                     "eval/epoch_perplexity": eval_metrics["perplexity"],
-                    "eval/epoch_accuracy": eval_metrics["accuracy"]
+                    "eval/epoch_accuracy": eval_metrics["accuracy"],
+                    "eval/epoch_bleu": eval_metrics["bleu"],
+                    "eval/epoch_rouge1": eval_metrics["rouge-1"],
+                    "eval/epoch_rougeL": eval_metrics["rouge-l"],
+                    "eval/epoch_meteor": eval_metrics["meteor"]
                 }, step=global_step)
-        
-        # 轮次结束保存
-        if (epoch + 1) % config.save_epochs == 0:
-            checkpoint_path = os.path.join(
-                config.output_dir,
-                f"model_epoch_{epoch+1}.pth"
-            )
-            pass
-            logger.info(f"保存检查点到: {checkpoint_path}")
     
-    # ==================== 5. 训练结束处理 ====================
+    # ==================== 7. 训练结束处理 ====================
     total_time = time.time() - total_start_time
     logger.info(f"训练完成! 总耗时: {total_time/3600:.2f} 小时")
     
     # 保存最终模型
-    final_model_path = os.path.join(config.output_dir, "final_model.pth")
-    torch.save(model.state_dict(), final_model_path)
-    logger.info(f"最终模型保存到: {final_model_path}")
+    final_path = checkpoint_manager.save_checkpoint(
+        epoch=config.train_epochs,
+        global_step=global_step,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        tag="final",
+        metrics={"total_time": total_time}
+    )
+    logger.info(f"最终模型保存到: {final_path}")
     
     # 记录训练完成
     if config.use_swanlab:
@@ -915,4 +1018,5 @@ def main():
     train(args.config)
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn")
     main()
