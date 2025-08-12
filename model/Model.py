@@ -53,7 +53,7 @@ class ByteModel(PreTrainedModel):
         # 残差投影层特殊缩放初始化
         for pn, p in self.named_parameters():
             if pn.endswith('w2.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.n_layers))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.num_layers))
 
         # 初始化最后一次向前传播的损失属性
         self.last_loss = None
@@ -339,7 +339,7 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("tokenizer")
     args = ByteModelConfig(
         dim=1024,
-        n_layers=18,
+        num_layers=18,
     )
     # 实例化Model
     model = ByteModel(args=args)
