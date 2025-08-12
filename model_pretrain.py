@@ -44,7 +44,7 @@ if not os.environ.get('NLTK_DATA_DOWNLOADED'):
     os.environ['NLTK_DATA_DOWNLOADED'] = 'True'
 
 # 设置全局logger
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("StellarByte")
 
 def parse_args(config_path: str):
     """
@@ -203,10 +203,14 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
     if config.use_swanlab and config.api_key:
         try:
             swanlab.login(api_key=config.api_key)
+
+            # 将SimpleNamespace转换为字典
+            config_dict = vars(config) if hasattr(config, '__dict__') else {}
+
             swanlab.init(
                 project=config.project_name or "default_project",
                 name=config.run_name or f"run_{int(time.time())}",
-                config=config,  # 自动记录所有配置参数
+                config=config_dict,  # 自动记录所有配置参数
                 logdir=logger_config.log_dir or None,
             )
             logger.info("SwanLab initialized.")
