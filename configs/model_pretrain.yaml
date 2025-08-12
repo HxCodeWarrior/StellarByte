@@ -19,8 +19,8 @@ experiment:
 # 数据配置
 data:
   tokenizer_path: "./tokenizer"  # 分词器路径
-  train_data: "./data/test/test_train.jsonl" # 训练数据目录
-  eval_data: "./data/test_eval.jsonl"   # 验证数据目录
+  train_data: "./datasets/test/test_train.jsonl" # 训练数据目录
+  eval_data: "./datasets/test/test_eval.jsonl"   # 验证数据目录
 
 # 模型架构配置
 model:
