@@ -97,12 +97,21 @@ training:
   device: "cpu"                  # 设备名称：cpu / cuda:0 / cuda:1 / cuda:[0,1]
   mixed_precision: true          # 是否使用混合精度
   
-  # 检查点设置
-  output_dir: "./checkpoints"    # 输出目录
-  save_epochs: 1                 # 保存间隔(轮次)
-  save_interval: 1000            # 保存间隔(步数)
+# 检查点设置
+checkpoints:
+  checkpoints_dir: "./checkpoints" # 输出目录
+  checkpoints_monitor: ""          # 最佳监控指标
+  checkpoints_mode: ""             # 监控指标模式: max / min,若为 min 则 metric 越小越好
+  max_checkpoints: 10              # 保存最多数量
+  checkpoints_prefix: "Stellar"    # 检查点名前缀
+  keep_last_n: 1                   # 强制保留最近 N 个 checkpoint（会与 max_checkpoints 一起工作）
+  is_master: True                  # 是否为主进程，若在分布式训练中，应传入是否为主进程（rank0）。None 表示非分布式（主进程）
+  resume_training: True            # 是否在已存在的 checkpoint 上继续训练
+  save_epochs: 1                   # 保存间隔(轮次)
+  save_interval: 1000              # 保存间隔(步数)
   
   # 日志与评估
+save:
   log_interval: 50               # 日志记录间隔(步数)
   eval_steps: 500                # 评估间隔(步数)
   eval_batch_size: 16            # 评估批次大小
