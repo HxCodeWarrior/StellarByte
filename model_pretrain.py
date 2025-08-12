@@ -29,10 +29,14 @@ from model.Model import ByteModel
 from model.config import ByteModelConfig
 from datasets import PretrainDataset
 
-# nltk需要下载必要资
-nltk.data.path.append('./sources/')
-nltk.download('wordnet', download_dir='./sources')
-nltk.download('omw-1.4', download_dir='./sources')
+# nltk需要下载必要资源
+# 使用环境变量标记是否已下载，避免重复下载
+if not os.environ.get('NLTK_DATA_DOWNLOADED'):
+    nltk.data.path.append('./sources/')
+    nltk.download('wordnet', download_dir='./sources')
+    nltk.download('omw-1.4', download_dir='./sources')
+    # 设置环境变量标记已下载
+    os.environ['NLTK_DATA_DOWNLOADED'] = 'True'
 
 # 设置全局logger
 logger = logging.getLogger(__name__)
@@ -53,13 +57,37 @@ def parse_args(config_path: str):
         3
         >>> model = AutoModel(config=config)
     """
+    def convert_value(v):
+        # 如果已经是数字或布尔值，直接返回
+        if isinstance(v, (int, float, bool)):
+            return v
+        
+        # 如果是字符串，尝试转换
+        if isinstance(v, str):
+            low_v = v.strip().lower()
+            # 布尔值识别
+            if low_v in ("true", "yes", "on"):
+                return True
+            if low_v in ("false", "no", "off"):
+                return False
+            # 数值识别（包含科学计数法）
+            try:
+                num = float(v)
+                # 如果是整数形式，转 int
+                if num.is_integer():
+                    return int(num)
+                return num
+            except ValueError:
+                return v  # 转换失败则保留原字符串
+        return v
+
     def flatten_dict_no_prefix(d):
         flat = {}
         for k, v in d.items():
             if isinstance(v, dict):
                 flat.update(flatten_dict_no_prefix(v))
             else:
-                flat[k] = v
+                flat[k] = convert_value(v)
         return flat
 
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -263,7 +291,34 @@ def init_model(config, device):
         tokenizer: 初始化后的 AutoTokenizer 实例
     """
     # ===== 1. 模型配置 =====
-    model_config = ByteModelConfig(config)
+    # 从config中提取需要的参数，而不是直接传递整个config对象
+    model_config = ByteModelConfig(
+        vocab_size=config.vocab_size,
+        model_dim=config.model_dim,
+        num_layers=config.num_layers,
+        num_attention_heads=config.num_heads,
+        num_kv_heads=config.num_kv_heads,
+        hidden_dim=config.hidden_dim,
+        dim_multiplier=config.dim_multiplier,
+        max_seq_len=config.max_seq_len,
+        drop_path_prob=config.drop_path_prob,
+        hidden_dropout_prob=config.hidden_dropout_prob,
+        attention_dropout_prob=config.attention_dropout_prob,
+        residual_dropout_prob=config.residual_dropout_prob,
+        layer_norm_eps=float(config.layer_norm_eps),
+        base_theta=config.base_theta,
+        ntk_alpha=config.ntk_alpha,
+        use_flash_attention=config.use_flash_attention,
+        use_cache=config.use_cache,
+        key_cache_dtype=torch.float16 if config.key_cache_dtype == 'float16' else torch.float32,
+        value_cache_dtype=torch.float16 if config.value_cache_dtype == 'float16' else torch.float32,
+        attention_window_size=config.attention_window_size,
+        parallel_residual=config.parallel_residual,
+        tensor_parallel_size=config.tensor_parallel_size,
+        tensor_parallel_group=None,
+        layerscale_init=float(config.layerscale_init),
+        initializer_range=config.initializer_range
+    )
 
     # ===== 2. 初始化模型 =====
     model = ByteModel(model_config)
@@ -706,18 +761,16 @@ def train(config_path: str):
     
     # 初始化数据集
     train_dataset = PretrainDataset(
-        data_dir=config.train_data,
-        max_length=config.max_seq_len,
+        data_path=config.train_data,
         tokenizer=tokenizer,
-        shuffle=True
+        max_length=config.max_seq_len
     )
     
     eval_dataset = PretrainDataset(
-        data_dir=config.eval_data,
-        max_length=config.max_seq_len,
+        data_path=config.eval_data,
         tokenizer=tokenizer,
-        shuffle=False
-    ) if config.data.eval_data_dir else None
+        max_length=config.max_seq_len
+    ) if config.eval_data else None
     
     # 创建数据加载器
     train_loader = DataLoader(
