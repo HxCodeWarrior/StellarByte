@@ -96,12 +96,19 @@ training:
   use_cuda: true                 # 是否使用GPU
   device: "cpu"                  # 设备名称：cpu / cuda:0 / cuda:1 / cuda:[0,1]
   mixed_precision: true          # 是否使用混合精度
-  
+
+# 早停机制设置
+early_stop:
+  patience: 3                      # 早停次数
+  patience_monitor: "loss"         # 需要监控的指标,默认验证损失，可选：loss / accuracy
+  patience_mode: "min"             # 监控指标模式: max / min,若为 min 则 metric 越小越好停
+  patience_delta: 0.0001           # 最小提升幅度，小于该幅度视为无提升
+
 # 检查点设置
 checkpoints:
   checkpoints_dir: "./checkpoints" # 输出目录
-  checkpoints_monitor: ""          # 最佳监控指标
-  checkpoints_mode: ""             # 监控指标模式: max / min,若为 min 则 metric 越小越好
+  checkpoints_monitor: "loss"      # 最佳监控指标
+  checkpoints_mode: "min"          # 监控指标模式: max / min,若为 min 则 metric 越小越好
   max_checkpoints: 10              # 保存最多数量
   checkpoints_prefix: "Stellar"    # 检查点名前缀
   keep_last_n: 1                   # 强制保留最近 N 个 checkpoint（会与 max_checkpoints 一起工作）
