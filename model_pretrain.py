@@ -224,6 +224,52 @@ def set_environment(config, seed: int = 42, use_cuda: bool = True):
 
     return device
 
+def early_stopping(
+    current_metric: float,
+    best_metric: float,
+    patience_counter: int,
+    patience: int = 5,
+    mode: str = "min",
+    delta: float = 1e-4
+) -> tuple:
+    """
+    早停机制函数
+    
+    Args:
+        current_metric (float): 当前验证集指标（loss 或 accuracy 等）
+        best_metric    (float): 历史最佳指标
+        patience_counter (int): 当前已连续未提升的轮数
+        patience       (int): 最大容忍未提升轮数
+        mode           (str): 'min' 表示指标越低越好（如loss），'max' 表示指标越高越好（如accuracy）
+        delta          (float): 最小提升幅度，小于该幅度视为无提升
+    
+    Returns:
+        best_metric (float): 更新后的最佳指标
+        patience_counter (int): 更新后的等待计数
+        stop (bool): 是否触发早停
+    """
+    stop = False
+    
+    if mode == "min":
+        if current_metric < best_metric - delta:
+            best_metric = current_metric
+            patience_counter = 0
+        else:
+            patience_counter += 1
+    elif mode == "max":
+        if current_metric > best_metric + delta:
+            best_metric = current_metric
+            patience_counter = 0
+        else:
+            patience_counter += 1
+    else:
+        raise ValueError("mode must be 'min' or 'max'")
+    
+    if patience_counter >= patience:
+        stop = True
+
+    return best_metric, patience_counter, stop
+
 def cosine_annealing_lr(
     current_step: int, 
     total_steps: int, 
@@ -803,7 +849,7 @@ def train(config_path: str):
 
     # ==================== 2. 检查点管理器初始化 ====================
     # 确保检查点目录存在
-    checkpoint_dir = getattr(config, "checkpoints_dir", config.output_dir)
+    checkpoint_dir = getattr(config, "checkpoints_dir", config.checkpoints_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger.info(f"检查点保存目录: {checkpoint_dir}")
 
@@ -812,9 +858,9 @@ def train(config_path: str):
         monitor         = config.checkpoints_monitor,  # 用于性能指标监控的字段名
         mode            = config.checkpoints_mode,     # 监控模式："min" | "max"
         max_checkpoints = config.max_checkpoints,      # 最多保存的检查点数
-        prefix          = config.model_type,           # 检查点命名前缀
+        prefix          = config.checkpoints_prefix,   # 检查点命名前缀
         keep_last_n     = config.keep_last_n,          # 保存最近n个检查点
-        is_master       = config.is_master,           # 主进程
+        is_master       = config.is_master,            # 主进程
     )
     # 注册信号处理器 (Ctrl+C/SIGTERM时保存紧急检查点)
     checkpoint_manager.register_signal_handlers()
@@ -874,6 +920,8 @@ def train(config_path: str):
     # ==================== 5. 恢复训练状态 ====================
     global_step = 0
     start_epoch = 0
+    patience_counter = 0
+    best_val_metric = None
     
     # 尝试加载最新检查点
     resume_training = getattr(config, "resume_training", False)
@@ -927,13 +975,13 @@ def train(config_path: str):
         # 轮次结束保存
         if (epoch + 1) %  getattr(config, "save_epochs", 1) == 0:
             checkpoint_path = checkpoint_manager.save_checkpoint(
-                epoch=epoch,
-                global_step=global_step,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                tag=f"epoch{epoch+1}",
-                metrics={"epoch_loss": epoch_loss}
+                epoch       = epoch,
+                global_step = global_step,
+                model       = model,
+                optimizer   = optimizer,
+                scaler      = scaler,
+                tag         = f"epoch{epoch+1}",
+                metrics     = {"epoch_loss": epoch_loss}
             )
             logger.info(f"轮次 {epoch+1} 结束 | 保存检查点: {checkpoint_path}")
 
@@ -948,16 +996,30 @@ def train(config_path: str):
                 device       = device
             )
 
+            # 初始化best_val_metric
+            if best_val_metric is None:
+                best_val_metric = eval_metrics[config.patience_monitor]
+
+            # 调用早停函数，更新状态
+            best_val_metric, patience_counter, stop_flag = early_stopping(
+                current_metric   = eval_metrics[config.patience_monitor],
+                best_metric      = best_val_metric,
+                patience_counter = patience_counter,
+                patience         = config.patience,
+                mode             = config.patience_mode,
+                delta            = config.patience_delta
+            )
+
             # 保存最佳模型（基于验证损失）
             best_path = checkpoint_manager.save_best(
-                metric_name="loss",
-                metric_value=eval_metrics["loss"],
-                epoch=epoch,
-                global_step=global_step,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                extra={"full_eval_metrics": eval_metrics}
+                metric_name  = config.checkpoints_monitor,
+                metric_value = eval_metrics[config.checkpoints_monitor],
+                epoch        = epoch,
+                global_step  = global_step,
+                model        = model,
+                optimizer    = optimizer,
+                scaler       = scaler,
+                extra        = {"full_eval_metrics": eval_metrics}
             )
 
             if best_path:
@@ -974,6 +1036,10 @@ def train(config_path: str):
                     "eval/epoch_rougeL": eval_metrics["rouge-l"],
                     "eval/epoch_meteor": eval_metrics["meteor"]
                 }, step=global_step)
+            
+            if stop_flag:
+                logger.info(f"早停触发: 已连续 {config.patience} 轮无提升, 在 epoch {epoch+1} 停止训练")
+                break
     
     # ==================== 7. 训练结束处理 ====================
     total_time = time.time() - total_start_time
@@ -981,13 +1047,13 @@ def train(config_path: str):
     
     # 保存最终模型
     final_path = checkpoint_manager.save_checkpoint(
-        epoch=config.train_epochs,
-        global_step=global_step,
-        model=model,
-        optimizer=optimizer,
-        scaler=scaler,
-        tag="final",
-        metrics={"total_time": total_time}
+        epoch       = config.train_epochs,
+        global_step = global_step,
+        model       = model,
+        optimizer   = optimizer,
+        scaler      = scaler,
+        tag         = "final",
+        metrics     = {"total_time": total_time}
     )
     logger.info(f"最终模型保存到: {final_path}")
     
