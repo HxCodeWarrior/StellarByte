@@ -4,9 +4,9 @@ import torch
 import logging
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
-from typing import List, Optional, Callable
+from typing import List, Optional, Union
 
 class BaseDataset(Dataset):
     """
@@ -206,6 +206,115 @@ class PretrainDataset(BaseDataset):
 
 
 
+class StreamingPretrainDataset(BaseDataset, IterableDataset):
+    """
+    流式加载预训练数据集，支持 json/jsonl/csv 格式。
+    逐条读取数据，避免一次性加载占用大量内存。
+    """
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 512,
+        fields: Optional[List[str]] = None,
+        template: Optional[str] = None,
+        add_bos: bool = True,
+        add_eos: bool = True
+    ):
+        BaseDataset.__init__(self, tokenizer, max_length)
+        IterableDataset.__init__(self)
+        
+        self.data_path = data_path
+        self.fields = fields or ["input", "output"]
+        self.template = template
+        self.add_bos = add_bos
+        self.add_eos = add_eos
+        self.bos_token_id = tokenizer.bos_token_id or None
+        self.eos_token_id = tokenizer.eos_token_id or None
+
+        if self.add_bos and self.bos_token_id is None:
+            if self.eos_token_id is not None:
+                logging.warning("[Dataset] Tokenizer has no <bos>, fallback to <eos> as BOS.")
+                self.bos_token_id = self.eos_token_id
+            else:
+                raise ValueError("Tokenizer must have bos_token or eos_token if add_bos=True")
+
+        if self.add_eos and self.eos_token_id is None:
+            if self.bos_token_id is not None:
+                logging.warning("[Dataset] Tokenizer has no <eos>, fallback to <bos> as EOS.")
+                self.eos_token_id = self.bos_token_id
+            else:
+                raise ValueError("Tokenizer must have eos_token if add_eos=True")
+
+    def _iter_jsonl(self):
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)
+
+    def _iter_json(self):
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                for sample in data:
+                    yield sample
+            else:
+                for sample in data.values():
+                    yield sample
+
+    def _iter_csv(self):
+        # pandas支持分块读取大文件，chunksize参数控制每块大小
+        for chunk in pd.read_csv(self.data_path, chunksize=1000):
+            for row in chunk.to_dict(orient="records"):
+                yield row
+
+    def __iter__(self):
+        ext = os.path.splitext(self.data_path)[-1]
+        if ext == ".jsonl":
+            data_iter = self._iter_jsonl()
+        elif ext == ".json":
+            data_iter = self._iter_json()
+        elif ext == ".csv":
+            data_iter = self._iter_csv()
+        else:
+            raise ValueError(f"Unsupported format: {ext}")
+
+        for sample in data_iter:
+            text = self._format_sample(sample)
+            if not text:
+                text = "[EMPTY]"
+
+            reserve_len = int(self.add_bos) + int(self.add_eos)
+
+            input_ids = self.tokenizer.encode(
+                text,
+                add_special_tokens=False,
+                max_length=self.max_length - reserve_len,
+                truncation=True
+            )
+            if self.add_bos:
+                input_ids = [self.bos_token_id] + input_ids
+            if self.add_eos:
+                input_ids = input_ids + [self.eos_token_id]
+
+            input_ids_x = input_ids[:-1]
+            input_ids_y = input_ids[1:]
+
+            input_tensor, attention_mask, _ = self._pad_and_mask(input_ids_x)
+            label_tensor, _, loss_mask = self._pad_and_mask(input_ids_y)
+
+            label_tensor = label_tensor.clone()
+            label_tensor[~loss_mask] = -100
+
+            yield {
+                "input_ids"     : input_tensor,
+                "labels"        : label_tensor,
+                "attention_mask": attention_mask,
+                "loss_mask"     : loss_mask,
+            }
+
+
+
 class SFTDataset(BaseDataset):
     def __init__(self, data_path, tokenizer, start_tokens, end_tokens, max_length=512):
         super().__init__(tokenizer, max_length)
@@ -378,6 +487,142 @@ class SFTDataset(BaseDataset):
             "loss_mask"     :   loss_mask        # [seq_len-1]
         }
 
+
+class StreamingSFTDataset(BaseDataset, IterableDataset):
+    """
+    流式加载的SFT数据集，逐行读取jsonl格式，边读边处理，适合大文件。
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        start_tokens: Union[str, List[int]],
+        end_tokens: Union[str, List[int]],
+        max_length: int = 512,
+    ):
+        BaseDataset.__init__(self, tokenizer, max_length)
+        IterableDataset.__init__(self)
+
+        self.data_path = data_path
+        self.start_tokens = start_tokens
+        self.end_tokens = end_tokens
+
+        # 初始化 start/end token id 序列
+        self._init_special_tokens()
+
+        logging.info(f"[StreamingSFTDataset] Streaming from {data_path}")
+        logging.info(f"Start tokens: {self.start_tokens}")
+        logging.info(f"End tokens: {self.end_tokens}")
+
+    def _init_special_tokens(self):
+        if isinstance(self.start_tokens, str):
+            self.start_token_ids = self.tokenizer.encode(self.start_tokens, add_special_tokens=False)
+        else:
+            self.start_token_ids = list(self.start_tokens)
+
+        if isinstance(self.end_tokens, str):
+            self.end_token_ids = self.tokenizer.encode(self.end_tokens, add_special_tokens=False)
+        else:
+            self.end_token_ids = list(self.end_tokens)
+
+        if not self.start_token_ids:
+            logging.warning("[StreamingSFTDataset] Start tokens empty!")
+        if not self.end_token_ids:
+            logging.warning("[StreamingSFTDataset] End tokens empty!")
+
+    @staticmethod
+    def _find_token_sequence(pattern: List[int], arr: List[int]) -> List[int]:
+        # KMP算法查找所有起点（和你SFTDataset完全一致）
+        if not pattern or len(pattern) > len(arr):
+            return []
+        lps = [0] * len(pattern)
+        j = 0
+        for i in range(1, len(pattern)):
+            while j and pattern[i] != pattern[j]:
+                j = lps[j - 1]
+            if pattern[i] == pattern[j]:
+                j += 1
+                lps[i] = j
+        res, j = [], 0
+        for idx, token in enumerate(arr):
+            while j and token != pattern[j]:
+                j = lps[j - 1]
+            if token == pattern[j]:
+                j += 1
+                if j == len(pattern):
+                    res.append(idx - j + 1)
+                    j = lps[j - 1]
+        return res
+
+    def _generate_loss_mask(self, input_ids: List[int]) -> List[bool]:
+        start_positions = self._find_token_sequence(self.start_token_ids, input_ids)
+        end_positions = self._find_token_sequence(self.end_token_ids, input_ids)
+
+        mask = [False] * len(input_ids)
+
+        for start in start_positions:
+            content_start = start + len(self.start_token_ids)
+            content_end = next((e for e in end_positions if e > content_start), len(input_ids))
+            if content_start < content_end:
+                mask[content_start:content_end] = [True] * (content_end - content_start)
+        return mask
+
+    def __iter__(self):
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"File not found: {self.data_path}")
+
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sample = json.loads(line)
+                except Exception as e:
+                    logging.warning(f"Failed to parse json line: {e}, skipping line")
+                    continue
+
+                # 你可能需要根据实际SFT数据格式调整文本生成逻辑
+                # 这里默认假设 sample 就是 dict，直接传给 tokenizer.apply_chat_template
+                text = self.tokenizer.apply_chat_template(
+                    sample,
+                    tokenize=False,
+                    add_generation_prompt=False
+                ).strip()
+                if not text:
+                    text = "[EMPTY]"
+
+                token_ids = self.tokenizer.encode(
+                    text,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=self.max_length
+                )
+
+                sft_mask = self._generate_loss_mask(token_ids)
+
+                padded_ids, attention_mask, pad_mask = self._pad_and_mask(token_ids)
+
+                sft_mask += [False] * (self.max_length - len(sft_mask))
+                sft_mask = torch.tensor(sft_mask, dtype=torch.bool)
+
+                final_mask = pad_mask & sft_mask
+
+                input_ids = padded_ids[:-1]
+                labels = padded_ids[1:]
+                attention_mask = attention_mask[:-1]
+                loss_mask = final_mask[1:]
+
+                labels = labels.clone()
+                labels[~loss_mask] = -100
+
+                yield {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                    "attention_mask": attention_mask,
+                    "loss_mask": loss_mask,
+                }
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
