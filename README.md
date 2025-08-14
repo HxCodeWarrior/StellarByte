@@ -1448,6 +1448,9 @@ embed_dim_per_partition: 768 (<class 'int'>)
 <details>
 <summary>20025.8.12</summary>
 
+### MileStone
+**实现基础的Byte-Transformer模型并成功验证了单卡训练**
+
 ### DONE
 1. model_pretrain.py 优化配置处理和数据集初始化,修复训练损失计算和nltk资源下载问题,添加检查点管理功能以支持模型恢复和最佳模型保存
 - 添加环境变量检查避免NLTK资源重复下载
@@ -1495,6 +1498,9 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 <details>
 <summary>2025.8.13 - 2028.8.14</summary>
+
+### MileStone
+**实现带KVCache 的Byte-Transformer模型。**
 
 ### DONE
 1. utils/checkpoint.py 添加checkpoints功能类，提供检查点保存、加载、查找等功能
