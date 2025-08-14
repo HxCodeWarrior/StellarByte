@@ -1493,6 +1493,52 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 ---
 
+<details>
+<summary>2025.8.13 - 2028.8.14</summary>
+
+### DONE
+1. utils/checkpoint.py 添加checkpoints功能类，提供检查点保存、加载、查找等功能
+2. model_pretrain.py 添加早停机制并优化检查点管理
+- 实现早停机制函数early_stopping，用于监控验证指标并在性能不再提升时终止训练
+- 修复检查点目录配置错误，统一使用config.checkpoints_dir
+- 优化检查点保存逻辑，使用配置中的checkpoints_prefix作为前缀
+- 调整最佳模型保存策略，使用config.checkpoints_monitor作为监控指标
+- 统一缓存参数配置并简化数据类型设置
+  - 将key_cache_dtype和value_cache_dtype合并为cache_dtype参数
+  - use_cache配置项改为使用config.use_kvcache
+3. configs/model_pretrain.yaml 添加早停机制并更新检查点配置
+- 添加早停机制相关参数配置，包括监控指标、模式和最小提升幅度
+- 更新检查点配置中的监控指标和模式为 loss 和 min
+4. datasets.py 数据集加载器新增流式数据集类支持大文件处理
+- 添加 StreamingPretrainDataset 和 StreamingSFTDataset 类，支持流式加载 json/jsonl/csv 格式数据，避免内存溢出问题。实现 IterableDataset 接口，逐条读取和处理数据，适用于大规模预训练和微调场景。
+5. MultiHeadSelfAttention 实现KV缓存支持及增量推理功能
+添加KV缓存功能以支持自回归生成，包括：
+- 引入ByteKVCache类管理缓存状态
+- 修改注意力掩码生成逻辑以支持缓存偏移
+- 实现缓存初始化、更新和状态管理接口
+- 支持增量推理时的位置偏移计算
+- 添加缓存相关测试用例
+6. DecoderLayer 添加对ByteKVCache的支持并更新前向传播
+- 为DecoderLayer添加ByteKVCache参数支持，修改前向传播逻辑以处理KV缓存
+7. Model 添加KV缓存支持以提高推理性能
+- 引入ByteKVCache类来缓存键值对，避免在自回归生成过程中重复计算
+- 修改forward方法以支持缓存传递
+- 在generate方法中初始化并使用缓存来优化长序列生成性能。
+8. KVCache 添加逻辑处理空序列时返回空张量
+- 当序列长度为0时返回空张量以避免潜在错误
+9. model/config.py 统一KV缓存相关参数命名
+- 将`use_cache`重命名为`use_kvcache`以保持命名一致性
+- 合并`key_cache_dtype`和`value_cache_dtype`为`cache_dtype`
+10. configs/model_pretrain.yaml 移除模型配置中的KV缓存参数并重构为独立模块
+- 将KV缓存相关配置从模型主配置中移除，并重构为独立的kv_cache模块，提高配置的可读性和模块化程度
+
+### TODO
+1. 尝试进行模型训练，并寻找BUG
+2. 按照Google CodeLab风格改进代码并完善文档。
+
+</details>
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
