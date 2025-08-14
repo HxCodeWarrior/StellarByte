@@ -9,24 +9,27 @@ except ImportError:
 
 class ByteMLP(nn.Module):
     """
-    Gated ByteMLP 模块（门控多层感知机）。
+    门控多层感知机(Gated MLP)模块，Transformer中前馈网络的改进实现。
 
-    该模块是 Transformer 中 FeedForward 层的改进版本，使用门控机制（如 GEGLU）
-    以及高效的 RMSNorm 替代传统 LayerNorm，提升数值稳定性与速度。
+    核心特点:
+    - 使用门控机制(GEGLU)增强非线性表达能力
+    - 采用RMSNorm替代LayerNorm提升计算效率和稳定性
+    - 支持隐藏层维度自动对齐优化
 
-    Attributes:
-        w13 (nn.Linear): 输入维度到 2 倍隐藏层维度的线性映射（用于门控结构）
-        w2 (nn.Linear): 从隐藏层还原回输出维度的线性映射
-        norm (ByteRMSNorm): RMSNorm 层，用于归一化输入
-        dropout (nn.Dropout): Dropout 层，用于防止过拟合
+    属性:
+        w1 (nn.Linear): 输入投影层，输出值分支（GEGLU结构）
+        w2 (nn.Linear): 输出投影层，将隐藏层映射回原始维度
+        w3 (nn.Linear): 输出投影层，输出门控权重
+        norm (ByteRMSNorm): RMS归一化层
+        dropout (nn.Dropout): 随机失活层防止过拟合
 
-    Args:
-        dim (int): 输入和输出的维度
-        hidden_dim (int, optional): 隐藏层维度；若为 None，将自动按 dim 推算并对齐
-        multiple_of (int, optional): 隐藏层维度对齐倍数（默认 256）
-        dropout (float, optional): dropout 概率（默认 0.1）
-        eps (float, optional): RMSNorm 中的数值稳定常数（默认 1e-6）
-        bias (bool, optional): 是否在线性层中使用偏置（默认 False）
+    参数:
+        dim (int): 输入/输出特征维度
+        hidden_dim (int, optional): 隐藏层维度，未指定时自动计算
+        multiple_of (int, optional): 隐藏层维度对齐基数(默认256)
+        dropout (float, optional): 随机失活概率(默认0.1)
+        eps (float, optional): RMSNorm的数值稳定常数(默认1e-6)
+        bias (bool, optional): 线性层是否使用偏置(默认False)
     """
 
     def __init__(
@@ -42,11 +45,15 @@ class ByteMLP(nn.Module):
 
         # 若未指定 hidden_dim，则按 (8/3)*dim 向上取整为 multiple_of 的倍数
         if hidden_dim is None:
+            # 基础计算：约为原始维度的3倍 (8/3 ≈ 2.666)
             hidden_dim = int(8 * dim / 3)
+            # 向上对齐到multiple_of的倍数（确保硬件友好）
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        # 将输入投影为 2 倍 hidden_dim（用于门控机制：一半为值分支，一半为门控分支）
-        self.w13 = nn.Linear(dim, hidden_dim * 2, bias=bias)
+        # 门控投影层：dim -> 2*hidden_dim
+        # 输出将拆分为值分支和门控分支
+        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)  # gate/激活分支
+        self.w3 = nn.Linear(dim, hidden_dim, bias=bias)  # value/线性分支
 
         # 输出投影层，将 hidden_dim 降回 dim
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -74,28 +81,26 @@ class ByteMLP(nn.Module):
         # Step 1: 输入归一化处理
         x = self.norm(x)
 
-        # Step 2: 一次线性变换输出两份：值分支 + 门控分支（GEGLU结构）
-        x_proj = self.w13(x)  # [B, T, 2 * hidden_dim]
+        # Step 2: 线性变换输出两份：值分支 + 门控分支（GEGLU结构）
+        x_gate  = self.w13(x)  # [B, T, hidden_dim]
+        x_value = self.w3(x)   # [B, T, hidden_dim]
 
-        # Step 3: 沿最后一个维度均分为两部分
-        x_gate, x_value = x_proj.chunk(2, dim=-1)
-
-        # Step 4: 对值分支使用 SiLU 激活函数（替代 ReLU，平滑且性能好）
+        # Step 3: 对值分支使用 SiLU 激活函数（替代 ReLU，平滑且性能好）
         x_value = F.silu(x_value)
 
-        # Step 5: 对门控分支使用 Sigmoid 激活，输出 (0,1) 区间的门控权重
+        # Step 4: 对门控分支使用 Sigmoid 激活，输出 (0,1) 区间的门控权重
         x_gate = torch.sigmoid(x_gate)
 
-        # Step 6: 门控机制：逐元素乘，控制信息流通强度
+        # Step 5: 门控机制：逐元素乘，控制信息流通强度
         x = x_value * x_gate  # [B, T, hidden_dim]
 
-        # Step 7: 输出映射回原维度
+        # Step 6: 输出映射回原维度
         x = self.w2(x)  # [B, T, dim]
 
-        # Step 8: Dropout 处理防止过拟合
+        # Step 7: Dropout 处理防止过拟合
         x = self.dropout(x)
 
-        # Step 9: 残差连接
+        # Step 8: 残差连接
         output = x + residual
 
         return output
