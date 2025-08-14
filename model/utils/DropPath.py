@@ -7,31 +7,34 @@ import torch.distributed as dist
 class DropPath(nn.Module):
     """DropPath (随机深度) 模块的工业级实现。
 
+    该模块在训练过程中以概率丢弃整个样本路径，在推理时保持完整路径。
+    支持概率衰减计划和分布式训练同步，适用于大型模型训练。
+
     功能特性：
-    - 支持线性/余弦衰减计划
-    - 可选的分布式数据并行(DDP)一致性掩码
-    - 支持自动混合精度(AMP)
-    - 适用于任意输入维度
+    - 支持线性/余弦衰减计划：随训练步数动态调整丢弃概率
+    - 分布式数据并行(DDP)一致性：确保多GPU训练中所有进程使用相同丢弃掩码
+    - 自动混合精度(AMP)兼容：正确处理半精度输入
+    - 维度无关：适用于任意维度的输入张量
 
     属性:
         drop_prob (float): 基础丢弃概率，范围[0.0, 1.0]
         schedule_type (str): 衰减计划类型（'linear'/'cosine'）
-        total_steps (int): 计划总步数（用于衰减计划）
+        total_steps (int): 衰减计划总步数（用于衰减计划）
         sync_ddp (bool): 是否在DDP进程中同步随机掩码
     """
 
     def __init__(
         self,
         drop_prob: float = 0.0,
-        schedule_type: str = "linear",  # 可选: "linear" | "cosine" | None
-        total_steps: int = None,  # 衰减计划总步数
-        sync_ddp: bool = False,  # 是否在DDP进程中同步掩码
+        schedule_type: str = "linear",
+        total_steps: int = None,
+        sync_ddp: bool = False,
     ):
         """初始化DropPath模块。
 
         参数:
             drop_prob: 基础丢弃概率
-            schedule_type: 衰减计划类型（None表示固定概率）
+            schedule_type: 衰减计划类型（None表示固定概率）,可选: "linear" | "cosine" | None
             total_steps: 衰减计划总步数（无计划时可设为None）
             sync_ddp: 是否在分布式训练中同步掩码
         """
