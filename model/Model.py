@@ -7,11 +7,13 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, Tuple, Union
 
 try:
+    from .utils.KVCache      import ByteKVCache
     from .EmbeddingLayer     import ByteEmbedding
     from .DecoderLayer       import ByteDecoderLayer
     from .RMSNorm            import ByteRMSNorm
     from .config             import ByteModelConfig
 except ImportError:
+    from utils.KVCache      import ByteKVCache
     from EmbeddingLayer     import ByteEmbedding
     from DecoderLayer       import ByteDecoderLayer
     from RMSNorm            import ByteRMSNorm
@@ -30,6 +32,16 @@ class ByteModel(PreTrainedModel):
         # 模型层数
         self.num_layers = args.num_layers
 
+        # KVCache
+        self.kv_cache = ByteKVCache(
+            num_layers  = args.num_layers,
+            num_heads   = args.num_attention_heads,
+            head_dim    = args.model_dim // args.num_attention_heads,
+            max_seq_len = args.max_seq_len,
+            batch_size  = args.batch_size,  # 这里 batch_size 要跟推理时一致
+            dtype       = torch.float16 if getattr(args, "cache_dtype", "float32") == "float16" else torch.float32,
+            device      = getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu")
+        )
         # 词嵌入层
         self.token_embedding = ByteEmbedding(args)
         # Dropout层
@@ -78,6 +90,7 @@ class ByteModel(PreTrainedModel):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[ByteKVCache] = None,
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         # 获取输入张量的形状信息
@@ -91,7 +104,7 @@ class ByteModel(PreTrainedModel):
         
         # Decoder层
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            hidden_states = layer(hidden_states, attention_mask, kv_cache)
 
         # 归一化
         hidden_states = self.norm(hidden_states)
@@ -166,13 +179,27 @@ class ByteModel(PreTrainedModel):
         top_k = max(top_k, 0)
         repetition_penalty = max(repetition_penalty, 1.0)
 
+        # 创建并清空缓存
+        kv_cache = ByteKVCache(
+            num_layers  = self.args.num_layers,
+            num_heads   = self.args.num_attention_heads,
+            head_dim    = self.args.model_dim // self.args.num_attention_heads,
+            max_seq_len = max_seq_len,
+            batch_size  = batch_size,
+            dtype       = self.output.weight.dtype,
+            device      = device
+        )
+
         # 存储生成的 token（初始为输入）
         generated = input_ids.clone()
         all_logits = [] if return_logits else None
 
+        # 先跑一次全量前向，把 prompt 全部写入缓存
+        _ = self.forward(input_ids=generated, kv_cache=kv_cache)
+
         for _ in range(max_seq_len):
             # 模型前向传播
-            output = self.forward(generated)
+            output = self.forward(input_ids=generated, kv_cache=kv_cache)
             
             # 获取当前logits
             logits = output.logits     # [B, 1, vocab_size]
