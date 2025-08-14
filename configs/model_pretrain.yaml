@@ -51,9 +51,6 @@ model:
     attention_dropout_prob: 0.1 # 注意力权重Dropout概率
     base_theta: 10000.0         # RoPE位置编码基数
     ntk_alpha: 1.0              # NTK动态缩放因子
-    use_cache: true             # 是否启用KV缓存
-    key_cache_dtype: float16    # Key缓存数据类型
-    value_cache_dtype: float16  # Value缓存数据类型
   
   # 前馈网络
   feed_forward:
@@ -66,6 +63,12 @@ model:
     residual_dropout_prob: 0.1  # 残差连接Dropout概率
     drop_path_prob: 0.0         # DropPath最大丢弃概率
   
+  # KVCache机制
+  kv_cache:
+    use_kvcache: False         # 是否启用KVCache
+    cache_layers: 1            # KVCach层数
+    cache_dtype: float16       # 缓存数据类型
+    
   # 张量并行
   parallel:
     tensor_parallel_size: 1     # 张量并行组大小
