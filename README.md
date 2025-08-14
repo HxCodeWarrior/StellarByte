@@ -1576,6 +1576,8 @@ embed_dim_per_partition: 768 (<class 'int'>)
 ### TODO
 1. 尝试进行模型训练，并寻找BUG
 2. 优化MLP层，尝试加入融合推理
+3. 测试KVCache
+4. 分析并优化显存占用
 
 </details>
 
