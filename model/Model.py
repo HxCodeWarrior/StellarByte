@@ -19,7 +19,7 @@ except ImportError:
 
 class ByteModel(PreTrainedModel):
     config_class = ByteModelConfig
-    last_loss    = Optional[torch.Tensor]
+    loss         = Optional[torch.Tensor]
 
     def __init__(self, args: ByteModelConfig = None):
         super().__init__(args)
@@ -56,7 +56,7 @@ class ByteModel(PreTrainedModel):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.num_layers))
 
         # 初始化最后一次向前传播的损失属性
-        self.last_loss = None
+        self.loss = None
         self.OUT = CausalLMOutputWithPast()
         self._no_split_models = [name for name, _ in self.named_modules()]  # 不分割的模块列表
     
@@ -109,15 +109,15 @@ class ByteModel(PreTrainedModel):
                 ignore_index=-100,  # 忽略特殊标签
                 reduction='mean'
             )
-            self.last_loss = loss.detach()
+            self.loss = loss
         else:
             # 推理时，只对最后一个位置的输出进行向前传播计算
             logits = self.output(hidden_states[:, [-1], :])
-            self.last_loss = None
+            self.loss = None
 
         # 设置输出
         self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('last_loss', self.last_loss)
+        self.OUT.__setitem__('loss', self.loss)
 
         return self.OUT
     
