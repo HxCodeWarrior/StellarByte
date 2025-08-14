@@ -217,6 +217,9 @@ class ByteKVCache:
         """
         layer = self._layers[layer_idx]
         current_len = int(layer["seq_len"])
+        if current_len == 0:
+            # 返回空张量
+            return torch.empty(0), torch.empty(0)
         seq_len = current_len if max_len is None else min(max_len, current_len)
         
         if seq_len > current_len:
