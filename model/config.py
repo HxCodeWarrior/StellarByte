@@ -22,9 +22,8 @@ class ByteModelConfig(PretrainedConfig):
         base_theta: float = 10000.0,          # 位置编码theta参数
         ntk_alpha: float = 1.0,               # 位置编码NTK-alpha参数
         use_flash_attention: bool = False,    # 是否使用FlashAttention
-        use_cache: bool = True,               # 是否使用KV缓存加速推理
-        key_cache_dtype: torch.dtype = torch.float16,  # KV缓存中Key的精度
-        value_cache_dtype: torch.dtype = torch.float16,  # KV缓存中Value的精度
+        use_kvcache: bool = True,             # 是否使用KV缓存加速推理
+        cache_dtype: torch.dtype = torch.float16,  # KV缓存中Key的精度
         attention_window_size: int = 0,        # 注意力窗口大小
         parallel_residual: bool = True,        # 串并行残差
         tensor_parallel_size: int = 1,         # 张量并行大小
@@ -62,9 +61,8 @@ class ByteModelConfig(PretrainedConfig):
         self.ntk_alpha = ntk_alpha
 
         # ========== KV Cache ==========
-        self.use_cache = use_cache
-        self.key_cache_dtype = key_cache_dtype
-        self.value_cache_dtype = value_cache_dtype
+        self.use_kvcache = use_kvcache
+        self.cache_dtype = cache_dtype
 
         # ========== Parallel ===========
         self.parallel_residual = parallel_residual
