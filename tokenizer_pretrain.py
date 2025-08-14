@@ -105,30 +105,29 @@ def create_tokenizer_config(save_dir: str, model_max_length: int = 8192) -> None
     os.makedirs(save_dir, exist_ok=True)
 
     config = {
+        # tokenizer类，预训练fast tokenizer
+        "tokenizer_class": "PreTrainedTokenizerFast",
         # 是否自动在序列开头添加bos_token，建议开启对话模型时使用
         "add_bos_token": True,  
         # 是否自动在序列结尾添加eos_token，建议开启对话模型时使用
         "add_eos_token": True,
         # 是否在单词前加空格，通常GPT类模型需要
         "add_prefix_space": True,
+        # 是否清理tokenization产生的多余空格，建议开启
+        "clean_up_tokenization_spaces": True,
+        # 最大输入长度
+        "model_max_length": model_max_length,
+        # padding策略，常用right padding，也可设置为'left'
+        "padding_side": "right",
+        # 截断策略，常用right截断
+        "truncation_side": "right",
+
         # 预定义的特殊token
         "bos_token": "<|sbos|>",
         "eos_token": "<|seos|>",
         "pad_token": "<|spad|>",  # 专用pad token
         "unk_token": "<unk>",
         "mask_token": "<mask>",  # Mask token，方便mask填空任务
-        # 额外推荐加入sep_token，用于分隔对话轮次或者上下文
-        "sep_token": "<|ssep|>",
-        # 最大输入长度
-        "model_max_length": model_max_length,
-        # 是否清理tokenization产生的多余空格，建议开启
-        "clean_up_tokenization_spaces": True,
-        # tokenizer类，预训练fast tokenizer
-        "tokenizer_class": "PreTrainedTokenizerFast",
-        # padding策略，常用right padding，也可设置为'left'
-        "padding_side": "right",
-        # 截断策略，常用right截断
-        "truncation_side": "right",
 
         # chat模板，基于Jinja2模板语法生成对话输入
         "chat_template": (
@@ -165,7 +164,6 @@ def create_tokenizer_config(save_dir: str, model_max_length: int = 8192) -> None
         "additional_special_tokens": [
             "<s>",
             "</s>",
-            "<|ssep|>",       # 加入sep_token分隔符
             "<|system|>",
             "<|user|>",
             "<|assistant|>",
@@ -181,7 +179,7 @@ def create_advanced_normalizer() -> normalizers.Sequence:
     """创建文本规范化序列"""
     return normalizers.Sequence([
         # Unicode规范化
-        NFD(),  # 标准化分解
+        NFD(),  # 标准化分解，全角半角统一，兼容中英文
         StripAccents(),  # 去除重音符号
         
         # 处理特殊字符
@@ -190,12 +188,11 @@ def create_advanced_normalizer() -> normalizers.Sequence:
         Replace(Regex(r"[ \t\n\r\f\v]+"), " "),  # 合并空白字符
         
         # 表情符号处理
-        Replace(Regex(r":(\w+):"), r": \1 :"),  # 分隔表情符号代码
         Replace(Regex(r"(\p{Emoji})"), r" \1 "),  # 分隔表情符号
         
         # URL和特殊模式
-        Replace(Regex(r"https?://\S+"), " [URL] "),
-        Replace(Regex(r"\b\d{1,3}(?:,\d{3})+\b"), " [LARGE_NUMBER] "),
+        Replace(Regex(r"https?://\S+"), " [URL] "),      # URL占位
+        Replace(Regex(r"\b\d[\d,.]*\b"), " [NUMBER] "),  # 数字占位
         
         # 最终清理
         Replace(Regex(r"\s+"), " "),  # 合并空格
@@ -208,8 +205,11 @@ def create_advanced_pre_tokenizer() -> pre_tokenizers.Sequence:
         # 按空白分割（保留空白信息）
         Metaspace(replacement="▁", add_prefix_space=True),
         
-        # 特殊结构分割
-        Split(Regex(r'([^a-zA-Z0-9\s])'), behavior="isolated"),
+        # 单独隔离代码常用符号
+        Split(Regex(r'([\+\-\*/=%&|^~!@#])'), behavior="isolated"),
+        Split(Regex(r"(['\"]|//|#|/\*|\*/)"), behavior="isolated"),
+
+        # 分隔字母与大写字母（CamelCase）
         Split(Regex(r'([a-z])([A-Z])'), behavior="contiguous"),
         Split(Regex(r"(\d+)([a-zA-Z])"), behavior="contiguous"),
         
@@ -218,9 +218,6 @@ def create_advanced_pre_tokenizer() -> pre_tokenizers.Sequence:
         
         # 标点符号处理
         Punctuation(behavior="isolated"),
-        
-        # 特殊符号处理
-        Split(Regex(r"([@#])"), behavior="isolated"),
     ])
 
 def train_tokenizer(
@@ -277,11 +274,10 @@ def train_tokenizer(
             ("<|seos|>", 4),
             ("<|spad|>", 5),
             ("<mask>", 6),
-            ("<|ssep|>", 7),
-            ("<|system|>", 8),
-            ("<|user|>", 9),
-            ("<|assistant|>", 10),
-            ("<|tool|>", 11),
+            ("<|system|>", 7),
+            ("<|user|>", 8),
+            ("<|assistant|>", 9),
+            ("<|tool|>", 10),
         ]
     )
 
@@ -294,7 +290,6 @@ def train_tokenizer(
         "<|seos|>",
         "<|spad|>",  # 专用pad token
         "<mask>",    # MLM任务支持
-        "<|ssep|>",  # 分隔符token
         "<|system|>",
         "<|user|>",
         "<|assistant|>",
@@ -347,11 +342,10 @@ def train_tokenizer(
         "<|seos|>": 4,
         "<|spad|>": 5,
         "<mask>": 6,
-        "<|ssep|>": 7,
-        "<|system|>": 8,
-        "<|user|>": 9,
-        "<|assistant|>": 10,
-        "<|tool|>": 11
+        "<|system|>": 7,
+        "<|user|>": 8,
+        "<|assistant|>": 9,
+        "<|tool|>": 10
     }
     
     for token, expected_id in special_token_map.items():
