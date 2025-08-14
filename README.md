@@ -1572,12 +1572,28 @@ embed_dim_per_partition: 768 (<class 'int'>)
 - 可能抛出的异常类型及触发条件
 - 内部实现细节的补充说明
 - 分布式操作和状态管理的文档完善
+19. tokenizer_pretrain.py 优化tokenizer配置和预处理逻辑
+- 重新组织tokenizer配置项顺序，将tokenizer_class移至顶部
+- 移除冗余的sep_token，简化特殊token列表
+- 改进文本规范化逻辑，统一数字处理为[NUMBER]
+- 优化预分词器规则，专注于代码符号和大小写处理
+- 调整特殊token的ID映射以保持一致性
 
 ### TODO
 1. 尝试进行模型训练，并寻找BUG
 2. 优化MLP层，尝试加入融合推理
 3. 测试KVCache
 4. 分析并优化显存占用
+5. 寻找并构建tokenizer训练数据集
+  - 中文语料
+  - 英文语料
+  - Emoji语料
+  - Code语料
+6. 寻找并构建模型训练数据集
+  - 文本生成
+  - 代码生成/代码理解
+  - 逻辑推理/问答/常识
+  - 多轮对话
 
 </details>
 
