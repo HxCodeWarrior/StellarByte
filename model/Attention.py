@@ -17,7 +17,13 @@ except:
 
 class ByteMultiHeadSelfAttention(nn.Module):
     """
-    多头自注意力机制模块，支持长序列、FlashAttention、KV缓存、因果掩码、Dropout、混合精度与张量并行。
+    多头自注意力机制模块，支持：
+    - 张量并行（Tensor Parallelism）
+    - KV缓存（KV Cache）用于高效自回归推理
+    - FlashAttention加速计算
+    - 动态RoPE位置编码
+    - 分组查询注意力（Grouped Query Attention）
+    - 滑动窗口注意力（Sliding Window Attention）
 
     Attributes:
         tp_size            (int)            : 张量并行组的大小。
@@ -46,6 +52,14 @@ class ByteMultiHeadSelfAttention(nn.Module):
         layer_id: Optional[int] = None,
         num_layers: Optional[int] = None
     ):
+        """
+        多头自注意力层初始化
+        
+        参数:
+            args: ByteModelConfig - 模型配置参数
+            layer_id: int - 当前层ID（用于KV缓存索引）
+            num_layers: int - 总层数（用于权重初始化）
+        """
         super().__init__()
 
         # ===== 张量并行配置 =====
@@ -86,8 +100,11 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         # ===== 投影层 =====
         # Q/K/V投影层（按头维度切分）
+        # 查询投影（输出维度: 本地头数 * 头维度）
         self.W_q = nn.Linear(self.embed_dim, self.num_local_heads * self.head_dim, bias=False)
+        # 键投影（输出维度: 本地键/值头数 * 头维度）
         self.W_k = nn.Linear(self.embed_dim, self.num_local_kv_heads * self.head_dim, bias=False)
+        # 值投影（输出维度: 本地键/值头数 * 头维度）
         self.W_v = nn.Linear(self.embed_dim, self.num_local_kv_heads * self.head_dim, bias=False)
 
         # 输出投影层（按特征维度切分），将多头注意力的拼接结果映射回embed_dim维度
@@ -119,7 +136,17 @@ class ByteMultiHeadSelfAttention(nn.Module):
         device: torch.device,
         args: ByteModelConfig = None
     ) -> ByteKVCache:
-        """初始化适用于当前层的KV缓存"""
+        """
+        初始化适用于当前层的KV缓存
+        
+        参数:
+            batch_size: int - 批大小
+            device: torch.device - 缓存设备
+            args: ByteModelConfig - 模型配置（可选）
+            
+        返回:
+            ByteKVCache - 初始化后的KV缓存实例
+        """
         return ByteKVCache(
             num_layers    = args.cache_layers,
             num_heads     = self.num_local_kv_heads,
@@ -134,12 +161,17 @@ class ByteMultiHeadSelfAttention(nn.Module):
     def _init_weights(self, num_layers: int):
         """
         权重初始化，按照 √(2 * num_layers) 缩放。
+        参数:
+            num_layers: int - 总层数
         """
+        # 标准差 = 0.02 / sqrt(2 * num_layers)
         std = 0.02 / math.sqrt(2 * num_layers)
+
+        # 初始化Q/K/V投影权重
         for lin in (self.W_q, self.W_k, self.W_v):
             nn.init.normal_(lin.weight, mean=0.0, std=std)
 
-        # 输出层特殊初始化
+        # 输出层特殊初始化（考虑张量并行）
         nn.init.normal_(self.W_o.weight, mean=0.0, std=std * self.tp_size)
 
     def _repeat_kv(self, kv: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -177,7 +209,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
         offset: int = 0
     ) -> torch.Tensor:
         """
-        生成因果掩码(Causal Mask)
+        生成因果掩码(Causal Mask)(支持缓存偏移)
         确保位置i只能关注位置j<=i的token，防止信息泄露
 
         支持两种模式:
@@ -185,15 +217,15 @@ class ByteMultiHeadSelfAttention(nn.Module):
           2. 滑动窗口掩码 (window_size > 0 且 seq_len > window_size)
 
         参数:
-        :param seq_len: 当前序列长度(含填充token)
-        :param device: 输出张量设备(与输入数据保持一致)
-        :param dtype: 输出数据类型(通常与注意力分数类型一致)
-        :param offset: 偏移量（即已缓存的 token 数，增量推理时使用）
+            seq_len(int): 当前序列长度(含填充token)
+            device(torch.device): 输出张量设备(与输入数据保持一致)
+            dtype(torch.dtype): 输出数据类型(通常与注意力分数类型一致)
+            offset(int): 偏移量（即已缓存的 token 数，增量推理时使用）
 
-        Return:
-        mask: 形状为(1, 1, seq_len, seq_len)的掩码张量
+        返回:
+            mask(Tensor): 因果掩码 [1, 1, seq_len, total_len]（total_len = offset + seq_len）
         """
-        min_val = -1e9
+        min_val = -1e9                    # 掩码最小值（用于softmax前）
         total_len = seq_len + offset      # 序列总长度（已缓存 + 当前）
 
         # === 情况1: 使用标准因果掩码 ===
@@ -297,6 +329,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         # 如果有 offset，则在左侧补齐 offset 长度的 "全 0"（或全 min_val）区块
         if offset > 0:
+            # 创建填充块 [B, 1, 1, offset]
             if attention_mask.dtype == torch.bool:
                 pad_block = torch.ones(
                     attention_mask.shape[0], 1, 1, offset,
@@ -307,12 +340,15 @@ class ByteMultiHeadSelfAttention(nn.Module):
                     attention_mask.shape[0], 1, 1, offset,
                     dtype=attention_mask.dtype, device=device
                 )
+            # 拼接 [缓存掩码 | 当前掩码]
             attention_mask = torch.cat([pad_block, attention_mask], dim=-1)
 
         # 转换布尔掩码为加法掩码
         if attention_mask.dtype == torch.bool:
+            # 创建临时张量
             zeros = torch.zeros_like(attention_mask, dtype=dtype)
             neg_val = torch.full_like(zeros, min_val, dtype=dtype)
+            # True位置设为0，False位置设为min_val
             attention_mask = torch.where(attention_mask, zeros, neg_val)
 
         return attention_mask.to(dtype=dtype, device=device)
@@ -322,8 +358,8 @@ class ByteMultiHeadSelfAttention(nn.Module):
         合并因果掩码和 padding 掩码，返回最终用于 attention 的掩码。
 
         参数:
-        :param causal_mask: Tensor[1, 1, T, T]，下三角因果掩码
-        :param attention_mask: Tensor[B, 1, 1, T]，padding mask
+            causal_mask: Tensor[1, 1, T, T]，下三角因果掩码
+            attention_mask: Tensor[B, 1, 1, T]，padding mask
 
         返回:
             合并后的掩码: Tensor[B, 1, T, T]
@@ -346,6 +382,18 @@ class ByteMultiHeadSelfAttention(nn.Module):
         attention_mask: torch.Tensor = None,            # 可选Padding掩码，形状 [B, 1, 1, T]
         kv_cache: Optional[ByteKVCache] = None,
     ) -> torch.Tensor:
+        """
+        前向传播
+        
+        参数:
+            x: Tensor - 输入序列 [batch_size, seq_len, embed_dim]
+            attention_mask: Tensor - 注意力掩码（可选）
+            kv_cache: ByteKVCache - KV缓存（可选）
+            
+        返回:
+            output: Tensor - 注意力输出 [B, T, E]
+            meta: Dict - 缓存元信息（当使用缓存时）或 None
+        """
         # ===== 1. 张量并行输入切分 =====
         if self.tp_size > 1:
             # 特征维度切分 (embed_dim -> [embed_dim // tp_size])
@@ -366,9 +414,9 @@ class ByteMultiHeadSelfAttention(nn.Module):
         # ===== 3. QKV 投影 & 拆分 ===== 
         # 线性变换得到QKV，形状 [B, T, embed_dim]
         # [B,T,E] -> [B,T,3E] 再 chunk 也可，但这里单独调用
-        q = self.W_q(x)  # [B, T, local_heads * head_dim]
-        k = self.W_k(x)  # [B, T, local_kv_heads * head_dim]
-        v = self.W_v(x)  # [B, T, local_kv_heads * head_dim]
+        q = self.W_q(x)  # 查询投影 [B, T, local_heads * head_dim]
+        k = self.W_k(x)  # 键投影   [B, T, local_kv_heads * head_dim]
+        v = self.W_v(x)  # 值投影   [B, T, local_kv_heads * head_dim]
 
         # reshape成多头格式 [B, T, H, head_dim]
         q = q.view(batch_size, seq_len, self.num_local_heads, self.head_dim)       # [B,T,H,dh]
@@ -384,14 +432,14 @@ class ByteMultiHeadSelfAttention(nn.Module):
         v_kv = v.transpose(1,2).contiguous()  # [B, kv_H, T, D]
 
         # ===== 6. 重复k,v以匹配 =====
-        k = self._repeat_kv(k, self.num_rep)
-        v = self._repeat_kv(v, self.num_rep)
+        k = self._repeat_kv(k, self.num_rep)  # [B, T, H, D]
+        v = self._repeat_kv(v, self.num_rep)  # [B, T, H, D]
 
         # ===== 7. 转成 FlashAttention 要求的维度 ===== 
         # 调整维度为FlashAttention所需 [B, H, T, D]
-        q = q.transpose(1, 2)
-        k_cur = k.transpose(1, 2)
-        v_cur = v.transpose(1, 2)
+        q = q.transpose(1, 2)     # [B, H, T, D]
+        k_cur = k.transpose(1, 2) # [B, H, T, D]
+        v_cur = v.transpose(1, 2) # [B, H, T, D]
 
         # ===== 8. 拼接历史KV缓存值 =====
         if self.use_kvcache and kv_cache is not None:
@@ -431,18 +479,28 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         # ===== 12. 构建 Mask & Attention ===== 
         if self.use_flash:
+            # 使用FlashAttention（高效实现）
             attn_out = F.scaled_dot_product_attention(
-                q, k_full, v_full,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_dropout.p if self.training else 0.0
+                query     = q,         # [B, H, T, D]
+                key       = k_full,    # [B, H, T_total, D]
+                value     = v_full,    # [B, H, T_total, D]
+                attn_mask = attn_mask, # [B, 1, T, T_total]
+                dropout_p = self.attn_dropout.p if self.training else 0.0
             )
         else:
-            # 经典 Attention 实现
+            # 标准注意力实现
+            # 计算注意力分数 [B, H, T, T_total]
             attn_scores  = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
+            
+            # 应用掩码
             attn_scores  = attn_scores + attn_mask
+            
+            # 计算注意力权重
             attn_weights = F.softmax(attn_scores, dim=-1, dtype=compute_dtype)
             attn_weights = self.attn_dropout(attn_weights)
             attn_weights = attn_weights.to(v_full.dtype)
+            
+            # 加权求和
             attn_out     = torch.matmul(attn_weights, v_full)
 
 
@@ -456,9 +514,11 @@ class ByteMultiHeadSelfAttention(nn.Module):
         
         # ===== 14. 张量并行输出聚合 =====
         if self.tp_size > 1:
+            # 创建收集列表（每个设备一个）
             gather_list = [torch.zeros_like(attn_out_local) for _ in range(self.tp_size)]
-            # dist.all_gather 会在每个进程把所有 partition 的片段收集到 gather_list
+            # 全收集操作（跨设备） dist.all_gather 会在每个进程把所有 partition 的片段收集到 gather_list
             dist.all_gather(gather_list, attn_out_local.contiguous(), group=self.tp_group)
+            # 沿特征维度拼接 [B, T, E]
             attn_out = torch.cat(gather_list, dim=-1)  # [B, T, embed_dim]
         else:
             attn_out = attn_out_local  # already full
@@ -472,6 +532,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
             # kv_cache.append_batch expects [B, num_heads_kv_local, L_block, head_dim]
             # k_kv/v_kv 是 [B, kv_H_local, T_cur, D]
             kv_cache.append_batch(self.layer_id, k_kv, v_kv)
+            # 返回缓存元信息
             meta = {"past_len": cache_len, "new_len": cache_len + seq_len}
             return attn_out, meta
 
