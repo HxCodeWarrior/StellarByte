@@ -117,7 +117,7 @@ class ByteModel(PreTrainedModel):
 
         # 设置输出
         self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('last_loss', self.last_loss)
+        self.OUT.__setitem__('loss', self.last_loss)
 
         return self.OUT
     
