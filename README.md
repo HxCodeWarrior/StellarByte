@@ -1541,8 +1541,10 @@ embed_dim_per_partition: 768 (<class 'int'>)
 ### TODO
 1. 尝试进行模型训练，并寻找BUG
 2. 按照Google CodeLab风格改进代码并完善文档。
+3. 优化MLP层，尝试加入融合推理
 
 </details>
+
 ---
 
 ## 🤝 贡献指南
