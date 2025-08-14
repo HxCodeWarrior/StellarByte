@@ -5,14 +5,14 @@ from typing import Optional
 
 try:
     from .config           import ByteModelConfig
-    # from .utils.KVCache    import KVCache
+    from .utils.KVCache    import ByteKVCache
     from .utils.DropPath   import DropPath
     from .RMSNorm          import ByteRMSNorm
     from .Attention        import ByteMultiHeadSelfAttention
     from .MLP              import ByteMLP
 except:
     from config           import ByteModelConfig
-    # from utils.KVCache    import KVCache
+    from utils.KVCache    import ByteKVCache
     from utils.DropPath   import DropPath
     from RMSNorm          import ByteRMSNorm
     from Attention        import ByteMultiHeadSelfAttention
@@ -79,7 +79,8 @@ class ByteDecoderLayer(nn.Module):
     def forward(
         self, 
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[ByteKVCache] = None
     ) -> torch.Tensor:
         """
         x: [B, T, D]
@@ -87,10 +88,10 @@ class ByteDecoderLayer(nn.Module):
         """
         if self.parallel_residual:
             # -------- Parallel Residual (PaLM / GPT‑NeoX 风格) ----------
-            attn_norm_x = self.norm_attn(x)
-            ffn_norm_x  = self.norm_ffn(x)
-            attn_out = self.self_attn(attn_norm_x, attention_mask)
-            ffn_out  = self.mlp(ffn_norm_x)
+            attn_norm_x    = self.norm_attn(x)
+            ffn_norm_x     = self.norm_ffn(x)
+            attn_out, meta = self.self_attn(attn_norm_x, attention_mask, kv_cache)
+            ffn_out        = self.mlp(ffn_norm_x)
             out = x + self.drop_path(
                 self.ls_attn * attn_out * self.resid_scale
                 + self.ls_mlp  * ffn_out  * self.resid_scale
@@ -99,7 +100,7 @@ class ByteDecoderLayer(nn.Module):
         else:
             # ------------------- 顺序 Residual -------------------------
             # 1) Self‑Attention
-            attn_out = self.self_attn(self.norm_attn(x), attention_mask)
+            attn_out, meta = self.self_attn(self.norm_attn(x), attention_mask, kv_cache)
             x = x + self.drop_path(self.ls_attn * attn_out * self.resid_scale)
 
             # 2) Feed‑Forward
