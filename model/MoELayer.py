@@ -1,162 +1,178 @@
+"""
+DeepSpeed-MoE 风格分布式 Mixture-of-Experts 层
+特性：
+  - top-k routing 完全向量化
+  - 使用 all_to_all 进行分布式 token 交换
+  - 支持容量限制和负载均衡 loss
+  - 单卡和多卡兼容
+"""
+
+from typing import Optional, Tuple
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict
+import torch.distributed as dist
 
-try:
-    from .MoERouter import ByteContextAwareRouter
-    from .RMSNorm import ByteRMSNorm
-    from .MLP import ByteMLP
-except ImportError:
-    from MoERouter import ByteContextAwareRouter
-    from RMSNorm import ByteRMSNorm
-    from MLP import ByteMLP
-
-
-class ByteMoELayer(nn.Module):
-    """
-    基础的工业级 MoE Layer，参考 DeepSpeed-MoE 风格实现。
-    支持多专家动态路由、负载均衡、上下文增强，暂不考虑分布式通信，预留接口。
-
-    Args:
-        hidden_size (int): 输入维度
-        ffn_hidden_size (int): 专家FFN隐层维度
-        num_experts (int): 专家数量
-        k (int): 每个token路由到的专家数
-        dropout (float): dropout概率
-        aux_loss_coef (float): 负载均衡loss系数
-        capacity_factor (float): 专家容量因子
-    """
-    def __init__(self,
-                 hidden_size: int,
-                 ffn_hidden_size: int,
-                 num_experts: int,
-                 k: int = 1,
-                 dropout: float = 0.1,
-                 aux_loss_coef: float = 0.01,
-                 capacity_factor: float = 1.25,
-                 multiple_of: int = 256):
+class ExpertFFN(nn.Module):
+    """单个专家 FFN 层"""
+    def __init__(self, d_model: int, d_ff: int, activation: str = "gelu") -> None:
         super().__init__()
+        # 输入到隐藏层线性变换
+        self.fc1 = nn.Linear(d_model, d_ff)
+        # 隐藏层到输出线性变换
+        self.fc2 = nn.Linear(d_ff, d_model)
+        # 激活函数选择
+        if activation not in ("gelu", "relu", "swish"):
+            raise ValueError("不支持的激活函数")
+        self.activation = activation
 
-        self.hidden_size = hidden_size
-        self.ffn_hidden_size = ffn_hidden_size
-        self.num_experts = num_experts
-        self.k = k
-        self.capacity_factor = capacity_factor
-        self.aux_loss_coef = aux_loss_coef
-        self.multiple_of = multiple_of
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 前向计算
+        x = self.fc1(x)
+        # 激活函数
+        if self.activation == "gelu":
+            x = F.gelu(x)
+        elif self.activation == "swish":
+            x = x * torch.sigmoid(x)
+        else:
+            x = F.relu(x)
+        # 输出线性变换
+        return self.fc2(x)
 
-        # 输入归一化层，应用RMSNorm优化输入特征
-        self.input_norm = ByteRMSNorm(hidden_size)
 
-        # 初始化路由器（上下文感知）
-        self.router = ByteContextAwareRouter(
-            hidden_size=hidden_size,
-            num_experts=num_experts,
-            k=k,
-            aux_loss_coef=aux_loss_coef,
-            capacity_factor=capacity_factor,
-            context_dim=64,
-        )
+class MoELayerDistributedOptimized(nn.Module):
+    """分布式 MoE 层"""
+    def __init__(self, d_model: int, d_ff: int, n_experts: int = 32, k: int = 1,
+                 capacity_factor: float = 1.25, dropout: float = 0.0, activation: str = "gelu",
+                 world_size: int = 1, rank: int = 0) -> None:
+        super().__init__()
+        # 只支持 top-1 或 top-2 路由
+        assert k in (1, 2), "只支持 top-1 或 top-2"
+        self.d_model = d_model              # token 表示维度
+        self.d_ff = d_ff                    # 专家隐藏层维度
+        self.n_experts = n_experts          # 专家总数
+        self.k = k                          # top-k 路由数量
+        self.capacity_factor = capacity_factor  # 容量因子
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()  # dropout 层
+        self.world_size = world_size        # 分布式总 GPU 数
+        self.rank = rank                    # 当前 GPU rank
 
-        # 初始化专家组（共享参数结构）
-        self.experts = nn.ModuleList([
-            ByteMLP(
-                dim=hidden_size, 
-                hidden_dim=ffn_hidden_size, 
-                multiple_of=multiple_of,
-                dropout=dropout,
-            )
-            for _ in range(num_experts)
-        ])
+        # 每个 GPU 的本地专家数量
+        self.n_experts_per_rank = n_experts // world_size
+        assert n_experts % world_size == 0, "n_experts 必须能整除 world_size"
 
-        self.dropout = nn.Dropout(dropout)
+        # gating 网络，用于计算每个 token 对各个专家的权重
+        self.w_gate = nn.Linear(d_model, n_experts, bias=False)
+        # 本地专家列表
+        self.experts = nn.ModuleList([ExpertFFN(d_model, d_ff, activation)
+                                      for _ in range(self.n_experts_per_rank)])
 
-    def forward(self,
-                x: torch.Tensor,
-                positions: Optional[torch.Tensor] = None,
-                prev_hidden: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: 输入张量 [B, S, H]
-            positions: 位置索引 [B, S]
-            prev_hidden: 上一隐藏状态 [B, H]
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        B, T, D = x.shape
+        # 将输入 reshape 为二维 [S, D]，方便后续处理
+        tokens = x.view(-1, D)
+        S = tokens.size(0)  # 总 token 数
 
-        Returns:
-            output: MoE输出 [B, S, H]
-            aux_loss: 负载均衡辅助损失
-        """
-        B, S, H = x.size()
-        N = B * S
-        # 输入先做RMSNorm归一化
-        x_normed = self.input_norm(x)
-        x_flat = x.view(N, H)
+        # ---------- 1) top-k gating ----------
+        logits = self.w_gate(tokens)           # [S, n_experts] 计算每个 token 对每个专家的分数
+        probs = F.softmax(logits, dim=-1)     # 概率化
+        topk_vals, topk_idx = torch.topk(probs, self.k, dim=-1)  # 每个 token 选择 top-k 专家
 
-        # === 路由阶段 ===
-        dispatch_info, aux_loss, next_context = self.router(x_normed, positions, prev_hidden)
-        expert_indices = dispatch_info["expert_indices"]  # [N, k]
-        expert_weights = dispatch_info["expert_weights"]  # [N, k]
-        buffer_positions = dispatch_info["buffer_positions"]  # [N, k]
-        assigned_mask = dispatch_info["assigned_mask"]  # [N, k]
-        capacity = dispatch_info["capacity"]
+        # ---------- 2) 负载均衡 loss ----------
+        # importance 表示每个专家被选中的概率和
+        importance = probs.sum(dim=0)
+        # topk_onehot 用于统计每个专家被选中 token 的数量
+        topk_onehot = torch.zeros(S, self.n_experts, device=x.device)
+        topk_onehot.scatter_(1, topk_idx, 1.0)
+        load = topk_onehot.sum(dim=0)
+        # 计算负载均衡 loss
+        load_balance_loss = (torch.mean(importance * load) * (self.n_experts ** 2)) / (S * S) if self.training else None
 
-        # === 构建专家输入缓存 ===
-        expert_inputs = [
-            torch.zeros(capacity, H, device=x.device)
-            for _ in range(self.num_experts)
-        ]
-        input_mask = torch.zeros(self.num_experts, capacity, dtype=torch.bool, device=x.device)
-        token_outputs = torch.zeros(N, H, device=x.device)
+        # ---------- 3) 计算容量 ----------
+        capacity = int(math.ceil((S / self.n_experts) * self.capacity_factor))  # 每个专家容量
 
-        for i in range(self.k):
-            tok_mask = assigned_mask[:, i]
-            tok_idx = tok_mask.nonzero(as_tuple=False).squeeze(-1)
-            if tok_idx.numel() == 0:
-                continue
-            expert_ids = expert_indices[tok_idx, i]  # [T]
-            slot_ids = buffer_positions[tok_idx, i]  # [T]
-            weights = expert_weights[tok_idx, i].unsqueeze(1)  # [T, 1]
-            input_vals = x_flat[tok_idx] * weights  # [T, H]
+        # ---------- 4) flatten top-k routing ----------
+        expert_idx_flat = topk_idx.flatten()       # 展平为一维 [S*k]
+        gate_vals_flat = topk_vals.flatten()      # 展平对应权重 [S*k]
+        token_idx_flat = torch.arange(S, device=x.device).unsqueeze(1).repeat(1, self.k).flatten()  # token 索引
 
-            for e in range(self.num_experts):
-                e_mask = (expert_ids == e)
-                if e_mask.any():
-                    e_slot = slot_ids[e_mask]
-                    e_input = input_vals[e_mask]
-                    expert_inputs[e][e_slot] = e_input
-                    input_mask[e][e_slot] = True
+        # ---------- 5) 分布式路由 ----------
+        # 计算每个 token 属于哪个 GPU 的专家
+        expert_rank = expert_idx_flat // self.n_experts_per_rank
+        local_mask = expert_rank == self.rank   # 当前 GPU 的 token 掩码
+        local_expert_idx = expert_idx_flat[local_mask] - self.rank * self.n_experts_per_rank  # 本地专家索引
+        local_token_idx = token_idx_flat[local_mask]   # 对应 token 索引
+        local_gate_vals = gate_vals_flat[local_mask]   # 对应 gate 权重
 
-        # === 专家前向计算 ===
-        expert_outputs = []
+        # ---------- 6) 向量化容量控制 ----------
+        # 按本地专家排序，便于后续位置计算
+        sorted_idx = torch.argsort(local_expert_idx)
+        local_expert_idx = local_expert_idx[sorted_idx]
+        local_token_idx = local_token_idx[sorted_idx]
+        local_gate_vals = local_gate_vals[sorted_idx]
+
+        # one-hot 编码每个 token 属于的本地专家
+        one_hot = F.one_hot(local_expert_idx, num_classes=self.n_experts_per_rank).float()  # [N_local, n_experts_local]
+        # 累加计算每个 token 在专家 buffer 中的位置
+        positions = one_hot.cumsum(dim=0).argmax(dim=1) - 1  # [N_local]
+        # 容量上限
+        positions = positions.clamp(max=capacity-1)
+
+        # ---------- 7) 构建专家输入 buffer ----------
+        expert_input = torch.zeros(self.n_experts_per_rank, capacity, D, device=x.device, dtype=tokens.dtype)
+        # 将 token 放入对应专家的 buffer
+        expert_input.index_put_((local_expert_idx, positions), tokens[local_token_idx], accumulate=False)
+
+        # ---------- 8) 专家前向 ----------
+        expert_output = torch.zeros_like(expert_input)
         for i, expert in enumerate(self.experts):
-            valid_idx = input_mask[i].nonzero(as_tuple=False).squeeze(-1)
-            if valid_idx.numel() == 0:
-                expert_outputs.append(torch.zeros_like(expert_inputs[i]))
-            else:
-                out = expert(expert_inputs[i][valid_idx])
-                full_out = torch.zeros_like(expert_inputs[i])
-                full_out[valid_idx] = out
-                expert_outputs.append(full_out)
+            expert_output[i] = expert(expert_input[i])  # 每个专家独立计算输出
 
-        # === 汇聚专家输出 ===
-        for i in range(self.k):
-            tok_mask = assigned_mask[:, i]
-            tok_idx = tok_mask.nonzero(as_tuple=False).squeeze(-1)
-            if tok_idx.numel() == 0:
-                continue
-            expert_ids = expert_indices[tok_idx, i]
-            slot_ids = buffer_positions[tok_idx, i]
-            for j, idx in enumerate(tok_idx):
-                expert_out = expert_outputs[expert_ids[j]][slot_ids[j]]
-                token_outputs[idx] += expert_out
+        # ---------- 9) all-to-all 分布式通信 ----------
+        # 目标：将每个 GPU 上的本地专家输出，按专家所在 rank 分发到对应 GPU
+        # 输入：expert_output -> [n_experts_per_rank, capacity, D]
+        # 输出：expert_output_full -> [n_experts, capacity, D]
+        
+        # 获取本地专家数量和特征维度
+        n_local_experts, capacity, D = expert_output.shape
+        
+        # 1. 将本地专家数据按世界大小切分，每份对应一个目标 GPU
+        #    chunk 后每个 chunk 是 [n_local_experts_per_dest, capacity, D]
+        n_chunk = self.world_size
+        assert n_local_experts % n_chunk == 0, "本地专家数必须能被 world_size 整除"
+        split_experts = expert_output.chunk(n_chunk, dim=0)  # list of tensors
+        
+        # 2. flatten 为二维 [n_experts_per_chunk * capacity, D]，便于 all_to_all_single 传输
+        send_tensors = [t.contiguous().view(-1, D) for t in split_experts]
+        send_tensor_flat = torch.cat(send_tensors, dim=0)
+        
+        # 3. 计算发送/接收量，每个 GPU 接收的 token 数量
+        tokens_per_gpu = send_tensor_flat.shape[0] // self.world_size
+        recv_tensor_flat = torch.zeros(tokens_per_gpu * self.world_size, D, device=expert_output.device, dtype=expert_output.dtype)
+        
+        # 4. 调用 all_to_all_single 进行通信
+        #    send_tensor_flat -> 所有 GPU 按顺序发送
+        #    recv_tensor_flat -> 接收来自所有 GPU 的数据
+        dist.all_to_all_single(recv_tensor_flat, send_tensor_flat)
+        
+        # 5. reshape 回三维 [n_experts, capacity, D]
+        #    total_experts = n_experts_per_rank * world_size
+        total_experts = self.n_experts_per_rank * self.world_size
+        expert_output_full = recv_tensor_flat.view(total_experts, capacity, D)
 
-        out = self.dropout(token_outputs.view(B, S, H))
-        return out, aux_loss
+        # ---------- 10) 合并回原 token ----------
+        combined = torch.zeros(S, D, device=x.device, dtype=tokens.dtype)
+        weight_sums = torch.zeros(S, device=x.device, dtype=tokens.dtype)
+        # 将专家输出按 gate 权重累加到对应 token
+        combined.index_add_(0, local_token_idx, expert_output_full[local_expert_idx, positions] * local_gate_vals)
+        weight_sums.index_add_(0, local_token_idx, local_gate_vals)
+        # 对非零权重的 token 做归一化
+        nonzero = weight_sums > 0
+        combined[nonzero] = combined[nonzero] / weight_sums[nonzero].unsqueeze(1)
 
-if __name__ == "__main__":
-    B, S, H = 2, 4, 16
-    x = torch.randn(B, S, H)
-    model = ByteMoELayer(hidden_size=H, ffn_hidden_size=H*4, num_experts=4, k=4)
-    out, aux_loss = model(x)
-    print("输出形状:", out.shape) # [batch_size, seq_len, hidden_size]
-    print("辅助损失:", aux_loss)
+        # reshape 回原始 [B, T, D] 形状
+        y = combined.view(B, T, D)
+        y = self.dropout(y)
+
+        return y, load_balance_loss
