@@ -20,7 +20,7 @@ StellarByte 是一个基于 Transformer 架构的高性能语言模型实现，�
 
 - 🚀 **高性能实现**：集成 FlashAttention、KV 缓存等优化技术
 - 🧩 **模块化设计**：各组件可独立使用或组合
-- 🔄 **XPos 旋转位置编码**：改进的 RoPE 位置编码，提高长序列建模能力
+- 🔄 **Dynamic-RoPE 旋转位置编码**：改进的 RoPE 位置编码，提高长序列建模能力
 - 🛠️ **丰富的优化技术**：
   - ⚙️ DeepNorm 归一化策略
   - 🔍 LayerScale 初始化技术
@@ -74,7 +74,7 @@ pip install -r requirements.txt[dev]
 
 ```python
 import torch
-from stellarbyte import ByteTransformer, ByteConfig
+from stellarbyte import ByteModel, ByteConfig
 
 # 创建配置
 config = ByteModelConfig(
@@ -86,7 +86,7 @@ config = ByteModelConfig(
 )
 
 # 初始化模型
-model = ByteTransformer(config)
+model = ByteModel(config)
 
 # 准备输入
 inputs = torch.randint(0, 32000, (1, 512))
@@ -97,7 +97,7 @@ outputs = model(inputs)
 
 ## 📋 使用示例
 
-### 从 HuggingFace 加载预训练模型
+### 从 HuggingFace 加载预训练模型(暂未实现)
 
 ```python
 from stellarbyte import ByteTransformer
@@ -115,7 +115,7 @@ outputs = model.generate(inputs.input_ids, max_length=100)
 print(tokenizer.decode(outputs[0]))
 ```
 
-### 使用 LoRA 进行参数高效微调
+### 使用 LoRA 进行参数高效微调(暂未时间)
 
 ```python
 from stellarbyte import ByteTransformer, LoRAConfig
@@ -143,57 +143,97 @@ model = apply_lora_to_model(model, lora_config)
 ```
 StellarByte/
 |   .gitignore
+|   CONTRIBUTING.md
 |   datasets.py
+|   INSTALL.md
 |   LICENSE
 |   model_pretrain.py
 |   model_stf_train.py
 |   README.md
 |   requirements.txt
+|   setup.py
+|   tokenizer_pretrain.py
+|
++---.pytest_cache
+|   |   .gitignore
+|   |   CACHEDIR.TAG
+|   |   README.md
+|   |
+|   \---v
+|       \---cache
+|               lastfailed
+|               nodeids
+|               stepwise
 |
 +---checkpoints
 +---configs
-|       pretrain_config.yaml
+|       model_pretrain.yaml
 |
 +---datasets
 |   |   data_preprocessor.py
-|   |   pretrain_hq.jsonl
+|   |   train.jsonl
+|   |   eval.jsonl
 |   |
-|   \---test
-|           train.jsonl
-|           val.jsonl
+|   +---test
+|   |       test_eval.jsonl
+|   |       test_train.jsonl
+|   |
+|   \---tokenizers
+|           code.jsonl
+|           emoji.jsonl
+|           en.jsonl
+|           multi_lang.jsonl
+|           zh.jsonl
 |
 +---logs
+|
 +---model
 |   |   Attention.py
 |   |   config.py
 |   |   DecoderLayer.py
+|   |   EmbeddingLayer.py
 |   |   MLP.py
 |   |   Model.py
-|   |   MoE.py
+|   |   MoELayer.py
+|   |   MoERouter.py
 |   |   Position_Embedding.py
 |   |   RMSNorm.py
 |   |   __init__.py
 |   |
 |   +---utils
-|          DropPath.py
-|          KVCache.py
-|          LoRA.py
-|          Memory.py
-|          __init__.py
-|
+|           DropPath.py
+|           KVCache.py
+|           LoRA.py
+|           __init__.py
+|        
+|    
 +---model_info
-+---scripts
-+---test
-|   |   test_Attention.py
-|   |   test_datasets.py
-|   |   test_DeocoderLayer.py
-|   |   test_KVCache.py
-|   |   test_LoRA.py
-|   |   test_MLP.py
-|   |   test_Position_Embedding.py
-|   |   test_RMSNorm.py
+|   |   model_report_xxx.md
+|   |   model_structure.md
 |   |
-|   +---test_results
+|   \---plots
+|
++---scripts
+|       setup_env.bat
+|       setup_env.py
+|       setup_env.sh
+|
++---sources
+|   \---corpora
+|           omw-1.4.zip
+|           wordnet.zip
+|
++---test
+|       test_Attention.py
+|       test_datasets.py
+|       test_DeocoderLayer.py
+|       test_KVCache.py
+|       test_LoRA.py
+|       test_MLP.py
+|       test_MoERouter.py
+|       test_Position_Embedding.py
+|       test_RMSNorm.py
+|    
 |
 +---tokenizer
 |       special_tokens_map.json
@@ -206,6 +246,7 @@ StellarByte/
         logger.py
         model_info.py
         progressbar.py
+
 ```
 
 ## 🔜 开发计划
@@ -1597,6 +1638,25 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 </details>
 
+---
+
+<details>
+<summary>2025.8.15</summary>
+
+### DONE
+1. 移除MoERouter.py文件及其相关实现
+2. MoELayer 实现分布式优化的MoE层并支持all_to_all通信
+- 重构MoE层为分布式优化版本，支持多GPU专家并行计算
+- 使用向量化top-k路由和容量控制机制
+- 实现基于all_to_all的分布式token交换
+- 保留负载均衡loss以优化专家利用率
+
+### TODO
+1. 测试 MoELayer 并修复对应BUG
+2. 尝试使用 MoELayer 替换 MLP
+3. 优化 MoELayer
+
+</details>
 ---
 
 ## 🤝 贡献指南
