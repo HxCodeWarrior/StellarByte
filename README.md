@@ -1655,6 +1655,7 @@ embed_dim_per_partition: 768 (<class 'int'>)
 1. 测试 MoELayer 并修复对应BUG
 2. 尝试使用 MoELayer 替换 MLP
 3. 优化 MoELayer
+4. 使用流式数据集加载器替换全量数据集加载器进行模型训练，进行测试，并修复对应BUG
 
 </details>
 
