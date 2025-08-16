@@ -9,6 +9,7 @@ import math
 import random
 import numpy as np
 
+from itertools import islice
 from tqdm import tqdm
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ from utils.logger import setup_logger
 from utils.checkpoint import CheckpointManager 
 from model.Model import ByteModel
 from model.config import ByteModelConfig
-from datasets import PretrainDataset
+from datasets import PretrainDataset, StreamingPretrainDataset
 
 # nltk需要下载必要资源
 # 使用环境变量标记是否已下载，避免重复下载
@@ -582,7 +583,13 @@ def train_epoch(
     # ===== 1. 训练准备 =====
     model.train()               # 设置模型为训练模式（启用dropout等）
     train_config       = config # 获取训练相关配置
-    iter_per_epoch     = len(train_dataloader)  # 每epoch的迭代次数
+    # 每epoch的迭代次数
+    if not config.use_streaming:
+        iter_per_epoch = len(train_dataloader) # 数据集全量加载
+        data_iter      = train_dataloader
+    else:
+        iter_per_epoch = config.steps_per_epoch # 数据集流式加载
+        data_iter      = islice(train_dataloader, iter_per_epoch)
     accumulation_steps = train_config.gradient_accumulation_steps  # 梯度累积步数
     max_grad_norm      = train_config.max_grad_norm                # 梯度裁剪阈值
     # === 初始化损失与token计数统计变量 ===
@@ -593,13 +600,13 @@ def train_epoch(
     acc_token_count = 0         # 当前梯度累积周期内有效token数
     
     # 从配置获取日志间隔（添加默认值）
-    log_interval = getattr(train_config, 'log_interval', 10)
+    log_interval  = getattr(train_config, 'log_interval', 10)
     save_interval = getattr(train_config, 'save_interval', 1000)
     eval_interval = getattr(train_config, 'eval_steps', 2000)
 
     # 创建进度条（显示epoch信息，以batch为单位）
     pbar = tqdm(
-        train_dataloader, 
+        data_iter, 
         total=iter_per_epoch, 
         desc=f"Epoch {epoch+1}/{train_config.train_epochs}", 
         unit="batch"
@@ -873,24 +880,39 @@ def train(config_path: str):
     logger.info(f"模型总参数: {total_params:,} | 可训练参数: {trainable_params:,}")
     
     # 初始化数据集
-    train_dataset = PretrainDataset(
-        data_path=config.train_data,
-        tokenizer=tokenizer,
-        max_length=config.max_seq_len
-    )
-    
-    eval_dataset = PretrainDataset(
-        data_path=config.eval_data,
-        tokenizer=tokenizer,
-        max_length=config.max_seq_len
-    ) if config.eval_data else None
+    if not config.use_streaming:
+        # 数据集加载方式1：全量加载
+        train_dataset = PretrainDataset(
+            data_path=config.train_data,
+            tokenizer=tokenizer,
+            max_length=config.max_seq_len
+        )
+        eval_dataset = PretrainDataset(
+            data_path=config.eval_data,
+            tokenizer=tokenizer,
+            max_length=config.max_seq_len
+        ) if config.eval_data else None
+    else:
+        # 数据集加载方式2：流式加载
+        train_dataset = StreamingPretrainDataset(
+            data_path  = config.train_data,
+            tokenizer  = tokenizer,
+            max_length = config.max_seq_len
+        )
+
+        eval_dataset = StreamingPretrainDataset(
+            data_path  = config.eval_data,
+            tokenizer  = tokenizer,
+            max_length = config.max_seq_len
+        ) if config.eval_data else None
     
     # 创建数据加载器
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        pin_memory=True
+        dataset     = train_dataset,
+        batch_size  = config.batch_size,
+        num_workers = config.num_workers,
+        pin_memory  = True,
+        drop_last   = True,
     )
     
     # ==================== 4. 训练基础设施初始化 ====================
@@ -906,7 +928,12 @@ def train(config_path: str):
     scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
     
     # 学习率调度器
-    total_steps  = len(train_loader) * config.train_epochs
+    if not config.use_streaming:
+        # 全量加载 total_steps 
+        total_steps  = len(train_loader) * config.train_epochs
+    else:
+        # 流式加载 total_steps
+        total_steps = config.steps_per_epoch * config.train_epochs
     lr_scheduler = lambda step: cosine_annealing_lr(
         current_step  = step,
         total_steps   = total_steps,
