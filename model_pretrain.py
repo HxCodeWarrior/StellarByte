@@ -387,7 +387,7 @@ def init_model(config, device):
 
     return model, tokenizer
 
-def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("cpu")):
+def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("cpu"), config=None):
     """
     工业级的LLM预训练模型评估函数。
 
@@ -397,6 +397,7 @@ def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("
         tokenizer (AutoTokenizer): 分词器。
         batch_size (int): 每次评估的批次大小。
         device (torch.device): 执行评估的设备（默认使用cpu）。
+        config (ByteModelConfig, optional): 模型配置对象。仅用于模型训练。
     Returns:
         type: dict
         {
@@ -432,16 +433,21 @@ def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("
     rougeL_scores = []
     meteor_scores = []
 
-    step = 0  # 当前评估步数
+    if not config.use_streaming:
+        if config.eval_steps is None:
+            raise ValueError("Streaming dataset must set eval_steps for evaluation.")
+        data_iter = islice(eval_dataloader, config.eval_steps)
+        total_batches = config.eval_steps
+    else:
+        data_iter = eval_dataloader
+        total_batches = len(eval_dataloader)
 
     # 禁用梯度计算，加快评估速度、减少显存占用
     with torch.no_grad():
         # 使用tqdm显示进度条
-        pbar = tqdm(eval_dataloader, desc="Evaluating", unit="batch")
+        pbar = tqdm(data_iter, total=total_batches, desc="Evaluating", unit="batch")
 
         for batch in pbar:
-            step += 1
-
             # 将batch中的输入转移到指定设备
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
