@@ -77,11 +77,17 @@ model:
 training:
   # 基础参数
   train_epochs: 10               # 训练总轮次
-  batch_size: 32                 # 每批数据量
   learning_rate: 3e-4            # 初始学习率
   min_lr_ratio: 0.1              # 最小学习率比例
   weight_decay: 0.1              # 权重衰减系数
-  
+
+  # 数据集加载器
+  use_streaming: False           # 是否使用数据流式训练
+  batch_size: 32                 # 单卡每批数据量
+  steps_per_epoch: 100           # 每个Epoch的步数(数据集流式加载必须配置)【计算：steps_per_epoch = num_total_data / (battch_size * gradient_accumulation_steps)】
+  fields:                        # 数据集处理字段名列表(可选)【默认为['input', 'output']】
+  template:                      # 数据集格式模板名称(可选)【默认为['input', 'output']】
+
   # 优化器
   beta1: 0.9                     # AdamW beta1
   beta2: 0.98                    # AdamW beta2
@@ -91,7 +97,7 @@ training:
   plateau_ratio: 0.01            # 学习率平台期比例
   
   # 梯度处理
-  gradient_accumulation_steps: 4 # 梯度累积步数
+  gradient_accumulation_steps: 4 # 梯度累积步数 【effective_batch_size = batch_size * gradient_accumulation_steps * world_size】
   max_grad_norm: 1.0             # 梯度裁剪阈值
   
   # 资源管理
