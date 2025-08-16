@@ -8,6 +8,9 @@ from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 from typing import List, Optional, Union
 
+from torch.utils.data import get_worker_info
+import torch.distributed as dist
+
 class BaseDataset(Dataset):
     """
     通用数据集基类：提供序列填充与损失掩码生成逻辑
@@ -64,6 +67,24 @@ class BaseDataset(Dataset):
             torch.tensor(attention_mask, dtype=torch.bool),
             torch.tensor(loss_mask, dtype=torch.bool)
         )
+
+    def _format_sample(self, sample: dict) -> str:
+        """
+        将多个字段合并为单个文本
+        """
+        # 字段缺失降级为空字符串
+        field_values = {k: str(sample.get(k, "")).strip() for k in self.fields}
+
+        if self.template:
+            try:
+                text = self.template.format(**field_values)
+            except KeyError as e:
+                raise ValueError(f"Template字段缺失：{e}")
+        else:
+            # 默认拼接方式：input: xxx\noutput: xxx
+            text = "\n".join([f"{k}: {v}" for k, v in field_values.items()])
+        
+        return text.strip()
 
 
 class PretrainDataset(BaseDataset):
@@ -135,24 +156,6 @@ class PretrainDataset(BaseDataset):
             return df.to_dict(orient="records")
         else:
             raise ValueError(f"Unsupported format: {ext}")
-
-    def _format_sample(self, sample: dict) -> str:
-        """
-        将多个字段合并为单个文本
-        """
-        # 字段缺失降级为空字符串
-        field_values = {k: str(sample.get(k, "")).strip() for k in self.fields}
-
-        if self.template:
-            try:
-                text = self.template.format(**field_values)
-            except KeyError as e:
-                raise ValueError(f"Template字段缺失：{e}")
-        else:
-            # 默认拼接方式：input: xxx\noutput: xxx
-            text = "\n".join([f"{k}: {v}" for k, v in field_values.items()])
-        
-        return text.strip()
 
     def __len__(self) -> int:
         return len(self.data)
@@ -279,39 +282,52 @@ class StreamingPretrainDataset(BaseDataset, IterableDataset):
         else:
             raise ValueError(f"Unsupported format: {ext}")
 
-        for sample in data_iter:
-            text = self._format_sample(sample)
-            if not text:
-                text = "[EMPTY]"
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info else 1
+        worker_id   = worker_info.id if worker_info else 0
 
-            reserve_len = int(self.add_bos) + int(self.add_eos)
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank       = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
-            input_ids = self.tokenizer.encode(
-                text,
-                add_special_tokens=False,
-                max_length=self.max_length - reserve_len,
-                truncation=True
-            )
-            if self.add_bos:
-                input_ids = [self.bos_token_id] + input_ids
-            if self.add_eos:
-                input_ids = input_ids + [self.eos_token_id]
+        parallel = num_workers * world_size
+        shard_id = rank * num_workers + worker_id
 
-            input_ids_x = input_ids[:-1]
-            input_ids_y = input_ids[1:]
+        for i, sample in enumerate(data_iter):
+            if i % parallel != shard_id:
+                continue
+            yield self._encode_one(sample)
+    
+    def _encode_one(self, sample):
+        text = self._format_sample(sample)
+        if not text:
+            text = "[EMPTY]"
 
-            input_tensor, attention_mask, _ = self._pad_and_mask(input_ids_x)
-            label_tensor, _, loss_mask = self._pad_and_mask(input_ids_y)
+        reserve_len = int(self.add_bos) + int(self.add_eos)
 
-            label_tensor = label_tensor.clone()
-            label_tensor[~loss_mask] = -100
+        input_ids = self.tokenizer.encode(
+            text, add_special_tokens=False,
+            max_length=self.max_length - reserve_len, truncation=True
+        )
+        if self.add_bos:
+            input_ids = [self.bos_token_id] + input_ids
+        if self.add_eos:
+            input_ids = input_ids + [self.eos_token_id]
 
-            yield {
-                "input_ids"     : input_tensor,
-                "labels"        : label_tensor,
-                "attention_mask": attention_mask,
-                "loss_mask"     : loss_mask,
-            }
+        input_ids_x = input_ids[:-1]
+        input_ids_y = input_ids[1:]
+
+        input_tensor, attention_mask, _ = self._pad_and_mask(input_ids_x)
+        label_tensor,  _,     loss_mask = self._pad_and_mask(input_ids_y)
+
+        label_tensor = label_tensor.clone()
+        label_tensor[~loss_mask] = -100
+
+        return {
+            "input_ids": input_tensor,
+            "labels": label_tensor,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+        }
 
 
 
@@ -572,8 +588,21 @@ class StreamingSFTDataset(BaseDataset, IterableDataset):
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(f"File not found: {self.data_path}")
 
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info else 1
+        worker_id   = worker_info.id if worker_info else 0
+
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank       = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+        parallel = num_workers * world_size
+        shard_id = rank * num_workers + worker_id
+
         with open(self.data_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for i, line in enumerate(f):
+                if i % parallel != shard_id:
+                    continue
+
                 line = line.strip()
                 if not line:
                     continue
@@ -582,47 +611,47 @@ class StreamingSFTDataset(BaseDataset, IterableDataset):
                 except Exception as e:
                     logging.warning(f"Failed to parse json line: {e}, skipping line")
                     continue
+                self._encoder_one(sample)
+                
+    
+    def _encode_one(self, sample):
+        text = self.tokenizer.apply_chat_template(
+            sample,
+            tokenize=False,
+            add_generation_prompt=False
+        ).strip()
 
-                # 你可能需要根据实际SFT数据格式调整文本生成逻辑
-                # 这里默认假设 sample 就是 dict，直接传给 tokenizer.apply_chat_template
-                text = self.tokenizer.apply_chat_template(
-                    sample,
-                    tokenize=False,
-                    add_generation_prompt=False
-                ).strip()
-                if not text:
-                    text = "[EMPTY]"
+        if not text:
+            text = "[EMPTY]"
 
-                token_ids = self.tokenizer.encode(
-                    text,
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=self.max_length
-                )
+        token_ids = self.tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_length
+        )
 
-                sft_mask = self._generate_loss_mask(token_ids)
-
-                padded_ids, attention_mask, pad_mask = self._pad_and_mask(token_ids)
-
-                sft_mask += [False] * (self.max_length - len(sft_mask))
-                sft_mask = torch.tensor(sft_mask, dtype=torch.bool)
-
-                final_mask = pad_mask & sft_mask
-
-                input_ids = padded_ids[:-1]
-                labels = padded_ids[1:]
-                attention_mask = attention_mask[:-1]
-                loss_mask = final_mask[1:]
-
-                labels = labels.clone()
-                labels[~loss_mask] = -100
-
-                yield {
-                    "input_ids": input_ids,
-                    "labels": labels,
-                    "attention_mask": attention_mask,
-                    "loss_mask": loss_mask,
-                }
+        sft_mask = self._generate_loss_mask(token_ids)
+        padded_ids, attention_mask, pad_mask = self._pad_and_mask(token_ids)
+        sft_mask += [False] * (self.max_length - len(sft_mask))
+        sft_mask = torch.tensor(sft_mask, dtype=torch.bool)
+        final_mask = pad_mask & sft_mask
+        
+        input_ids = padded_ids[:-1]
+        labels = padded_ids[1:]
+        attention_mask = attention_mask[:-1]
+        loss_mask = final_mask[1:]
+        
+        labels = labels.clone()
+        labels[~loss_mask] = -100
+        
+        yield {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+        }
+    
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
