@@ -1661,6 +1661,51 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 ---
 
+<details>
+<summary>2025.8.16</summary>
+
+### DONE
+1. model_pretrain.py 添加数据集流式加载支持
+- 为大规模数据集训练添加流式加载功能，通过配置use_streaming开关控制加载方式。当启用流式加载时，使用StreamingPretrainDataset和islice进行分批处理，避免内存不足问题并支持更大规模数据训练。同时调整了相关训练逻辑和参数计算以适应流式加载模式。
+2. configs/model_pretrain.yaml 更新模型预训练配置文件，添加流式训练相关参数
+- 添加流式训练相关配置参数，包括use_streaming、steps_per_epoch等
+- 调整batch_size参数位置至数据集加载器部分
+- 补充梯度累积步数的有效batch_size计算公式
+3. datasets 数据集加载器添加分布式训练支持并添加流式数据加载逻辑
+- 在BaseDataset中提取_format_sample方法避免代码重复
+- 为StreamingPretrainDataset和StreamingSFTDataset添加分布式训练支持
+- 将数据编码逻辑重构为_encode_one方法提高可维护性
+
+### TODO
+1. 重构MoELayer，添加流式token分发和专家并行支持，使用all_to_all通信模式，支持高效token分发和计算
+- 支持多GPU专家并行计算
+- 实现分布式top-k路由和专家负载均衡
+- 保持显存和gpu占用稳定。
+2. 重构MoELayer测试模块，并修复对应BUG。
+
+</details>
+
+---
+
+<details>
+<summary>2025.8.18</summary>
+
+### DONE
+1. ByteMoELayer 重构MoE层实现，增加专家并行支持并优化通信效率：
+- 实现双all_to_all通信模式，支持高效分布式token分发与结果聚合
+- 改进路由算法，支持top-1/top-2路由及容量裁剪
+- 增强专家模块功能，支持残差连接和LayerNorm
+- 优化负载均衡损失计算，提高专家利用率
+- 完善单卡/多卡兼容性处理
+
+### TODO
+1. 重构ByteMoELayer测试模块，并修复对应BUG
+2. 尝试应用ByteMoELayer替代MLP
+
+</detaills>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
