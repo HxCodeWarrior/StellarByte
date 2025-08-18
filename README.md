@@ -1702,7 +1702,7 @@ embed_dim_per_partition: 768 (<class 'int'>)
 1. 重构ByteMoELayer测试模块，并修复对应BUG
 2. 尝试应用ByteMoELayer替代MLP
 
-</detaills>
+</details>
 
 ---
 
