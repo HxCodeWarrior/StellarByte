@@ -112,6 +112,7 @@ class ByteMoELayer(nn.Module):
         """
         super().__init__()
         assert k in (1, 2), "仅支持 top-1/top-2 路由"
+        assert k <= n_experts, "k 必须小于等于专家数"
 
         # 保存配置参数
         self.d_model = d_model
