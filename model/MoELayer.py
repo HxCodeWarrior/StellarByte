@@ -722,3 +722,37 @@ class ByteMoELayer(nn.Module):
 
         # 应用dropout后返回结果和辅助损失
         return self.dropout(output), aux_loss
+
+if __name__ == "__main__":
+    # 单卡测试配置
+    d_model = 16
+    d_ff = 32
+    n_experts = 4
+    batch_size = 2
+    seq_len = 10
+    k = 2  # top-2路由
+    capacity_factor = 1.25
+
+    # 创建单卡MoE层
+    moe_layer = ByteMoELayer(
+        d_model=d_model,
+        d_ff=d_ff,
+        n_experts=n_experts,
+        world_size=1,
+        rank=0,
+        k=k,
+        capacity_factor=capacity_factor,
+        dropout=0.1,
+        activation="gelu"
+    )
+
+    # 创建测试输入
+    x = torch.randn(batch_size, seq_len, d_model)
+    
+    # 前向传播
+    output, aux_loss = moe_layer(x)
+    
+    # 验证输出形状
+    assert output.shape == (batch_size, seq_len, d_model), "输出形状不正确"
+    assert aux_loss.dim() == 0 and aux_loss.item() >= 0, "辅助损失应为非负标量"
+    print(f"单卡测试通过!\n输入形状: {x.shape}, \n输出形状: {output.shape}, \n辅助损失: {aux_loss.item():.4f}")
