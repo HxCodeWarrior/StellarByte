@@ -1734,6 +1734,7 @@ embed_dim_per_partition: 768 (<class 'int'>)
 ### TODO
 1. 尝试测试使用MoE混合专家系统的模型，并调试修复相关BUG
 2. 尝试优化分析该MoE混合专家系统的性能和效率
+3. 分析model.loss 与 moe_aux_loss 的关系与区别，如果可以尝试将二者融合，如果不可以尝试将moe_aux_loss进行应用
 
 </details>
 
