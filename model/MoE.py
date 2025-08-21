@@ -112,7 +112,7 @@ class ByteMoE(nn.Module):
         """
         super().__init__()
         assert k in (1, 2), "仅支持 top-1/top-2 路由"
-        assert k <= n_experts, "k 必须小于等于专家数"
+        assert k <= num_experts, "k 必须小于等于专家数"
 
         # 保存配置参数
         self.dim = dim
@@ -126,11 +126,11 @@ class ByteMoE(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # 路由器：输入 token -> 专家权重 (fp32 保证数值稳定)
-        self.w_gate = nn.Linear(dim, n_experts, bias=False)
+        self.w_gate = nn.Linear(dim, num_experts, bias=False)
 
         # 验证专家总数能被进程数整除 (保证分布式划分均匀)
-        assert n_experts % max(world_size, 1) == 0, "专家数必须能被并行组大小整除"
-        self.n_local = n_experts // max(world_size, 1)  # 当前进程持有的专家数
+        assert num_experts % max(world_size, 1) == 0, "专家数必须能被并行组大小整除"
+        self.n_local = num_experts // max(world_size, 1)  # 当前进程持有的专家数
 
         # 初始化本地专家列表 (每个 rank 上存放部分专家)
         self.experts = nn.ModuleList([
@@ -725,11 +725,11 @@ class ByteMoE(nn.Module):
 
 if __name__ == "__main__":
     # 单卡测试配置
-    dim = 16
+    dim = 128
     hidden_dim = 32
     n_experts = 4
     batch_size = 2
-    seq_len = 10
+    seq_len = 16
     k = 2  # top-2路由
     capacity_factor = 1.25
 
@@ -755,4 +755,4 @@ if __name__ == "__main__":
     # 验证输出形状
     assert output.shape == (batch_size, seq_len, dim), "输出形状不正确"
     assert aux_loss.dim() == 0 and aux_loss.item() >= 0, "辅助损失应为非负标量"
-    print(f"单卡测试通过!\n输入形状: {x.shape}, \n输出形状: {output.shape}, \n辅助损失: {aux_loss.item():.4f}")
+    print(f"单卡测试通过!\nInput shape: {x.shape}, \nOutput shape: {output.shape}, \nAux Loss: {aux_loss.item():.4f}")
