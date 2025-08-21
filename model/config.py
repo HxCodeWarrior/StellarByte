@@ -29,7 +29,14 @@ class ByteModelConfig(PretrainedConfig):
         tensor_parallel_size: int = 1,         # 张量并行大小
         tensor_parallel_group: int = 0,        # 张量并行rank
         layerscale_init : float = 1e-5,        # 层尺度初始化值
-        initializer_range: float = 0.02,      # 权重初始化范围
+        initializer_range: float = 0.02,       # 权重初始化范围
+        use_moe: bool = False,                 # 是否使用MoE
+        moe_num_experts: int = 2,              # 专家数量
+        moe_k: int = 1,                        # 每个专家选择的token数
+        moe_capacity_factor: float = 1.25,     # 专家容量因子
+        moe_loss_coefficient: float = 0.01,    # 专家损失系数
+        moe_world_size: int = 1,               # MoE并行大小
+        moe_rank: int = 0,                     # MoE并行rank
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -55,6 +62,15 @@ class ByteModelConfig(PretrainedConfig):
         # ========= Attention ==========
         self.use_flash_attention = use_flash_attention
         self.attention_window_size = attention_window_size
+        
+        # ========== MoELayer ==========
+        self.use_moe = use_moe
+        self.moe_num_experts = moe_num_experts
+        self.moe_k = moe_k
+        self.moe_capacity_factor = moe_capacity_factor
+        self.moe_loss_coefficient = moe_loss_coefficient
+        self.world_size = moe_world_size
+        self.rank = moe_rank
 
         # ======== Dynamic RoPE ========
         self.base_theta = base_theta
