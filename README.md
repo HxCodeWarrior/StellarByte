@@ -1625,16 +1625,17 @@ embed_dim_per_partition: 768 (<class 'int'>)
 2. 优化MLP层，尝试加入融合推理
 3. 测试KVCache
 4. 分析并优化显存占用
-5. 寻找并构建tokenizer训练数据集
-  - 中文语料
-  - 英文语料
-  - Emoji语料
-  - Code语料
-6. 寻找并构建模型训练数据集
-  - 文本生成
-  - 代码生成/代码理解
-  - 逻辑推理/问答/常识
-  - 多轮对话
+>5. 寻找并构建tokenizer训练数据集
+>>  - 中文语料
+>>  - 英文语料
+>>  - Emoji语料
+>>  - Code语料
+
+>6. 寻找并构建模型训练数据集
+>>  - 文本生成
+>>  - 代码生成/代码理解
+>>  - 逻辑推理/问答/常识
+>>  - 多轮对话
 
 </details>
 
@@ -1701,6 +1702,38 @@ embed_dim_per_partition: 768 (<class 'int'>)
 ### TODO
 1. 重构ByteMoELayer测试模块，并修复对应BUG
 2. 尝试应用ByteMoELayer替代MLP
+
+</details>
+
+---
+
+<details>
+<summary>2025.8.19 - 8.21</summary>
+
+### DONE
+1. MoELayer 添加路由k值不超过专家数的断言检查
+2. 添加MoELayer模块的单元测试和分布式测试
+- 添加ExpertFFN和ByteMoELayer的单元测试，包括正向传播、反向传播、异常处理等
+- 添加分布式环境下的测试用例，验证多卡场景下的正确性
+3. ByteMLP 修正门控分支的权重变量名错误,将x_gate的错误权重变量名w13更正为w1，以匹配GEGLU结构的正确实现
+4. ByteDecoderLayer 添加MoE支持并重构前馈网络逻辑
+- 引入混合专家系统(MoE)作为前馈网络的替代方案，根据配置选择使用MLP或MoE
+- 重构前馈网络相关变量命名，将ls_mlp改为ls_ffn以更准确反映功能
+- 修改前向传播逻辑以返回辅助损失，保持与原始MLP的兼容性
+- 更新测试代码以验证MoE功能
+5. ByteModel 添加MoE辅助损失计算并优化KV缓存初始化
+- 初始化MoE辅助损失属性aux_loss并确保设备一致性
+- 在decoder层处理中累加MoE辅助损失
+- 优化KV缓存初始化逻辑，考虑张量并行和分组查询注意力
+- 添加调试输出以便测试模型输出
+6. model/config.py 添加MoE相关配置参数以支持混合专家模型,添加了use_moe、moe_num_experts等MoE配置参数，用于支持模型中的混合专家层实现
+7. configs/model_pretrain.yaml 添加MoE配置参数和分布式训练参数
+- 在模型配置中添加Mixture of Experts相关参数，包括专家数量、容量因子等
+- 添加分布式训练所需的world_size和rank参数
+
+### TODO
+1. 尝试测试使用MoE混合专家系统的模型，并调试修复相关BUG
+2. 尝试优化分析该MoE混合专家系统的性能和效率
 
 </details>
 
