@@ -110,5 +110,6 @@ if __name__ == '__main__':
     output = embedding_layer(input_ids)
     
     print(f"Input_ids: {input_ids}")
+    print(f'Input_ids shape: {input_ids.shape}')
     print(f"Embedding shape: {output.shape}")  # 期望: [2, 16, 128]
     print("输出示例 (第一个样本第一个token的向量前5维):", output[0,0,:5])
