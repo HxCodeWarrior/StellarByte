@@ -80,6 +80,8 @@ class ByteModel(PreTrainedModel):
                 std = 0.02 / math.sqrt(2 * args.num_layers)
                 torch.nn.init.normal_(p, mean=0.0, std=std)
 
+        # 初始化MoE辅助损失zux_loss
+        self.aux_loss = torch.tensor(0.0, requires_grad=True)
         # 初始化最后一次向前传播的损失属性
         self.loss = None
         # Hugging Face兼容输出格式
@@ -146,21 +148,28 @@ class ByteModel(PreTrainedModel):
         # 2. Dropout
         hidden_states = self.dropout(hidden_states)
         
-        # 2. Decoder层处理
+        # 3. 确保辅助损失设备一致性
+        self.aux_loss = self.aux_loss.to(hidden_states.device)
+
+        # 4. Decoder层处理
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, aux_loss = layer(
                 hidden_states, 
                 attention_mask, 
                 kv_cache
             )
 
-        # 3. 归一化
+            # 累加MoE辅助损失
+            if aux_loss is not None:
+                self.aux_loss += aux_loss * self.args.moe_loss_coefficient
+
+        # 5. 归一化
         hidden_states = self.norm(hidden_states)
 
-        # 4. 输出投影
+        # 6. 输出投影
         logits = self.output(hidden_states)
 
-        # 5. 损失计算
+        # 7. 损失计算
         loss = None
         if labels is not None:
             # 计算交叉熵损失
@@ -170,6 +179,8 @@ class ByteModel(PreTrainedModel):
                 ignore_index=-100,                # 忽略特殊标签（如填充token）
                 reduction='mean'                  # 批内平均损失
             )
+            # 已有损失：交叉熵损失、MoE辅助损失
+            # 总损失 = 交叉熵损失
             self.loss = loss
         else:
             # 推理时，只对最后一个位置的输出进行向前传播计算
@@ -231,11 +242,17 @@ class ByteModel(PreTrainedModel):
         top_k              = max(top_k, 0)                # 确保非负  
         repetition_penalty = max(repetition_penalty, 1.0) # 确保≥1
 
+        # 计算本地KV头数（考虑张量并行和分组查询注意力）
+        head_dim = self.args.model_dim // self.args.num_attention_heads
+        # 计算本地KV头数（考虑张量并行和分组查询注意力）
+        num_kv_heads = self.args.num_kv_heads or self.args.num_attention_heads
+        num_local_kv_heads = num_kv_heads // max(1, self.args.tensor_parallel_size)
+
         # 创建并清空缓存
         kv_cache = ByteKVCache(
             num_layers  = self.args.num_layers,
-            num_heads   = self.args.num_attention_heads,
-            head_dim    = self.args.model_dim // self.args.num_attention_heads,
+            num_heads   = num_local_kv_heads,
+            head_dim    = head_dim,
             max_seq_len = max_seq_len,
             batch_size  = batch_size,
             dtype       = self.output.weight.dtype,
@@ -459,6 +476,7 @@ if __name__ == '__main__':
 
     # 将输入张量传入模型
     output = model(X, Y)
+    print(f'Output: {output}')
 
     # 自回归文本生成
     input_ids = torch.tensor([tokenizer.encode("你好呀，今天吃什么呢？")]).to(model.device)
