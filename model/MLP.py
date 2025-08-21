@@ -82,7 +82,7 @@ class ByteMLP(nn.Module):
         x = self.norm(x)
 
         # Step 2: 线性变换输出两份：值分支 + 门控分支（GEGLU结构）
-        x_gate  = self.w13(x)  # [B, T, hidden_dim]
+        x_gate  = self.w1(x)  # [B, T, hidden_dim]
         x_value = self.w3(x)   # [B, T, hidden_dim]
 
         # Step 3: 对值分支使用 SiLU 激活函数（替代 ReLU，平滑且性能好）
