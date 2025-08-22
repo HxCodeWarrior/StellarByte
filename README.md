@@ -1740,6 +1740,23 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 ---
 
+<details>
+<summary>2025.8.22</summary>
+
+### MileStone
+**构建一个基于Transformer的混合专家模型，支持多GPU训练和推理**
+
+### DONE
+1. ByteModel 修复模型训练时未包含MoE辅助损失的问题，在训练阶段，总损失计算现在包含交叉熵损失和MoE辅助损失，以正确反映模型训练目标
+
+### TODO
+1. 修复获取模型信息脚本中的错误，确保能正确分析获取模型信息
+2. 优化tokenizer训练脚本，提高tokenizer的质量和性能
+
+</details>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
