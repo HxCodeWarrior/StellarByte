@@ -180,8 +180,8 @@ class ByteModel(PreTrainedModel):
                 reduction='mean'                  # 批内平均损失
             )
             # 已有损失：交叉熵损失、MoE辅助损失
-            # 总损失 = 交叉熵损失
-            self.loss = loss
+            # 总损失 = 交叉熵损失 + MoE辅助损失
+            self.loss = loss + self.aux_loss
         else:
             # 推理时，只对最后一个位置的输出进行向前传播计算
             logits = self.output(hidden_states[:, [-1], :]) # 保留最后一个token的输出
