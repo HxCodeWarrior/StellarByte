@@ -1841,6 +1841,8 @@ embed_dim_per_partition: 768 (<class 'int'>)
 ```
 - 根据tokenizer评估报告，升级优化tokenizer的文本归一化和分词逻辑，提升tokenizer的性能与质量
 
+</details>
+
 ---
 
 ## 🤝 贡献指南
