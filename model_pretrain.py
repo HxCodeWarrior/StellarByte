@@ -31,7 +31,7 @@ from utils.logger import setup_logger
 from utils.checkpoint import CheckpointManager 
 from model.Model import ByteModel
 from model.config import ByteModelConfig
-from datasets import PretrainDataset, StreamingPretrainDataset
+from datasets.datasets import PretrainDataset, StreamingPretrainDataset
 
 # nltk需要下载必要资源
 # 使用环境变量标记是否已下载，避免重复下载
