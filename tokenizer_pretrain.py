@@ -79,25 +79,34 @@ class MemoryAwareIterator:
 def read_data_from_json(
     file_path: str, 
     text_fields: Optional[List[str]] = None,
-    fallback_field: str = "text"
+    sampling_rate: float = 1.0,
+    max_samples: Optional[int] = None
 ) -> Generator[str, None, None]:
     """
-    读取JSONL文件，支持多种字段结构和回退机制
+    读取JSONL文件，仅支持多字段优先级提取（无回退机制）
     
     参数:
         file_path: JSONL文件路径
         text_fields: 尝试提取的文本字段优先级列表
-        fallback_field: 当指定字段不存在时的回退字段
+        sampling_rate: 采样率
+        max_samples: 最大样本数限制
     """
     if text_fields is None:
         text_fields = ["input", "content", "reasoning_content", "text"]
     
+    sample_count = 0
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         for line_num, line in enumerate(f, 1):
+            if max_samples and sample_count >= max_samples:
+                break
+                
+            if random.random() > sampling_rate:
+                continue
+                
             try:
                 data = json.loads(line)
                 
-                # 尝试按优先级获取文本字段
+                # 仅提取指定字段
                 text_parts = []
                 for field in text_fields:
                     if field in data:
@@ -109,19 +118,15 @@ def read_data_from_json(
                         else:
                             text_parts.append(str(content))
                 
-                # 回退机制
+                # 如果没有提取到任何文本，直接跳过
                 if not text_parts:
-                    if fallback_field in data:
-                        text_parts.append(str(data[fallback_field]))
-                    else:
-                        # 尝试提取所有字符串值
-                        text_parts = [str(v) for v in data.values() if isinstance(v, str)]
+                    continue
                 
-                # 合并文本
                 text = "\n".join(text_parts)
                 if not text.strip():
-                    raise ValueError(f"Empty text in line {line_num}")
+                    continue
                 
+                sample_count += 1
                 yield text
                 
             except json.JSONDecodeError:
@@ -132,27 +137,40 @@ def read_data_from_json(
                 continue
 
 def read_data_from_sqlite(
-    db_path: str,
+    db_manager: SQLiteDatabaseManager,
     table_name: str = "tokenizer_data",
     text_field: str = "text",
-    batch_size: int = 1000
+    batch_size: int = 1000,
+    sampling_rate: float = 1.0,
+    max_samples: Optional[int] = None,
 ) -> Generator[str, None, None]:
     """
-    从SQLite数据库流式读取数据
-    
+    从SQLite数据库流式读取数据，支持采样和限制
+    ⚠️ 注意：必须传入已连接的 db_manager，避免多次重复连接
+
     参数:
-        db_path: SQLite数据库路径
+        db_manager: 已连接的数据库管理器实例
         table_name: 表名
         text_field: 文本字段名
         batch_size: 每次读取的批量大小
+        sampling_rate: 采样率
+        max_samples: 最大样本数限制
+
+    返回:
+        文本数据生成器
     """
-    # 为每个线程创建独立的数据库管理器实例
-    db_manager = SQLiteDatabaseManager(db_path)
-    try:
-        yield from db_manager.stream_text_data(table_name, text_field, batch_size)
-    finally:
-        # 确保连接被正确关闭
-        db_manager.disconnect()
+    sample_count = 0
+    for text in db_manager.stream_text_data(table_name, text_field, batch_size, show_progress=True):
+        # 检查最大样本限制
+        if max_samples and sample_count >= max_samples:
+            break
+
+        # 应用采样
+        if random.random() > sampling_rate:
+            continue
+
+        yield text
+        sample_count += 1
 
 def batch_iterator_json(
     file_paths: List[str], 
@@ -171,74 +189,77 @@ def batch_iterator_json(
         sampling_rate: 采样率
         max_samples: 最大样本数限制
     """
-    sample_count = 0
+    batch = []
+    total_samples = 0
+    
     for file_path in file_paths:
-        batch = []
-        for text in read_data_from_json(file_path, text_fields):
-            # 检查最大样本限制
-            if max_samples and sample_count >= max_samples:
-                if batch:  # 处理最后一批
-                    yield batch
-                return
-                
-            # 应用采样
-            if random.random() > sampling_rate:
-                continue
-
+        for text in read_data_from_json(
+            file_path, text_fields, 
+            sampling_rate=sampling_rate, 
+            max_samples=max_samples
+        ):
             batch.append(text)
-            sample_count += 1
-
+            total_samples += 1
+            
             if len(batch) >= batch_size:
                 yield batch
                 batch = []
-                # 主动触发垃圾回收
-                gc.collect()
-        
-        # 处理最后一批
-        if batch:
-            yield batch
-            batch = []
-            gc.collect()
+            
+            # 检查最大样本限制
+            if max_samples and total_samples >= max_samples:
+                if batch:
+                    yield batch
+                return
+    
+    if batch:
+        yield batch
 
 def batch_iterator_sqlite(
-    db_paths: List[str],
+    db_manager: SQLiteDatabaseManager,
     table_name: str = "tokenizer_data",
     text_field: str = "text",
     batch_size: int = 1000,
     sampling_rate: float = 1.0,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
 ) -> Iterator[List[str]]:
     """
-    批量迭代器，真正的流式读取数据
-    
+    批量迭代器
+    ⚠️ 注意：必须传入已连接的 db_manager
+
     参数:
-        db_paths: 数据库路径列表
+        db_manager: 已连接的数据库管理器实例
         table_name: 表名
         text_field: 文本字段名
         batch_size: 批量大小
         sampling_rate: 采样率
         max_samples: 最大样本数限制
+
+    返回:
+        批量文本数据迭代器
     """
-    sample_count = 0
     batch = []
+    total_samples = 0
 
-    for db_path in db_paths:
-        for text in read_data_from_sqlite(db_path, table_name, text_field, batch_size):
-            # 采样
-            if random.random() > sampling_rate:
-                continue
+    for text in read_data_from_sqlite(
+        db_manager,
+        table_name,
+        text_field,
+        batch_size,
+        sampling_rate,
+        max_samples
+    ):
+        batch.append(text)
+        total_samples += 1
 
-            batch.append(text)
-            sample_count += 1
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
 
-            if len(batch) >= batch_size:
+        # 检查最大样本限制
+        if max_samples and total_samples >= max_samples:
+            if batch:
                 yield batch
-                batch = []
-
-            if max_samples and sample_count >= max_samples:
-                if batch:
-                    yield batch
-                return  # 提前退出
+            return
 
     if batch:
         yield batch
@@ -261,49 +282,54 @@ def count_samples_json(
     返回:
         样本数量
     """
-    sample_count = 0
+    count = 0
     for file_path in file_paths:
-        for text in read_data_from_json(file_path, text_fields):
-            # 检查最大样本限制
-            if max_samples and sample_count >= max_samples:
-                return sample_count
-                
-            # 应用采样
-            if random.random() > sampling_rate:
-                continue
-
-            sample_count += 1
-    return sample_count
+        for text in read_data_from_json(
+            file_path, text_fields, 
+            sampling_rate=sampling_rate, 
+            max_samples=max_samples
+        ):
+            count += 1
+            if max_samples and count >= max_samples:
+                return count
+    return count
 
 def count_samples_sqlite(
-    db_paths: List[str],
+    db_manager: SQLiteDatabaseManager,
     table_name: str = "tokenizer_data",
     text_field: str = "text",
     sampling_rate: float = 1.0,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
 ) -> int:
     """
     计算满足条件的样本数量
-    
+    ⚠️ 注意：必须传入已连接的 db_manager
+
     参数:
-        db_paths: 数据库路径列表
+        db_manager: 已连接的数据库管理器实例
         table_name: 表名
         text_field: 文本字段名
         sampling_rate: 采样率
         max_samples: 最大样本数限制
-    
+
     返回:
         样本数量
     """
-    total_count = 0
-    for db_path in db_paths:
-        for text in read_data_from_sqlite(db_path, table_name, text_field):
-            if random.random() > sampling_rate:
-                continue
-            total_count += 1
-            if max_samples and total_count >= max_samples:
-                return total_count
-    return total_count
+    count = 0
+
+    for text in read_data_from_sqlite(
+        db_manager,
+        table_name,
+        text_field,
+        1000,
+        sampling_rate,
+        max_samples
+    ):
+        count += 1
+        if max_samples and count >= max_samples:
+            return count
+
+    return count
 
 def create_tokenizer_config(save_dir: str, model_max_length: int = 8192) -> None:
     """
@@ -493,7 +519,7 @@ def create_tokenizer_pre_tokenizer() -> pre_tokenizers.Sequence:
     ])
 
 def train_tokenizer(
-    data_paths: Union[str, List[str]],
+    db_path: Union[str, List[str]],
     save_dir: str,
     table_name: str = "tokenizer_data",
     text_fields: str = 'text',
@@ -507,8 +533,9 @@ def train_tokenizer(
     训练并保存自定义tokenizer
     
     参数:
-        data_paths: 单个路径或路径列表
+        db_path: 语料数据库路径
         save_dir: 保存目录
+        db_path: 数据库路径
         vocab_size: 词汇表大小
         min_frequency: 最小词频
         model_max_length: 最大模型长度
@@ -578,10 +605,6 @@ def train_tokenizer(
         "<|safe|>",  # 安全token
         "<|unsafe|>",  # 非安全token
     ]
-
-    # 处理多文件路径
-    if isinstance(data_paths, str):
-        data_paths = [data_paths]
     
     # 计算每个阶段的参数，基于最后一阶段的完全抽样模式
     final_phase_sampling = phase_sampling_rates[-1]  # 最后一阶段的采样率
@@ -621,61 +644,69 @@ def train_tokenizer(
             "sampling_ratio": sampling_ratio
         })
     
-    # 分阶段训练
-    for i, phase in enumerate(training_phases):
-        print(f"\n=== {phase['name']}/{len(training_phases)}: Sampling Rate {phase['sampling_rate']} ===")
-        print(f"Vocab Size: {phase['vocab_size']}, Min Frequency: {phase['min_frequency']}")
-        print(f"Batch Size: {phase['batch_size']}, Limit Alphabet: {phase['limit_alphabet']}")
-        
-        # 配置当前阶段的训练器
-        trainer = trainers.BpeTrainer(
-            vocab_size=phase["vocab_size"],
-            special_tokens=special_tokens,
-            min_frequency=phase["min_frequency"],
-            show_progress=True,
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-            continuing_subword_prefix="",
-            end_of_word_suffix="",
-            limit_alphabet=phase["limit_alphabet"]
-        )
-        
-        # 创建当前阶段的数据迭代器
-        def phase_data_iterator():
-            for batch in batch_iterator_sqlite(
-                data_paths,
-                table_name=table_name,
-                text_field=text_fields, 
-                batch_size=phase["batch_size"], 
-                sampling_rate=phase["sampling_rate"]
-            ):
-                yield batch
-                gc.collect()
-        
-        # 使用内存感知迭代器包装
-        memory_aware_iterator = MemoryAwareIterator(phase_data_iterator())
-        
-        # 自动计算迭代器长度
-        length = count_samples_sqlite(
-            db_paths=data_paths,
-            table_name=table_name, 
-            text_field=text_fields, 
-            sampling_rate=phase["sampling_rate"]
-        )
-        print(f"Found {length} samples for this phase")
+    # 创建数据库管理器实例，将在所有阶段中重用
+    db_manager = SQLiteDatabaseManager(db_path)
+    db_manager.connect()
 
-        # 训练当前阶段
-        tokenizer.train_from_iterator(
-            memory_aware_iterator, 
-            trainer=trainer, 
-            length=length
-        )
-        
-        # （可选）在每个阶段后保存 tokenizer 状态以备后续使用或检查
-        tokenizer.save(f"./stellarbytetokenizer/tokenizer_phase_{i+1}.json")
-        
-        # 打印当前阶段的统计信息
-        current_vocab_size = len(tokenizer.get_vocab())
-        print(f"{phase['name']} completed. Current vocab size: {current_vocab_size}")
+    # 分阶段训练
+    try:
+        for i, phase in enumerate(training_phases):
+            print(f"\n=== {phase['name']}/{len(training_phases)}: Sampling Rate {phase['sampling_rate']} ===")
+            print(f"Vocab Size: {phase['vocab_size']}, Min Frequency: {phase['min_frequency']}")
+            print(f"Batch Size: {phase['batch_size']}, Limit Alphabet: {phase['limit_alphabet']}")
+
+            # 配置当前阶段的训练器
+            trainer = trainers.BpeTrainer(
+                vocab_size=phase["vocab_size"],
+                special_tokens=special_tokens,
+                min_frequency=phase["min_frequency"],
+                show_progress=True,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                continuing_subword_prefix="",
+                end_of_word_suffix="",
+                limit_alphabet=phase["limit_alphabet"]
+            )
+
+            # 创建当前阶段的数据迭代器
+            def phase_data_iterator():
+                for batch in batch_iterator_sqlite(
+                    db_manager,
+                    table_name=table_name,
+                    text_field=text_fields, 
+                    batch_size=phase["batch_size"], 
+                    sampling_rate=phase["sampling_rate"]
+                ):
+                    yield batch
+                    gc.collect()
+
+            # 使用内存感知迭代器包装
+            memory_aware_iterator = MemoryAwareIterator(phase_data_iterator())
+
+            # 自动计算迭代器长度
+            length = count_samples_sqlite(
+                db_manager,
+                table_name=table_name, 
+                text_field=text_fields, 
+                sampling_rate=phase["sampling_rate"]
+            )
+            print(f"Found {length} samples for this phase")
+
+            # 训练当前阶段
+            tokenizer.train_from_iterator(
+                memory_aware_iterator, 
+                trainer=trainer, 
+                length=length
+            )
+
+            # （可选）在每个阶段后保存 tokenizer 状态以备后续使用或检查
+            tokenizer.save(f"./stellarbytetokenizer/tokenizer_phase_{i+1}.json")
+
+            # 打印当前阶段的统计信息
+            current_vocab_size = len(tokenizer.get_vocab())
+            print(f"{phase['name']} completed. Current vocab size: {current_vocab_size}")
+    finally:
+        # 关闭数据库连接
+        db_manager.disconnect()
 
     # 验证特殊token映射
     special_token_map = {
@@ -1164,21 +1195,22 @@ def main():
     save_dir = "./stellarbytetokenizer"
     eval_tokenizer_info_dir = './model_info'
 
-    # 创建数据库
-    db_manager = SQLiteDatabaseManager(db_path)
-    db_manager.connect()
-    db_manager.create_table('tokenizer_pretrain_data', 'text')
-    db_manager.insert_data(
-        data_file_path=data_path,
-        table_name='tokenizer_pretrain_data',
-        columns='text'
-    )
-    db_manager.optimize_database()
-    db_manager.disconnect()
+    # 检查数据库是否存在，如果不存在则创建并导入数据
+    if not os.path.exists(db_path):
+        db_manager = SQLiteDatabaseManager(db_path)
+        db_manager.connect()
+        db_manager.create_table('tokenizer_pretrain_data', 'text')
+        db_manager.insert_data(
+            data_file_path=data_path,
+            table_name='tokenizer_pretrain_data',
+            columns='text'
+        )
+        db_manager.optimize_database()
+        db_manager.disconnect()
 
     # 训练tokenizer
     train_tokenizer(
-        data_paths=db_path,
+        db_path=db_path,
         save_dir=save_dir,
         table_name='tokenizer_pretrain_data',
         text_fields='text',
