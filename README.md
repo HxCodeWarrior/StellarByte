@@ -50,6 +50,45 @@ StellarByte 是基于 Transformer 架构的高性能语言模型框架，专为�
 ## 📚 模型结构
 > [模型架构](./model_info/model_structure.md)
 
+## 🧠 训练流程
+
+StellarByte支持完整的语言模型训练流程：
+```mermaid
+flowchart TD
+    A[初始预训练模型<br>拥有语言能力和世界知识<br>但无法遵循指令] --> B[SFT 监督微调]
+    
+    subgraph B [阶段一: 监督微调]
+        B1[高质量指令-回答对]
+        B2[训练目标: 指令遵循]
+    end
+    
+    B --> C(SFT模型<br>能遵循指令但可能<br>生成有害或不一致的输出)
+    C --> D[RLHF 基于人类反馈的强化学习]
+    
+    subgraph D [阶段二: 奖励模型训练]
+        D1[人类对回答排序]
+        D2[训练奖励模型预测人类偏好]
+    end
+    
+    D --> E
+    
+    subgraph E [阶段三: 强化学习优化]
+        E1[奖励模型提供反馈]
+        E2[强化学习算法PPO优化模型]
+        E3[KL散度防止模型偏离太远]
+    end
+    
+    E --> F(RLHF优化后的模型<br>输出更有用、一致、安全)
+    F --> G[持续学习与特定优化]
+    
+    subgraph G [可选阶段]
+        G1[持续预训练<br>领域知识注入]
+        G2[特定任务微调<br>Task-Specific Fine-tuning]
+    end
+    
+    G --> H[成熟、安全、可靠的LLM助手]
+```
+
 ## 🔧 安装
 
 ### 环境要求
@@ -1768,6 +1807,39 @@ embed_dim_per_partition: 768 (<class 'int'>)
 2. 优化tokenizer训练脚本，提高tokenizer的质量和性能
 
 </details>
+
+---
+
+<details>
+<summary>2025.8.28</summary>
+
+### DONE
+1. 添加SQLite数据库管理类用于数据存储和流式读取，提供以下功能：
+- 线程安全的数据库连接管理
+- 数据表创建和优化
+- 从JSONL文件批量导入数据
+- 流式读取文本数据
+- 数据库性能优化配置
+2. 移动数据集加载器类，添加基础数据集类及预训练/SFT数据集实现
+- 实现 BaseDataset 作为通用基类，提供序列填充与损失掩码生成逻辑
+- 新增 PretrainDataset 和 SFTDataset，分别支持预训练和指令微调任务
+- 添加流式数据集 StreamingPretrainDataset 和 StreamingSFTDataset 以支持大文件处理
+- 包含完整的测试用例和文档注释
+3. tokenizer_pretrain.py 优化数据读取和训练流程，改进数据库连接管理
+- 重构数据读取函数，移除回退机制，增加采样率和最大样本数限制
+- 改进数据库连接管理，使用已连接的db_manager避免重复连接
+- 优化批量迭代器逻辑，简化代码结构
+- 添加数据库存在性检查，避免重复创建
+- 统一采样和限制逻辑到核心读取函数
+4. 更新数据集导入路径以匹配新的模块结构,将PretrainDataset和StreamingPretrainDataset的导入路径从'datasets'更新为'datasets.datasets'，以匹配项目重构后的模块组织结构
+
+### TODO
+1. tokenizer_pretrain.py 
+- 数据库创建与训练这两个流程需要分开处理，当二者衔接时就会发生错误
+```text
+=== Phase 1/3: Sampling Rate 0.3 === Vocab Size: 10400, Min Frequency: 6 Batch Size: 500, Limit Alphabet: 800 2025-08-28 16:22:56,728 - datasets.sqlmanager - INFO - 线程 30376 数据库连接已关闭 Traceback (most recent call last): File "d:\Objects\StellarByte\tokenizer_pretrain.py", line 1233, in <module> main() File "d:\Objects\StellarByte\tokenizer_pretrain.py", line 1211, in main train_tokenizer( File "d:\Objects\StellarByte\tokenizer_pretrain.py", line 686, in train_tokenizer length = count_samples_sqlite( File "d:\Objects\StellarByte\tokenizer_pretrain.py", line 320, in count_samples_sqlite for text in read_data_from_sqlite( File "d:\Objects\StellarByte\tokenizer_pretrain.py", line 163, in read_data_from_sqlite for text in db_manager.stream_text_data(table_name, text_field, batch_size, show_progress=False): File "d:\Objects\StellarByte\datasets\sqlmanager.py", line 218, in stream_text_data cursor = db_connected.cursor() sqlite3.ProgrammingError: Cannot operate on a closed database.
+```
+- 根据tokenizer评估报告，升级优化tokenizer的文本归一化和分词逻辑，提升tokenizer的性能与质量
 
 ---
 
