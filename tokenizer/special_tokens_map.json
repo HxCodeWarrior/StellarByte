@@ -1,10 +1,20 @@
 {
     "bos_token": "<|im_start|>",
     "eos_token": "<|im_end|>",
+    "pad_token": "<|pad|>",
     "unk_token": "<unk>",
-    "pad_token": "<|im_end|>",
+    "mask_token": "<mask>",
     "additional_special_tokens": [
         "<s>",
-        "</s>"
+        "</s>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|tool|>",
+        "<|function|>",
+        "<|observation|>",
+        "<|unknown|>",
+        "<|safe|>",
+        "<|unsafe|>"
     ]
 }

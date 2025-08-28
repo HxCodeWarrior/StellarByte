@@ -1,6 +1,6 @@
 """模型信息分析工具
 =================================================
-本文件提供了分析 ByteTransformer 模型详细信息的工具，
+本文件提供了分析 ByteModel 模型详细信息的工具，
 包括参数统计、层级结构、内存使用、计算复杂度等，
 并生成详细的可视化报告。
 
@@ -32,7 +32,7 @@ sys.path.append(str(root_dir))
 
 # 导入项目模块
 from model.config import ByteModelConfig
-from model.Model import ByteTransformer
+from model.Model import ByteModel
 
 # 设置中文字体和负号显示
 # Linux
@@ -55,24 +55,24 @@ class ModelInfo:
     6. 可视化报告生成
     """
     
-    def __init__(self, model: Union[ByteTransformer, str, Path], config: Optional[ByteModelConfig] = None):
+    def __init__(self, model: Union[ByteModel, str, Path], config: Optional[ByteModelConfig] = None):
         """初始化模型信息分析器
         
         Args:
-            model: ByteTransformer模型实例、模型路径或模型名称
+            model: ByteModel模型实例、模型路径或模型名称
             config: 模型配置，如果model是路径或名称，则必须提供
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 加载模型
-        if isinstance(model, ByteTransformer):
+        if isinstance(model, ByteModel):
             self.model = model
             self.config = model.config
         elif isinstance(model, (str, Path)):
             if config is None:
                 raise ValueError("当model是路径或名称时，必须提供config参数")
             self.config = config
-            self.model = ByteTransformer(config)
+            self.model = ByteModel(config)
             # 尝试加载模型权重
             try:
                 self.model.load_state_dict(torch.load(model, map_location="cpu"))
@@ -80,7 +80,7 @@ class ModelInfo:
             except Exception as e:
                 print(f"警告: 无法加载模型权重 ({e})，使用随机初始化权重")
         else:
-            raise TypeError("model参数必须是ByteTransformer实例、模型路径或模型名称")
+            raise TypeError("model参数必须是ByteModel实例、模型路径或模型名称")
         
         # 初始化分析结果存储
         self.param_stats = {}
@@ -110,12 +110,9 @@ class ModelInfo:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
         # 2. 非嵌入层参数量
-        embed_params = self.model.embed_tokens.weight.numel()
-        if self.config.tie_word_embeddings:
-            non_embed_params = total_params - embed_params
-        else:
-            lm_head_params = self.model.lm_head.weight.numel()
-            non_embed_params = total_params - (embed_params + lm_head_params)
+        embed_params = self.model.embedding.weight.numel()
+        lm_head_params = self.model.lm_head.weight.numel()
+        non_embed_params = total_params - (embed_params + lm_head_params)
         
         # 3. 按模块统计参数
         module_params = {}
@@ -139,7 +136,7 @@ class ModelInfo:
                       if any(n in name for n in ["w1", "w2", "w3", "gate_proj", "up_proj", "down_proj"])),
             "norm": sum(p.numel() for name, p in self.model.named_parameters() 
                        if "norm" in name.lower()),
-            "lm_head": self.model.lm_head.weight.numel() if not self.config.tie_word_embeddings else 0
+            "lm_head": self.model.lm_head.weight.numel()
         }
         
         # 6. 参数精度统计
@@ -409,10 +406,7 @@ class ModelInfo:
         
         # 3. 输出层计算量 (LM头)
         # 如果权重共享，则只计算偏置部分
-        if self.config.tie_word_embeddings:
-            lm_head_flops = batch_size * seq_len * V
-        else:
-            lm_head_flops = batch_size * seq_len * D * V
+        lm_head_flops = batch_size * seq_len * V
         
         # 总计算量
         total_flops = embed_flops + all_layers_flops + lm_head_flops
@@ -602,12 +596,12 @@ class ModelInfo:
         # 开始生成报告
         with open(report_file, "w", encoding="utf-8") as f:
             # 1. 报告标题
-            f.write(f"# ByteTransformer 模型分析报告\n\n")
+            f.write(f"# ByteModel 模型分析报告\n\n")
             f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             
             # 2. 模型概览
             f.write("## 1. 模型概览\n\n")
-            f.write(f"- **模型类型**: ByteTransformer\n")
+            f.write(f"- **模型类型**: ByteModel\n")
             f.write(f"- **词汇表大小**: {self.config.vocab_size:,}\n")
             f.write(f"- **模型维度**: {self.config.model_dim}\n")
             f.write(f"- **层数**: {self.config.num_layers}\n")
@@ -811,7 +805,7 @@ class ModelInfo:
     def _append_architecture_summary(self, f):
         """生成更加丰富的模型结构概览"""
         f.write("```")
-        f.write(f"ByteTransformer(")
+        f.write(f"ByteModel(")
         f.write(f"  (embed_tokens): Embedding(vocab_size={self.config.vocab_size}, dim={self.config.model_dim})\n")
 
         for i in range(self.config.num_layers):
@@ -1101,7 +1095,7 @@ def main():
         model_info = ModelInfo(args.model_path, config)
     else:
         print("未提供模型路径，使用随机初始化的模型")
-        model = ByteTransformer(config)
+        model = ByteModel(config)
         model_info = ModelInfo(model)
     
     # 分析参数
