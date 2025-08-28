@@ -7,3 +7,4 @@ checkpoints/
 datasets/eval/
 datasets/train/
 datasets/tokenizers/
+stellarbytetokenizer/phase_pretrain/
