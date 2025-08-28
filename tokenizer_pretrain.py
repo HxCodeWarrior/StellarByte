@@ -699,7 +699,7 @@ def train_tokenizer(
             )
 
             # （可选）在每个阶段后保存 tokenizer 状态以备后续使用或检查
-            tokenizer.save(f"./stellarbytetokenizer/tokenizer_phase_{i+1}.json")
+            tokenizer.save(f"./stellarbytetokenizer/phase_pretrain/tokenizer_phase_{i+1}.json")
 
             # 打印当前阶段的统计信息
             current_vocab_size = len(tokenizer.get_vocab())
