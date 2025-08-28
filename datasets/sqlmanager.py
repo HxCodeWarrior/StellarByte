@@ -6,6 +6,36 @@ from tqdm import tqdm
 from typing import Generator, List, Optional, Dict, Any
 import logging
 
+class SQLiteConnectionPool:
+    """SQLite连接池，避免频繁创建和关闭连接"""
+    _connections = {}
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_connection(cls, db_path):
+        with cls._lock:
+            thread_id = threading.get_ident()
+            if db_path not in cls._connections:
+                cls._connections[db_path] = {}
+            
+            if thread_id not in cls._connections[db_path]:
+                cls._connections[db_path][thread_id] = sqlite3.connect(
+                    db_path, check_same_thread=False
+                )
+            
+            return cls._connections[db_path][thread_id]
+    
+    @classmethod
+    def close_all(cls):
+        with cls._lock:
+            for db_path, connections in cls._connections.items():
+                for conn in connections.values():
+                    try:
+                        conn.close()
+                    except:
+                        pass
+            cls._connections = {}
+            
 class SQLiteDatabaseManager:
     """
     SQLite数据库管理类，负责数据库的创建、数据插入和流式读取
@@ -34,10 +64,10 @@ class SQLiteDatabaseManager:
         return logger
     
     def connect(self) -> None:
-        """连接到数据库"""
+        """连接到数据库，使用连接池"""
         if not hasattr(self.thread_local, 'connection') or self.thread_local.connection is None:
             try:
-                self.thread_local.connection = sqlite3.connect(self.db_path, check_same_thread=False)
+                self.thread_local.connection = SQLiteConnectionPool.get_connection(self.db_path)
                 self.logger.info(f"线程 {threading.get_ident()} 成功连接到数据库: {self.db_path}")
             except sqlite3.Error as e:
                 self.logger.error(f"线程 {threading.get_ident()} 连接数据库失败: {e}")
