@@ -325,15 +325,18 @@ if __name__ == "__main__":
     # 测试代码
     db_path = './datasets/test/test.db'
     data_path = "./datasets/test/test_train.jsonl"
-    db_manager = SQLiteDatabaseManager(db_path)
-    db_manager.connect()
-    db_manager.create_table('test_data', 'text')
-    db_manager.insert_data(
-        data_file_path=data_path,
-        table_name='test_data',
-        columns='text'
-    )
-    db_manager.optimize_database()
+
+    # 检查数据库是否存在，如果不存在则创建并导入数据
+    if not os.path.exists(db_path):
+        db_manager = SQLiteDatabaseManager(db_path)
+        db_manager.connect()
+        db_manager.create_table('test_data', 'text')
+        db_manager.insert_data(
+            data_file_path=data_path,
+            table_name='test_data',
+            columns='text'
+        )
+        db_manager.optimize_database()
 
     # 获取表信息
     table_info = db_manager.get_table_info("test_data")
