@@ -2,6 +2,8 @@ pytest_cache/
 .pytest_cache/
 __pycache__/
 logs/
-datasets/
 sources/
 checkpoints/
+datasets/eval/
+datasets/train/
+datasets/tokenizers/
