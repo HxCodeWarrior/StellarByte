@@ -22,12 +22,12 @@ class BaseDataset(Dataset):
 
         # 2. 若 tokenizer 没有 pad_token，则动态注入一个占位符
         if tokenizer.pad_token is None:
-            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|spad|>'.")
-            tokenizer.add_special_tokens({"pad_token": "<|spad|>"})
+            logging.warning("[BaseDataset] Tokenizer has no <pad>, adding '<|pad|>'.")
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         if tokenizer.bos_token is None:
-            tokenizer.add_special_tokens({"bos_token": "<|sbos|>"})
+            tokenizer.add_special_tokens({"bos_token": "<|im_start|>"})
         if tokenizer.eos_token is None:
-            tokenizer.add_special_tokens({"eos_token": "<|seos|>"})
+            tokenizer.add_special_tokens({"eos_token": "<|im_end|>"})
 
         # 3. 最终的 pad_token_id（注入后一定存在）
         self.pad_token_id: int = tokenizer.pad_token_id
