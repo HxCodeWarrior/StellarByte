@@ -32,10 +32,6 @@ class BaseDataset(Dataset):
         # 3. 最终的 pad_token_id（注入后一定存在）
         self.pad_token_id: int = tokenizer.pad_token_id
 
-        # 4. 预计算BOS/EOS
-        self.has_bos = tokenizer.bos_token is not None
-        self.has_eos = tokenizer.eos_token is not None
-
     def _pad_and_mask(self, input_ids: List[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         截断 / 填充，并生成损失掩码。
@@ -97,9 +93,7 @@ class PretrainDataset(BaseDataset):
         tokenizer: PreTrainedTokenizerBase,
         max_length: int = 512,
         fields: Optional[List[str]] = None,
-        template: Optional[str] = None,
-        add_bos: bool = True,
-        add_eos: bool = True
+        template: Optional[str] = None
     ):
         """
         :param data_path: 数据文件路径（支持 .json / .jsonl / .csv）
@@ -112,26 +106,8 @@ class PretrainDataset(BaseDataset):
         """
         super().__init__(tokenizer, max_length)
         self.data_path = data_path
-        self.fields = fields or ["input", "output"]
+        self.fields = fields or ["text"]
         self.template = template
-        self.add_bos = add_bos
-        self.add_eos = add_eos
-        self.bos_token_id = tokenizer.bos_token_id or None
-        self.eos_token_id = tokenizer.eos_token_id or None
-
-        if self.add_bos and self.bos_token_id is None:
-            if self.eos_token_id is not None:
-                logging.warning("[Dataset] Tokenizer has no <bos>, fallback to <eos> as BOS.")
-                self.bos_token_id = self.eos_token_id
-            else:
-                raise ValueError("Tokenizer must have bos_token or eos_token if add_bos=True")
-
-        if self.add_eos and self.eos_token_id is None:
-            if self.bos_token_id is not None:
-                logging.warning("[Dataset] Tokenizer has no <eos>, fallback to <eos> as BOS.")
-                self.eos_token_id = self.bos_token_id
-            else:
-                raise ValueError("Tokenizer must have eos_token if add_eos=True")
 
         self.data = self._load_data()
         logging.info(f"[Dataset] Loaded {len(self)} samples from {data_path}")
@@ -167,21 +143,14 @@ class PretrainDataset(BaseDataset):
         # 处理空文本
         if not text:
             text = "[EMPTY]"
-
-        # BOS 和 EOS 预留长度
-        reserve_len = int(self.add_bos) + int(self.add_eos)
-
+    
         # 编码 & 截断
         input_ids = self.tokenizer.encode(
             text,
-            add_special_tokens=False,
-            max_length=self.max_length - reserve_len,  # 预留 BOS 和 EOS 空间
-            truncation=True
+            add_special_tokens=True,   # 是否自动加 special tokens
+            max_length=self.max_length,  # 预留 BOS 和 EOS 空间
+            truncation=True,
         )
-        if self.add_bos: # 添加 BOS
-            input_ids = [self.bos_token_id] + input_ids
-        if self.add_eos: # 添加 EOS
-            input_ids = input_ids + [self.eos_token_id]
 
         # 生成输入、标签、loss_mask
         # 1. 先拆分序列（避免填充污染）
@@ -194,11 +163,6 @@ class PretrainDataset(BaseDataset):
         
         # Y序列：模型预测目标
         label_tensor, _, loss_mask = self._pad_and_mask(input_ids_y)
-
-        # 3. 设置忽略标签
-        # mask 掩码中，-100 代表不计算损失，-100 以外的值代表计算损失，避免影响loss计算
-        label_tensor = label_tensor.clone()
-        label_tensor[~loss_mask] = -100 # 忽略 PAD 区损失
 
         return {
             "input_ids"     : input_tensor,       # [seq_len-1]
@@ -220,34 +184,14 @@ class StreamingPretrainDataset(BaseDataset, IterableDataset):
         tokenizer: PreTrainedTokenizerBase,
         max_length: int = 512,
         fields: Optional[List[str]] = None,
-        template: Optional[str] = None,
-        add_bos: bool = True,
-        add_eos: bool = True
+        template: Optional[str] = None
     ):
         BaseDataset.__init__(self, tokenizer, max_length)
         IterableDataset.__init__(self)
         
         self.data_path = data_path
-        self.fields = fields or ["input", "output"]
+        self.fields = fields or ["text"]
         self.template = template
-        self.add_bos = add_bos
-        self.add_eos = add_eos
-        self.bos_token_id = tokenizer.bos_token_id or None
-        self.eos_token_id = tokenizer.eos_token_id or None
-
-        if self.add_bos and self.bos_token_id is None:
-            if self.eos_token_id is not None:
-                logging.warning("[Dataset] Tokenizer has no <bos>, fallback to <eos> as BOS.")
-                self.bos_token_id = self.eos_token_id
-            else:
-                raise ValueError("Tokenizer must have bos_token or eos_token if add_bos=True")
-
-        if self.add_eos and self.eos_token_id is None:
-            if self.bos_token_id is not None:
-                logging.warning("[Dataset] Tokenizer has no <eos>, fallback to <bos> as EOS.")
-                self.eos_token_id = self.bos_token_id
-            else:
-                raise ValueError("Tokenizer must have eos_token if add_eos=True")
 
     def _iter_jsonl(self):
         with open(self.data_path, "r", encoding="utf-8") as f:
@@ -302,25 +246,18 @@ class StreamingPretrainDataset(BaseDataset, IterableDataset):
         if not text:
             text = "[EMPTY]"
 
-        reserve_len = int(self.add_bos) + int(self.add_eos)
-
         input_ids = self.tokenizer.encode(
-            text, add_special_tokens=False,
-            max_length=self.max_length - reserve_len, truncation=True
+            text, 
+            add_special_tokens=True,
+            max_length=self.max_length, 
+            truncation=True
         )
-        if self.add_bos:
-            input_ids = [self.bos_token_id] + input_ids
-        if self.add_eos:
-            input_ids = input_ids + [self.eos_token_id]
 
         input_ids_x = input_ids[:-1]
         input_ids_y = input_ids[1:]
 
         input_tensor, attention_mask, _ = self._pad_and_mask(input_ids_x)
         label_tensor,  _,     loss_mask = self._pad_and_mask(input_ids_y)
-
-        label_tensor = label_tensor.clone()
-        label_tensor[~loss_mask] = -100
 
         return {
             "input_ids": input_tensor,
@@ -675,11 +612,11 @@ if __name__ == "__main__":
     
     # 确保 tokenizer 有 pad_token 和 bos_token
     if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "<|PAD|>"})
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     if tokenizer.bos_token is None:
-        tokenizer.add_special_tokens({"bos_token": "<|BOS|>"})
+        tokenizer.add_special_tokens({"bos_token": "<|im_start|>"})
     if tokenizer.eos_token is None:
-        tokenizer.add_special_tokens({"eos_token": "<|EOS|>"})
+        tokenizer.add_special_tokens({"eos_token": "<|im_end|>"})
     
     # 初始化数据集
     dataset = PretrainDataset(
