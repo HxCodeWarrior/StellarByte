@@ -1845,6 +1845,26 @@ embed_dim_per_partition: 768 (<class 'int'>)
 
 ---
 
+<details>
+<summary>2025.9.2</summary>
+
+### DONE
+1. datasets.py 更新特殊token的命名以保持一致性
+- 将<pad>占位符从'<|spad|>'改为'<|pad|>'，<bos>和<eos>分别改为'<|im_start|>'和'<|im_end|>'，使其更符合通用命名规范
+- 移除BaseDataset中预计算BOS/EOS的逻辑，并简化PretrainDataset和StreamingPretrainDataset的构造函数。
+- 现在使用tokenizer的add_special_tokens参数自动处理特殊标记，不再需要手动添加BOS/EOS。
+- 同时将默认字段从["input", "output"]改为["text"]以简化配置。
+2. model_pretrain.py 修复梯度累积时损失计算未应用掩码的问题
+- 应用loss_mask来计算有效损失，忽略padding位置的影响，确保梯度累积时损失计算的准确性
+
+### TODO
+1. 调整数据集加载器中SFT数据加载的逻辑，详细分析并调整特殊token相关的处理
+2. 构建SFT训练脚本
+
+</details>
+
+---
+
 ## 🤝 贡献指南
 
 欢迎贡献代码、报告问题或提出新功能建议！请遵循以下步骤：
