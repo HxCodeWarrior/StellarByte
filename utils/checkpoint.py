@@ -49,18 +49,20 @@ class CheckpointManager:
         is_master: Optional[bool] = None,
         save_tokenizer_fn: Optional[Callable[[str], None]] = None,
         save_config_fn: Optional[Callable[[str], None]] = None,
+        best_model_weights_only: bool = True,
     ):
         """
         Args:
-            output_dir        : 输出目录
-            monitor           : 用于决定"最优"的度量名称（如 "loss" 或 "perplexity"）
-            mode              : "min" 或 "max"；若 "min" 则 metric 越小越好
-            max_checkpoints   : 保存最近 N 个检查点（包含最优和最后的）
-            prefix            : 保存文件名前缀
-            keep_last_n       : 强制保留的最近 N 个 checkpoint（会与 max_checkpoints 一起工作）
-            is_master         : 若在分布式训练中，应传入是否为主进程（rank0）。None 表示非分布式（主进程）
-            save_tokenizer_fn : 可选函数，负责把 tokenizer 保存到 output_dir （签名：fn(output_dir)）
-            save_config_fn    : 可选函数，负责把配置保存到 output_dir （签名：fn(output_dir)）
+            output_dir              : 输出目录
+            monitor                 : 用于决定"最优"的度量名称（如 "loss" 或 "perplexity"）
+            mode                    : "min" 或 "max"；若 "min" 则 metric 越小越好
+            max_checkpoints         : 保存最近 N 个检查点（包含最优和最后的）
+            prefix                  : 保存文件名前缀
+            keep_last_n             : 强制保留的最近 N 个 checkpoint（会与 max_checkpoints 一起工作）
+            is_master               : 若在分布式训练中，应传入是否为主进程（rank0）。None 表示非分布式（主进程）
+            save_tokenizer_fn       : 可选函数，负责把 tokenizer 保存到 output_dir （签名：fn(output_dir)）
+            save_config_fn          : 可选函数，负责把配置保存到 output_dir （签名：fn(output_dir)）
+            best_model_weights_only : 是否只保存最佳模型权重（不包含优化器状态等）
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +76,7 @@ class CheckpointManager:
         self.is_master = _is_master(is_master)
         self.save_tokenizer_fn = save_tokenizer_fn
         self.save_config_fn = save_config_fn
+        self.best_model_weights_only = best_model_weights_only
 
         # internal state
         self.best_metric: Optional[float] = None
@@ -263,25 +266,30 @@ class CheckpointManager:
             best_path = self.output_dir / best_fn
 
             def _save_best(tmp_path: str):
-                save_obj = {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model_state_dict": _model_state_dict(model),
-                    "metrics": {metric_name: metric_value},
-                    "extra": extra or {},
-                    "timestamp": int(time.time()),
-                }
-                if optimizer is not None:
-                    try:
-                        save_obj["optimizer_state_dict"] = optimizer.state_dict()
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch optimizer state dict: {e}")
-                if scaler is not None:
-                    try:
-                        save_obj["scaler_state_dict"] = scaler.state_dict()
-                    except Exception:
-                        logger.warning("Failed to save scaler state dict; skipping.")
-                torch.save(save_obj, tmp_path)
+                if self.best_model_weights_only:
+                    # 只保存模型权重
+                    torch.save(_model_state_dict(model), tmp_path)
+                else:
+                    # 保存完整检查点
+                    save_obj = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "model_state_dict": _model_state_dict(model),
+                        "metrics": {metric_name: metric_value},
+                        "extra": extra or {},
+                        "timestamp": int(time.time()),
+                    }
+                    if optimizer is not None:
+                        try:
+                            save_obj["optimizer_state_dict"] = optimizer.state_dict()
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch optimizer state dict: {e}")
+                    if scaler is not None:
+                        try:
+                            save_obj["scaler_state_dict"] = scaler.state_dict()
+                        except Exception:
+                            logger.warning("Failed to save scaler state dict; skipping.")
+                    torch.save(save_obj, tmp_path)
 
             # 原子写入覆盖 best_path（先写 tmp 再移动）
             self._atomic_save(_save_best, best_path)
@@ -312,6 +320,17 @@ class CheckpointManager:
         map_loc = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(str(p), map_location=map_loc)
 
+        # 处理只包含模型权重的检查点
+        if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+            # 可能是只保存了模型权重的文件
+            if model is not None:
+                try:
+                    model.load_state_dict(ckpt, strict=strict)
+                    logger.info(f"Loaded model weights from {p}")
+                except Exception as e:
+                    logger.warning(f"Failed to load model weights: {e}")
+            return {"model_state_dict": ckpt} if isinstance(ckpt, dict) else ckpt
+            
         # 加载模型权重（如果提供model）
         if model is not None and "model_state_dict" in ckpt:
             try:
