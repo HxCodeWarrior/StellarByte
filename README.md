@@ -105,6 +105,7 @@ git clone https://github.com/HxCodeWarrior/StellarByte.git
 cd StellarByte
 
 # 安装依赖
+pip install torch torchvision torchaudio -i https://pypi.tuna.tsinghua.edu.cn/simple
 pip install -r requirements.txt
 
 # 安装开发版本（暂未实现）
