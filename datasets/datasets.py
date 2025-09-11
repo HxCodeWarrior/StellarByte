@@ -60,8 +60,8 @@ class BaseDataset(Dataset):
 
         return (
             torch.tensor(padded_ids, dtype=torch.long),
-            torch.tensor(attention_mask, dtype=torch.bool),
-            torch.tensor(loss_mask, dtype=torch.bool)
+            torch.tensor(attention_mask, dtype=torch.long),
+            torch.tensor(loss_mask, dtype=torch.long)
         )
 
     def _format_sample(self, sample: dict) -> str:
