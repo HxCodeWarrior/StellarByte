@@ -1,14 +1,11 @@
 # ============= 核心依赖 =============
 # 深度学习框架
-torch==2.5.1
-torchvision==0.20.1
-transformers>=4.30.0
+torch_scatter
+transformers
 
 # Tokenizer
-sentencepiece>=0.2.0
+sentencepiece
 
-# 算法优化
-torch_scatter>=2.1.2
 
 # 数据处理
 numpy>=1.24.0
