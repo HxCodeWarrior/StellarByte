@@ -95,8 +95,6 @@ training:
   use_streaming: False           # 是否使用数据流式训练
   batch_size: 32                 # 单卡每批数据量
   steps_per_epoch: 100           # 每个Epoch的步数(数据集流式加载必须配置)【计算：steps_per_epoch = num_total_data / (battch_size * gradient_accumulation_steps)】
-  fields:                        # 数据集处理字段名列表(可选)【默认为['input', 'output']】
-  template:                      # 数据集格式模板名称(可选)【默认为['input', 'output']】
 
   # 优化器
   beta1: 0.9                     # AdamW beta1
