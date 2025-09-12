@@ -23,7 +23,7 @@ class PretrainDataset(Dataset):
         max_length: int = 512
     ):
         """
-        :param data_path: 数据文件路径（支持 .json / .jsonl / .csv）
+        :param data_path: 数据文件路径
         :param tokenizer: 分词器
         :param max_length: 最大长度（token级别）
         """
