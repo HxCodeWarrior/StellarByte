@@ -390,7 +390,8 @@ class ByteMultiHeadSelfAttention(nn.Module):
                 query     = q,         # [B, H, T, D]
                 key       = k_full,    # [B, H, T_total, D]
                 value     = v_full,    # [B, H, T_total, D]
-                attn_mask = causal_mask, # [B, 1, T, T_total]
+                is_causal = True,
+                attn_mask = None, 
                 dropout_p = self.attn_dropout.p if self.training else 0.0
             )
         else:
