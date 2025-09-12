@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import torch.nn as nn
@@ -450,7 +451,8 @@ class ByteModel(PreTrainedModel):
         }
 
 if __name__ == '__main__':
-    tokenizer = AutoTokenizer.from_pretrained("tokenizer")
+    tokenizer_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)  # 使用一个可用的分词器
     args = ByteModelConfig(
         dim=1024,
         num_layers=18,
