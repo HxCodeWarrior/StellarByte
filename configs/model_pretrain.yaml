@@ -40,13 +40,13 @@ model:
   layer_norm_eps: 1e-5          # LayerNorm的epsilon值
   initializer_range: 0.02       # 权重初始化标准差
   layerscale_init: 1e-5         # 层缩放参数γ的初始值
-  parallel_residual: true       # 是否使用并行残差连接
+  parallel_residual: True       # 是否使用并行残差连接
   
   # 注意力机制
   attention:
     num_heads: 16               # 注意力头总数
     num_kv_heads: 8             # Key/Value头数(分组查询注意力)
-    use_flash_attention: false  # 是否启用FlashAttention
+    use_flash_attention: False  # 是否启用FlashAttention
     attention_window_size: 0    # 滑动窗口大小(0: 全局注意力)
     attention_dropout_prob: 0.1 # 注意力权重Dropout概率
     base_theta: 10000.0         # RoPE位置编码基数
@@ -110,11 +110,11 @@ training:
   
   # 资源管理
   num_workers: 8                 # 数据加载线程数
-  use_cuda: true                 # 是否使用GPU
+  use_cuda: True                 # 是否使用GPU
   world_size: 1                  # 分布式训练进程数
   rank: 0                        # 分布式训练进程rank
   device: "cpu"                  # 设备名称：cpu / cuda:0 / cuda:1 / cuda:[0,1]
-  mixed_precision: true          # 是否使用混合精度
+  mixed_precision: True          # 是否使用混合精度
 
 # 早停机制设置
 early_stop:
