@@ -633,7 +633,6 @@ def train_epoch(
         # 2.1 数据准备
         input_ids      = batch["input_ids"].to(device, non_blocking=True)      # 输入token IDs，异步传输到设备
         labels         = batch["labels"].to(device, non_blocking=True)         # 标签token IDs，异步传输
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True) # 注意力掩码，异步传输
         loss_mask      = batch["loss_mask"].to(device, non_blocking=True)      # 损失掩码，异步传输
         batch_size, seq_len = input_ids.shape
         
@@ -646,8 +645,7 @@ def train_epoch(
         with amp_ctx: # 进入混合精度上下文（自动管理FP16计算）
             outputs = model(
                 input_ids      = input_ids, 
-                labels         = labels,
-                attention_mask = attention_mask,
+                labels         = labels
             ) # 模型前向传播
             # 计算损失并除以累积步数（用于梯度累积）
             loss      = outputs.loss / accumulation_steps  # 梯度累积损失缩放
