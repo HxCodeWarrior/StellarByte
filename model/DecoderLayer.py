@@ -111,14 +111,12 @@ class ByteDecoderLayer(nn.Module):
     def forward(
         self, 
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[ByteKVCache] = None
     ) -> torch.Tensor:
         """前向传播逻辑。
         
         参数:
             x (torch.Tensor): 输入张量 [batch_size, seq_len, hidden_dim]
-            attention_mask (torch.Tensor, optional): 注意力掩码，防止关注填充token
             kv_cache (ByteKVCache, optional): 用于存储KV值的缓存对象（推理加速）
             
         返回:
@@ -131,7 +129,7 @@ class ByteDecoderLayer(nn.Module):
             ffn_norm_x     = self.norm_ffn(x)   # MLP输入归一化
             
             # 2. 并行计算注意力和FFN输出
-            attn_out, meta = self.self_attn(attn_norm_x, attention_mask, kv_cache)
+            attn_out, meta = self.self_attn(attn_norm_x, kv_cache)
             if self.args.use_moe:
                 ffn_out, aux_loss = self.moe(ffn_norm_x)  # 接收专家输出+辅助损失
             else:
@@ -150,7 +148,7 @@ class ByteDecoderLayer(nn.Module):
             # ============= 顺序残差模式 (原始Transformer) =============
             # 1: 自注意力 + 残差连接
             attn_input = self.norm_attn(x)  # 输入归一化
-            attn_out, meta = self.self_attn(attn_input, attention_mask, kv_cache)
+            attn_out, meta = self.self_attn(attn_input, kv_cache)
             
             # 残差连接（应用LayerScale和DeepNorm缩放）
             attn_residual = self.ls_attn * attn_out * self.resid_scale

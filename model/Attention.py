@@ -290,96 +290,9 @@ class ByteMultiHeadSelfAttention(nn.Module):
 
         return mask
     
-    def _adjust_attention_mask(
-        self, 
-        attention_mask: torch.Tensor, 
-        seq_len: int, 
-        device: torch.device, 
-        dtype: torch.dtype,
-        offset: int = 0
-    ) -> Optional[torch.Tensor]:
-        """
-        统一调整 padding 掩码的形状，适配后续 attention 操作。
-        若未提供，则返回 None。
-
-        参数:
-            additive_mask: [B, 1, 1, T] or [B, T]
-            seq_len: 当前序列长度
-            device: 当前计算设备
-            dtype: 当前计算数据类型（如 float32）
-            offset: 起始位置（增量推理时使用）
-
-        返回:
-            调整后的掩码张量: 
-                1) [B, T_cur] 或 [B, 1, 1, T_cur]  (T_cur == seq_len)
-                2) [B, T_total] 或 [B, 1, 1, T_total] (T_total == cache_len + seq_len)
-        """
-        min_val = -1e9
-        total_len = seq_len + offset     # 序列总长度 (已缓存 + 当前)
-
-        if attention_mask is None:
-            return None
-
-        # 若 shape 为 [B, T]，转换为 [B, 1, 1, T]
-        if attention_mask.dim() == 2:
-            attention_mask = attention_mask[:, None, None, :]
-
-        # 确保形状正确
-        assert attention_mask.shape[-1] == seq_len, f"padding mask最后一维应与seq_len一致，但为 {attention_mask.shape[-1]} != {seq_len}"
-
-        # 如果有 offset，则在左侧补齐 offset 长度的 "全 0"（或全 min_val）区块
-        if offset > 0:
-            # 创建填充块 [B, 1, 1, offset]
-            if attention_mask.dtype == torch.bool:
-                pad_block = torch.ones(
-                    attention_mask.shape[0], 1, 1, offset,
-                    dtype=attention_mask.dtype, device=device
-                )
-            else:
-                pad_block = torch.zeros(
-                    attention_mask.shape[0], 1, 1, offset,
-                    dtype=attention_mask.dtype, device=device
-                )
-            # 拼接 [缓存掩码 | 当前掩码]
-            attention_mask = torch.cat([pad_block, attention_mask], dim=-1)
-
-        # 转换布尔掩码为加法掩码
-        if attention_mask.dtype == torch.bool:
-            # 创建临时张量
-            zeros = torch.zeros_like(attention_mask, dtype=dtype)
-            neg_val = torch.full_like(zeros, min_val, dtype=dtype)
-            # True位置设为0，False位置设为min_val
-            attention_mask = torch.where(attention_mask, zeros, neg_val)
-
-        return attention_mask.to(dtype=dtype, device=device)
-
-    def _merge_masks(self, causal_mask: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        合并因果掩码和 padding 掩码，返回最终用于 attention 的掩码。
-
-        参数:
-            causal_mask: Tensor[1, 1, T, T]，下三角因果掩码
-            attention_mask: Tensor[B, 1, 1, T]，padding mask
-
-        返回:
-            合并后的掩码: Tensor[B, 1, T, T]
-        """
-        if attention_mask is None:
-            return causal_mask
-
-        # 将 padding mask 扩展到 query 维度： [B, 1, 1, T] -> [B, 1, T, T]
-        # 即：每个 query token 都对所有 key 应用 padding 屏蔽
-        attention_mask = attention_mask.expand(-1, -1, causal_mask.size(-2), -1)  # [B, 1, T, T]
-
-        # 广播加法合并两个 mask，注意类型必须一致
-        attn_mask = causal_mask + attention_mask
-
-        return attn_mask
-
     def forward(
         self,
         x: torch.Tensor,                                # 输入张量，形状 [B, T, embed_dim]
-        attention_mask: torch.Tensor = None,            # 可选Padding掩码，形状 [B, 1, 1, T]
         kv_cache: Optional[ByteKVCache] = None,
     ) -> torch.Tensor:
         """
@@ -387,7 +300,6 @@ class ByteMultiHeadSelfAttention(nn.Module):
         
         参数:
             x: Tensor - 输入序列 [batch_size, seq_len, embed_dim]
-            attention_mask: Tensor - 注意力掩码（可选）
             kv_cache: ByteKVCache - KV缓存（可选）
             
         返回:
@@ -468,23 +380,17 @@ class ByteMultiHeadSelfAttention(nn.Module):
             k_full = k_cur
             v_full = v_cur
 
-        # ===== 9. 构建并自动调整 additive_mask 长度，和 KV 缓存长度同步 ===== 
-        attention_mask = self._adjust_attention_mask(attention_mask, seq_len, device, compute_dtype, cache_len)
-
-        # ===== 10. 构建基础因果掩码 ===== 
+        # ===== 9. 构建因果掩码 ===== 
         causal_mask = self._build_causal_mask(seq_len, device, compute_dtype, cache_len)
-        
-        # ===== 11. 合并因果掩码和padding掩码 ===== 
-        attn_mask = self._merge_masks(causal_mask, attention_mask)
 
-        # ===== 12. 构建 Mask & Attention ===== 
+        # ===== 10. 构建 Mask & Attention ===== 
         if self.use_flash:
             # 使用FlashAttention（高效实现）
             attn_out = F.scaled_dot_product_attention(
                 query     = q,         # [B, H, T, D]
                 key       = k_full,    # [B, H, T_total, D]
                 value     = v_full,    # [B, H, T_total, D]
-                attn_mask = attn_mask, # [B, 1, T, T_total]
+                attn_mask = causal_mask, # [B, 1, T, T_total]
                 dropout_p = self.attn_dropout.p if self.training else 0.0
             )
         else:
@@ -493,7 +399,7 @@ class ByteMultiHeadSelfAttention(nn.Module):
             attn_scores  = torch.matmul(q, k_full.transpose(-2, -1)) * self.scale
             
             # 应用掩码
-            attn_scores  = attn_scores + attn_mask
+            attn_scores  = attn_scores + causal_mask
             
             # 计算注意力权重
             attn_weights = F.softmax(attn_scores, dim=-1, dtype=compute_dtype)

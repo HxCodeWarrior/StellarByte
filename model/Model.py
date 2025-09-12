@@ -116,7 +116,6 @@ class ByteModel(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[ByteKVCache] = None,
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -133,7 +132,6 @@ class ByteModel(PreTrainedModel):
         参数:
             input_ids: 输入token ID矩阵 [batch_size, seq_len]
             labels: 目标token ID矩阵（用于训练）[batch_size, seq_len]
-            attention_mask: 注意力掩码（防止关注填充token）
             kv_cache: KV缓存对象（加速自回归生成）
         
         返回:
@@ -155,8 +153,7 @@ class ByteModel(PreTrainedModel):
         # 4. Decoder层处理
         for layer in self.layers:
             hidden_states, aux_loss = layer(
-                hidden_states, 
-                attention_mask, 
+                hidden_states,
                 kv_cache
             )
 
