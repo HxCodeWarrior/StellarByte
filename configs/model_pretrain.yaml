@@ -80,7 +80,8 @@ model:
     
   # 张量并行
   parallel:
-    tensor_parallel_size: 1     # 张量并行组大小
+    tensor_parallel_size: 1      # 张量并行组大小
+    tensor_parallel_groups: 1    # 张量并行组数
 
 # 训练配置
 training:

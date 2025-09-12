@@ -130,7 +130,7 @@ class ByteDecoderLayer(nn.Module):
             
             # 2. 并行计算注意力和FFN输出
             attn_out, meta = self.self_attn(attn_norm_x, kv_cache)
-            if self.args.use_moe:
+            if self.args.moe_enabled:
                 ffn_out, aux_loss = self.moe(ffn_norm_x)  # 接收专家输出+辅助损失
             else:
                 ffn_out  = self.mlp(ffn_norm_x)  # 标准MLP输出

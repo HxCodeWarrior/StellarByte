@@ -30,7 +30,7 @@ class ByteModelConfig(PretrainedConfig):
         tensor_parallel_group: int = 0,        # 张量并行rank
         layerscale_init : float = 1e-5,        # 层尺度初始化值
         initializer_range: float = 0.02,       # 权重初始化范围
-        use_moe: bool = False,                 # 是否使用MoE
+        moe_enabled: bool = False,             # 是否使用MoE
         moe_num_experts: int = 2,              # 专家数量
         moe_k: int = 1,                        # 每个专家选择的token数
         moe_capacity_factor: float = 1.25,     # 专家容量因子
@@ -64,7 +64,7 @@ class ByteModelConfig(PretrainedConfig):
         self.attention_window_size = attention_window_size
         
         # ========== MoELayer ==========
-        self.use_moe = use_moe
+        self.moe_enabled = moe_enabled
         self.moe_num_experts = moe_num_experts
         self.moe_k = moe_k
         self.moe_capacity_factor = moe_capacity_factor
