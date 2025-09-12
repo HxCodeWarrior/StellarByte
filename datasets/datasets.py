@@ -449,7 +449,7 @@ if __name__ == "__main__":
     dataset = PretrainDataset(
         data_path=temp_file_path,
         tokenizer=tokenizer,
-        max_length=512
+        max_length=450
     )
     
     print("\n=== PretrainDataset 样本检查 ===")
@@ -489,7 +489,7 @@ if __name__ == "__main__":
     sft_dataset = SFTDataset(
         data_path=temp_sft_path,
         tokenizer=tokenizer,
-        max_length=32
+        max_length=50
     )
 
     print("\n=== SFTDataset 样本检查 ===")
@@ -498,6 +498,6 @@ if __name__ == "__main__":
     print("Labels:", sft_item["labels"])
     print("Loss Mask:", sft_item["loss_mask"])
     print("Decoded Input:", tokenizer.decode(sft_item["input_ids"], skip_special_tokens=False))
-    print("Decoded Labels:", tokenizer.decode(sample["labels"], skip_special_tokens=False))
+    print("Decoded Labels:", tokenizer.decode(sft_item["labels"], skip_special_tokens=False))
 
     os.remove(temp_sft_path)
