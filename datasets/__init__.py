@@ -1,8 +1,5 @@
 __version__ = "0.1.0"
 
-# 数据集加载器
-from .datasets import BaseDataset
-
 # 数据集全量加载器
 from .datasets import PretrainDataset
 from .datasets import SFTDataset
@@ -15,7 +12,6 @@ from .datasets import StreamingSFTDataset
 from .sqlmanager import SQLiteDatabaseManager
 
 __all__ = [
-    "BaseDataset",
     "PretrainDataset",  
     "StreamingPretrainDataset",
     "SFTDataset",
