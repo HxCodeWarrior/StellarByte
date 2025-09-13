@@ -394,7 +394,14 @@ def init_model(config, device):
 
     return model, tokenizer
 
-def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("cpu"), config=None):
+def evaluate(
+    model, 
+    eval_dataset, 
+    tokenizer, 
+    batch_size=8, 
+    device=torch.device("cpu"), 
+    config=None
+):
     """
     工业级的LLM预训练模型评估函数。
 
@@ -440,14 +447,16 @@ def evaluate(model, eval_dataset, tokenizer, batch_size=8, device=torch.device("
     rougeL_scores = []
     meteor_scores = []
 
-    if not config.use_streaming:
+    if config.use_streaming:
+        # 如果使用流式评估，需要计算总步数
+        data_iter = eval_dataloader
+        total_batches = len(eval_dataloader)
+    else:
+        # 全量加载，使用迭代器
         if config.eval_steps is None:
             raise ValueError("Streaming dataset must set eval_steps for evaluation.")
         data_iter = islice(eval_dataloader, config.eval_steps)
         total_batches = config.eval_steps
-    else:
-        data_iter = eval_dataloader
-        total_batches = len(eval_dataloader)
 
     # 禁用梯度计算，加快评估速度、减少显存占用
     with torch.no_grad():
@@ -598,11 +607,13 @@ def train_epoch(
     train_config       = config # 获取训练相关配置
     # 每epoch的迭代次数
     if not config.use_streaming:
-        iter_per_epoch = len(train_dataloader) # 数据集全量加载
-        data_iter      = train_dataloader
-    else:
-        iter_per_epoch = config.steps_per_epoch # 数据集流式加载
+        # 数据集流式加载
+        iter_per_epoch = config.steps_per_epoch 
         data_iter      = islice(train_dataloader, iter_per_epoch)
+    else:
+        # 数据集全量加载
+        iter_per_epoch = len(train_dataloader) 
+        data_iter      = train_dataloader
     accumulation_steps = train_config.gradient_accumulation_steps  # 梯度累积步数
     max_grad_norm      = train_config.max_grad_norm                # 梯度裁剪阈值
     # === 初始化损失与token计数统计变量 ===
@@ -894,20 +905,8 @@ def train(config_path: str):
     logger.info(f"模型总参数: {total_params:,} | 可训练参数: {trainable_params:,}")
     
     # 初始化数据集
-    if not config.use_streaming:
-        # 数据集加载方式1：全量加载
-        train_dataset = PretrainDataset(
-            data_path=config.train_data,
-            tokenizer=tokenizer,
-            max_length=config.max_seq_len
-        )
-        eval_dataset = PretrainDataset(
-            data_path=config.eval_data,
-            tokenizer=tokenizer,
-            max_length=config.max_seq_len
-        ) if config.eval_data else None
-    else:
-        # 数据集加载方式2：流式加载
+    if config.use_streaming:
+        # 数据集加载方式1：流式加载
         train_dataset = StreamingPretrainDataset(
             data_path  = config.train_data,
             tokenizer  = tokenizer,
@@ -918,6 +917,18 @@ def train(config_path: str):
             data_path  = config.eval_data,
             tokenizer  = tokenizer,
             max_length = config.max_seq_len
+        ) if config.eval_data else None
+    else:
+        # 数据集加载方式2：全量加载
+        train_dataset = PretrainDataset(
+            data_path=config.train_data,
+            tokenizer=tokenizer,
+            max_length=config.max_seq_len
+        )
+        eval_dataset = PretrainDataset(
+            data_path=config.eval_data,
+            tokenizer=tokenizer,
+            max_length=config.max_seq_len
         ) if config.eval_data else None
     
     # 创建数据加载器
@@ -942,12 +953,12 @@ def train(config_path: str):
     scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
     
     # 学习率调度器
-    if not config.use_streaming:
-        # 全量加载 total_steps 
-        total_steps  = len(train_loader) * config.train_epochs
-    else:
+    if config.use_streaming:
         # 流式加载 total_steps
         total_steps = config.steps_per_epoch * config.train_epochs
+    else:
+        # 全量加载 total_steps 
+        total_steps  = len(train_loader) * config.train_epochs
     lr_scheduler = lambda step: cosine_annealing_lr(
         current_step  = step,
         total_steps   = total_steps,
@@ -1033,7 +1044,8 @@ def train(config_path: str):
                 eval_dataset = eval_dataset,
                 tokenizer    = tokenizer,
                 batch_size   = config.eval_batch_size,
-                device       = device
+                device       = device,
+                config       = config
             )
 
             # 初始化best_val_metric
