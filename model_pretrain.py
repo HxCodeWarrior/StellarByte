@@ -798,7 +798,8 @@ def train_epoch(
                     eval_dataset,
                     tokenizer, 
                     batch_size=train_config.eval_batch_size,
-                    device=device
+                    device=device,
+                    config=train_config
                 )
                 
                 # 保存最佳模型（基于验证损失）
