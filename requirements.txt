@@ -1,11 +1,13 @@
 # ============= 核心依赖 =============
 # 深度学习框架
+torch
+torchvision
+torchaudio
 torch_scatter
-transformers
+transformers>=4.40.0
 
 # Tokenizer
 sentencepiece
-
 
 # 数据处理
 numpy>=1.24.0
@@ -57,14 +59,16 @@ torch-xla>=2.0.0 ; platform_system != "Windows"
 
 # ============= 性能优化 =============
 # 内存优化
-accelerator>=0.20.0
+accelerate>=0.20.0 ; platform_system != "Windows"
+torch-optimizer>=0.3.0
 
 # ============= 日志与工具 =============
 # 日志管理
-logging-formatter>=1.0.0
 tqdm>=4.65.0
+
+# 系统资源监控
+psutil>=5.9.0
 
 # ============= 其他工具 =============
 typing-extensions>=4.7.0
 requests>=2.31.0
-
