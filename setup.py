@@ -32,7 +32,7 @@ setup(
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Creative Commons Attribution-NonCommercial 4.0 International License",
         "Operating System :: OS Independent",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
@@ -54,4 +54,10 @@ setup(
         ],
     },
     include_package_data=True,
+    entry_points={
+        "console_scripts": [
+            "stellarbyte-pretrain=model_pretrain:main",
+            "stellarbyte-tokenizer=tokenizer_pretrain:main",
+        ],
+    },
 )
