@@ -606,7 +606,7 @@ def train_epoch(
     model.train()               # 设置模型为训练模式（启用dropout等）
     train_config       = config # 获取训练相关配置
     # 每epoch的迭代次数
-    if not config.use_streaming:
+    if config.use_streaming:
         # 数据集流式加载
         iter_per_epoch = config.steps_per_epoch 
         data_iter      = islice(train_dataloader, iter_per_epoch)
