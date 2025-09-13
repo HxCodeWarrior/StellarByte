@@ -448,15 +448,15 @@ def evaluate(
     meteor_scores = []
 
     if config.use_streaming:
-        # 如果使用流式评估，需要计算总步数
-        data_iter = eval_dataloader
-        total_batches = len(eval_dataloader)
-    else:
-        # 全量加载，使用迭代器
+        # 流式评估，仅计算指定步数
         if config.eval_steps is None:
             raise ValueError("Streaming dataset must set eval_steps for evaluation.")
         data_iter = islice(eval_dataloader, config.eval_steps)
         total_batches = config.eval_steps
+    else:
+        # 全量评估，计算所有数据
+        data_iter = eval_dataloader
+        total_batches = len(eval_dataloader)
 
     # 禁用梯度计算，加快评估速度、减少显存占用
     with torch.no_grad():
@@ -466,11 +466,10 @@ def evaluate(
         for batch in pbar:
             # 将batch中的输入转移到指定设备
             input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
             labels         = batch["labels"].to(device)
 
             # 前向传播，获取损失和输出logits
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs.loss
             logits = outputs.logits
 
