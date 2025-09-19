@@ -1,89 +1,63 @@
 import torch
 from transformers import PretrainedConfig
+from typing import Optional
 
-class ByteModelConfig(PretrainedConfig):
+class StellarByteModelArgs(PretrainedConfig):
     model_type = "stellarbyte_model"
 
     def __init__(
         self,
-        vocab_size: int = 32768,              # 词汇表大小
-        model_dim: int = 768,                 # 模型维度
-        num_layers: int = 12,                 # Transformer层数
-        num_attention_heads: int = 16,        # 多头注意力头数
-        num_kv_heads: int = 8,                # 多头KV注意力头数（默认为num_heads，可做头分离）
-        hidden_dim: int = None,               # 隐藏层维度
-        dim_multiplier: int = 4,              # 隐藏层维度的对齐基数
-        max_seq_len: int = 2048,              # 最大序列长度
-        drop_path_prob: float = 0.0,          # DropPath残差连接dropout率
-        hidden_dropout_prob: float = 0.1,     # 隐藏层dropout率
-        attention_dropout_prob: float = 0.1,  # 注意力dropout率
-        residual_dropout_prob: float = 0.1,   # 残差连接dropout率
-        layer_norm_eps: float = 1e-5,         # 层归一化epsilon值
-        base_theta: float = 10000.0,          # 位置编码theta参数
-        ntk_alpha: float = 1.0,               # 位置编码NTK-alpha参数
-        use_flash_attention: bool = False,    # 是否使用FlashAttention
-        use_kvcache: bool = True,             # 是否使用KV缓存加速推理
-        cache_dtype: torch.dtype = torch.float16,  # KV缓存中Key的精度
-        attention_window_size: int = 0,        # 注意力窗口大小
-        parallel_residual: bool = True,        # 串并行残差
-        tensor_parallel_size: int = 1,         # 张量并行大小
-        tensor_parallel_group: int = 0,        # 张量并行rank
-        layerscale_init : float = 1e-5,        # 层尺度初始化值
-        initializer_range: float = 0.02,       # 权重初始化范围
-        moe_enabled: bool = False,             # 是否使用MoE
-        moe_num_experts: int = 2,              # 专家数量
-        moe_k: int = 1,                        # 每个专家选择的token数
-        moe_capacity_factor: float = 1.25,     # 专家容量因子
-        moe_loss_coefficient: float = 0.01,    # 专家损失系数
-        moe_world_size: int = 1,               # MoE并行大小
-        moe_rank: int = 0,                     # MoE并行rank
+        vocab_size: int = 32768,
+        dim: int = 4096,
+        num_layers: int = 32,
+        num_heads: int = 32,
+        num_kv_heads: Optional[int] = None,
+        multiple_of: int = 256,  # make SwiGLU hidden layer size     multiple of large power of 2
+        ffn_dim_multiplier: Optional[float] = None,
+        norm_eps: float = 1e-5,
+        rope_theta: float = 500000,
+        max_batch_size: int = 32,
+        max_seq_len: int = 2048,
+        enabled_flash_attn: bool = False,
+        atttention_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+
+        enabled_moe: bool = False,
+        num_experts_per_tok: int = 2,
+        num_routed_experts: int = 4,
+        num_shared_experts: int = 1,
+        scoring_func: str = 'softmax',
+        aux_loss_alpha: float = 0.1,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
         **kwargs
     ):
         self.vocab_size = vocab_size
-        self.model_dim = model_dim
+        self.dim = dim
         self.num_layers = num_layers
-        self.num_attention_heads = num_attention_heads
+        self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.hidden_dim = hidden_dim if hidden_dim is not None else 4 * model_dim
-        self.dim_multiplier = dim_multiplier
+        self.multiple_of = multiple_of
+        self.ffn_dim_multiplier = ffn_dim_multiplier
+        self.norm_eps = norm_eps
+        self.rope_theta = rope_theta
+        self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
-        self.layer_norm_eps = layer_norm_eps
-
-        # ======== Initializer =========
-        self.initializer_range = initializer_range
-        self.layerscale_init = layerscale_init
-
-        # ========== Dropout ===========
-        self.residual_dropout_prob = residual_dropout_prob
-        self.hidden_dropout_prob = hidden_dropout_prob
-        self.attention_dropout_prob = attention_dropout_prob
-        self.drop_path_prob = drop_path_prob
-
-        # ========= Attention ==========
-        self.use_flash_attention = use_flash_attention
-        self.attention_window_size = attention_window_size
+        self.enabled_flash_attn = enabled_flash_attn
+        self.attention_dropout = atttention_dropout
+        self.resid_dropout = resid_dropout
+        self.ffn_dropout = ffn_dropout
         
         # ========== MoELayer ==========
-        self.moe_enabled = moe_enabled
-        self.moe_num_experts = moe_num_experts
-        self.moe_k = moe_k
-        self.moe_capacity_factor = moe_capacity_factor
-        self.moe_loss_coefficient = moe_loss_coefficient
-        self.world_size = moe_world_size
-        self.rank = moe_rank
-
-        # ======== Dynamic RoPE ========
-        self.base_theta = base_theta
-        self.ntk_alpha = ntk_alpha
-
-        # ========== KV Cache ==========
-        self.use_kvcache = use_kvcache
-        self.cache_dtype = cache_dtype
-
-        # ========== Parallel ===========
-        self.parallel_residual = parallel_residual
-        self.tensor_parallel_size = tensor_parallel_size
-        self.tensor_parallel_group = tensor_parallel_group
+        self.enabled_moe = enabled_moe,
+        self.num_experts_per_tok = num_experts_per_tok,
+        self.num_routed_experts = num_routed_experts,
+        self.num_shared_experts = num_shared_experts,
+        self.scoring_func = scoring_func,
+        self.aux_loss_alpha = aux_loss_alpha,
+        self.seq_aux = seq_aux,
+        self.norm_topk_prob = norm_topk_prob,
         
         super().__init__(
             **kwargs

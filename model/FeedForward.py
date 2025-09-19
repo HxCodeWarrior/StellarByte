@@ -1,13 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear
+)
+from typing import Optional
 
 try:
-    from .RMSNorm import ByteRMSNorm
+    from .config import StellarByteModelArgs
+    from .RMSNorm import StellarByteRMSNorm
 except ImportError:
-    from RMSNorm import ByteRMSNorm
+    from config import StellarByteModelArgs
+    from RMSNorm import StellarByteRMSNorm
 
-class ByteMLP(nn.Module):
+class StellarByteMLP(nn.Module):
     """
     门控多层感知机(Gated MLP)模块，Transformer中前馈网络的改进实现。
 
@@ -20,7 +27,7 @@ class ByteMLP(nn.Module):
         w1 (nn.Linear): 输入投影层，输出值分支（GEGLU结构）
         w2 (nn.Linear): 输出投影层，将隐藏层映射回原始维度
         w3 (nn.Linear): 输出投影层，输出门控权重
-        norm (ByteRMSNorm): RMS归一化层
+        norm (StellarByteRMSNorm): RMS归一化层
         dropout (nn.Dropout): 随机失活层防止过拟合
 
     参数:
@@ -29,37 +36,42 @@ class ByteMLP(nn.Module):
         multiple_of (int, optional): 隐藏层维度对齐基数(默认256)
         dropout (float, optional): 随机失活概率(默认0.1)
         eps (float, optional): RMSNorm的数值稳定常数(默认1e-6)
-        bias (bool, optional): 线性层是否使用偏置(默认False)
     """
 
     def __init__(
         self,
         dim: int,
-        hidden_dim: int = None,
-        multiple_of: int = 256,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
         dropout: float = 0.1,
         eps: float = 1e-6,
-        bias: bool = False,
     ):
         super().__init__()
 
-        # 若未指定 hidden_dim，则按 (8/3)*dim 向上取整为 multiple_of 的倍数
-        if hidden_dim is None:
-            # 基础计算：约为原始维度的3倍 (8/3 ≈ 2.666)
-            hidden_dim = int(8 * dim / 3)
-            # 向上对齐到multiple_of的倍数（确保硬件友好）
-            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        # 门控投影层：dim -> 2*hidden_dim
-        # 输出将拆分为值分支和门控分支
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)  # gate/激活分支
-        self.w3 = nn.Linear(dim, hidden_dim, bias=bias)  # value/线性分支
+        # 门控分支线性层 (输入dim -> 隐藏层hidden_dim)
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        ) 
 
-        # 输出投影层，将 hidden_dim 降回 dim
-        self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
+        # 值分支线性层 (输入dim -> 隐藏层hidden_dim)
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        )
+
+        # 输出投影层 (隐藏层hidden_dim -> 输出dim)
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        )
 
         # 使用 RMSNorm 进行归一化，更快且数值稳定
-        self.norm = ByteRMSNorm(dim, eps)
+        self.norm = StellarByteRMSNorm(dim, eps)
 
         # Dropout 层，控制过拟合
         self.dropout = nn.Dropout(dropout)
@@ -106,24 +118,33 @@ class ByteMLP(nn.Module):
         return output
 
 if __name__ == '__main__':
-    from config import ByteModelConfig
+    from config import StellarByteModelArgs
 
     # 初始化模型配置（假设 config 提供了基本结构参数）
-    args = ByteModelConfig(
-        model_dim=128,                # 输入维度
-        num_attention_heads=8,        # 多头注意力数（未使用于此 MLP）
-        dim_multiplier=4,             # 隐藏层维度放大倍率（未直接用到）
-        residual_dropout_prob=0.1,    # Dropout 概率
+    args = StellarByteModelArgs(
+        dim=128,
+        hidden_dim=256,
+        multiple_of=256,
+        ffn_dim_multiplier=1,
+        num_heads=8,
+        dim_multiplier=4,
     )
 
-    # 创建 ByteMLP 实例
-    ByteMLP = ByteMLP(args.model_dim)
+    # 创建 ByteMLP 实例，传递所有必需参数
+    mlp = StellarByteMLP(
+        dim=args.dim,
+        hidden_dim=args.hidden_dim,
+        multiple_of=args.multiple_of,
+        ffn_dim_multiplier=args.ffn_dim_multiplier,
+        dropout=0.1,
+        eps=1e-6
+    )
 
     # 构造输入张量 [batch=2, seq_len=16, dim=128]
-    x = torch.randn(2, 16, args.model_dim)
+    x = torch.randn(2, 16, args.dim)
 
     # 前向传播
-    output = ByteMLP(x)
+    output = StellarByteMLP(x)
 
     # 打印输入输出维度
     print("Input shape : {}".format(x.shape))      # torch.Size([2, 16, 128])
