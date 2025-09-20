@@ -233,9 +233,6 @@ class StellarByteMOEFeedForward(nn.Module):
 
 
 if __name__ == "__main__":
-    import torch
-    from config import StellarByteModelArgs  # 确保从正确位置导入配置类
-    
     print("="*50)
     print("StellarByteMOEFeedForward 形状验证测试")
     print("="*50)

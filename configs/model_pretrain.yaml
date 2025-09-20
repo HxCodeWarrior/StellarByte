@@ -18,8 +18,8 @@ experiment:
   # 项目名可设置为None使用随机字符串，建议不设置以使用随机生成字符串
   # : : : : : : : : : : : 
   use_swanlab: False               # 是否启用swanlab
-  project_name: "ByteLM-Pretrain"  # 项目名称
-  run_name: "baseline-158M"        # 实验运行名称
+  project_name: "StellarByteLM-Pretrain"  # 项目名称
+  run_name: "baseline"        # 实验运行名称
   mode: "cloud"                    # SwanLab记录模式: 'cloud','cloud-only','local','disabled'
   logdir: "./swanlab_run"          # SwanLab记录日志保存路径
   api_key: ""                      # SwanLab API密钥
@@ -56,14 +56,14 @@ model:
   
   # MoE专家网络
   moe:
-    enabled_moe: false            # 是否启用Mixture of  Experts (原名 moe_enabled)
+    enabled_moe: False            # 是否启用Mixture of  Experts (原名 moe_enabled)
     num_experts_per_tok: 2        # 每个token选择的专家数 (原名   moe_k)
     num_routed_experts: 4         # 路由专家数量 (原名  moe_num_experts)
     num_shared_experts: 1         # 共享专家数量
     scoring_func: "softmax"       # 专家选择函数
     aux_loss_alpha: 0.01          # 辅助损失系数 (原名  moe_loss_coefficient)
-    seq_aux: true                 # 序列级辅助损失
-    norm_topk_prob: true          # 标准化top-k概率
+    seq_aux: True                 # 序列级辅助损失
+    norm_topk_prob: True          # 标准化top-k概率
     gating_dim: 768               # 门控网络维度, 与dim保持一致
   
   # 正则化
