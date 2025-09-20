@@ -34,54 +34,49 @@ data:
 model:
   # 基础参数
   vocab_size: 32768             # 词汇表大小
-  model_dim: 768                # 模型隐藏层维度
+  dim: 768                      # 模型隐藏层维度
   num_layers: 12                # Transformer层数
   max_seq_len: 2048             # 最大序列长度
-  layer_norm_eps: 1e-5          # LayerNorm的epsilon值
-  initializer_range: 0.02       # 权重初始化标准差
-  layerscale_init: 1e-5         # 层缩放参数γ的初始值
-  parallel_residual: True       # 是否使用并行残差连接
+  norm_eps: 1e-6                # LayerNorm的epsilon
+  rope_theta: 10000.0           # RoPE位置编码基数
   
   # 注意力机制
   attention:
     num_heads: 16               # 注意力头总数
     num_kv_heads: 8             # Key/Value头数(分组查询注意力)
-    use_flash_attention: False  # 是否启用FlashAttention
-    attention_window_size: 0    # 滑动窗口大小(0: 全局注意力)
-    attention_dropout_prob: 0.1 # 注意力权重Dropout概率
-    base_theta: 10000.0         # RoPE位置编码基数
-    ntk_alpha: 1.0              # NTK动态缩放因子
+    enabled_flash_attn: False   # 是否启用FlashAttention
+    attention_dropout: 0.0      # 注意力权重Dropout概率
+    max_batch_size: 32          # 最大批次大小
   
   # 前馈网络
   feed_forward:
-    hidden_dim: 3072             # MLP隐藏层维度(4*model_dim)
-    dim_multiplier: 4            # 隐藏层维度计算倍数
-    hidden_dropout_prob: 0.1     # MLP层Dropout概率
-    activation: "gelu"           # 激活函数类型
-    moe_dropout_prob: 0.1        # MoE激活函数Dropout概率
-    moe_enabled: False           # 是否启用Mixture of Experts
-    moe_num_experts: 1           # 专家数量
-    moe_k: 1                     # 每个专家选择的token数
-    moe_capacity_factor: 1.25    # 专家容量因子
-    moe_loss_coefficient: 0.01   # 专家损失系数
-    moe_world_size: 1            # MoE并行组大小
-    moe_rank: 0                  # MoE并行组rank
+    multiple_of: 256             # 前馈层维度倍数
+    ffn_dim_multiplier: null     # 隐藏层维度计算倍数
+    ffn_dropout: 0.1             # FeedForward层Dropout概率
+  
+  # MoE专家网络
+  moe:
+    enabled_moe: false            # 是否启用Mixture of  Experts (原名 moe_enabled)
+    num_experts_per_tok: 2        # 每个token选择的专家数 (原名   moe_k)
+    num_routed_experts: 4         # 路由专家数量 (原名  moe_num_experts)
+    num_shared_experts: 1         # 共享专家数量
+    scoring_func: "softmax"       # 专家选择函数
+    aux_loss_alpha: 0.01          # 辅助损失系数 (原名  moe_loss_coefficient)
+    seq_aux: true                 # 序列级辅助损失
+    norm_topk_prob: true          # 标准化top-k概率
+    gating_dim: 768               # 门控网络维度, 与dim保持一致
   
   # 正则化
   regularization:
-    residual_dropout_prob: 0.1  # 残差连接Dropout概率
-    drop_path_prob: 0.0         # DropPath最大丢弃概率
+    resid_dropout: 0.1            # 残差连接Dropout概率
   
   # KVCache机制
   kv_cache:
-    use_kvcache: False         # 是否启用KVCache
-    cache_layers: 1            # KVCach层数
-    cache_dtype: float16       # 缓存数据类型
+    enabled_kvcache: False        # 是否启用KVCache
     
-  # 张量并行
+  # 并行
   parallel:
-    tensor_parallel_size: 1      # 张量并行组大小
-    tensor_parallel_groups: 1    # 张量并行组数
+    model_parallel_size: 1        # 模型并行组大小
 
 # 训练配置
 training:
