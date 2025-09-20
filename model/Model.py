@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional,List,Tuple,Union
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     VocabParallelEmbedding,
 )
-from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 try:
@@ -65,7 +66,7 @@ class StellarByteModel(nn.Module):
             params.rope_theta,  # RoPE的theta参数
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, targets: Optional[torch.Tensor] = None):
         # 获取输入tokens的批次大小和序列长度
         _bsz, seqlen = tokens.shape
         # 将tokens转换为词嵌入向量
@@ -83,6 +84,22 @@ class StellarByteModel(nn.Module):
         # 通过输出层获取预测结果，并转换为float类型
         output = self.output(h).float()
         
+        # 根据是否提供targets决定输出计算方式
+        if targets is not None:
+            # 训练模式：计算全部位置的logits和损失
+            logits = self.output(h)
+            # 计算交叉熵损失，忽略索引0（padding），保持每个位置的损失值
+            last_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=0, 
+                reduction='none'
+            )
+        else:
+            # 推理模式：只计算最后一个位置的输出
+            logits = self.output(h[:, [-1], :]) 
+            last_loss = None
+
         # 计算所有MoE层的辅助损失之和（用于负载平衡）
         aux_loss = sum(
             layer.feed_forward.aux_loss  # 获取每层的辅助损失
@@ -90,8 +107,7 @@ class StellarByteModel(nn.Module):
             if isinstance(layer.feed_forward, StellarByteMOEFeedForward)  # 只处理MoE层
         )
         # 返回输出和辅助损失
-        return output, aux_loss
-
+        return output, logits, last_loss, aux_loss
 
 class StellarByteForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = StellarByteModelArgs
@@ -99,8 +115,13 @@ class StellarByteForCausalLM(PreTrainedModel, GenerationMixin):
     def __init__(self, config: StellarByteModelArgs = None):
         self.config = config or StellarByteModelArgs()
         super().__init__(self.config)
-        self.model = StellarByteModelArgs(self.config)
+        self.model = StellarByteModel(self.config)
         self.OUT = CausalLMOutputWithPast()
-
-    def forward():
-        pass
+    
+    def forward(self, tokens: torch.Tensor, start_pos: int, targets: Optional[torch.Tensor] = None, **args):
+        output, logits, last_loss, aux_loss = self.model(tokens, start_pos, targets, **args)
+        self.OUT.__setitem__('output', output)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('last_loss', last_loss)
+        self.OUT.__setitem__('aux_loss', aux_loss)
+        return self.OUT

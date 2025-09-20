@@ -3,7 +3,7 @@ from transformers import PretrainedConfig
 from typing import Optional
 
 class StellarByteModelArgs(PretrainedConfig):
-    model_type = "stellarbyte_model"
+    model_type = "StellarByte_CausalLM"
 
     def __init__(
         self,
