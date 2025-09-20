@@ -14,7 +14,7 @@ except ImportError:
     from config import StellarByteModelArgs
     from RMSNorm import StellarByteRMSNorm
 
-class StellarByteMLP(nn.Module):
+class StellarByteFeedForward(nn.Module):
     """
     门控多层感知机(Gated MLP)模块，Transformer中前馈网络的改进实现。
 
@@ -131,7 +131,7 @@ if __name__ == '__main__':
     )
 
     # 创建 ByteMLP 实例，传递所有必需参数
-    mlp = StellarByteMLP(
+    mlp = StellarByteFeedForward(
         dim=args.dim,
         hidden_dim=args.hidden_dim,
         multiple_of=args.multiple_of,
@@ -144,7 +144,7 @@ if __name__ == '__main__':
     x = torch.randn(2, 16, args.dim)
 
     # 前向传播
-    output = StellarByteMLP(x)
+    output = StellarByteFeedForward(x)
 
     # 打印输入输出维度
     print("Input shape : {}".format(x.shape))      # torch.Size([2, 16, 128])

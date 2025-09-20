@@ -8,14 +8,14 @@ try:
     from .config import StellarByteModelArgs  # 模型配置类
     from .RMSNorm import StellarByteRMSNorm  # RMS归一化层
     from .Attention import StellarByteAttention  # 注意力机制
-    from .FeedForward import StellarByteMLP  # 普通前馈网络
+    from .FeedForward import StellarByteFeedForward  # 普通前馈网络
     from .MoE import StellarByteMOEFeedForward  # 混合专家前馈网络
 except:
     # 如果相对导入失败，尝试绝对导入（用于独立运行或测试）
     from config import StellarByteModelArgs
     from RMSNorm import StellarByteRMSNorm
     from Attention import StellarByteAttention
-    from FeedForward import StellarByteMLP
+    from FeedForward import StellarByteFeedForward
     from MoE import StellarByteMOEFeedForward
 
 
@@ -31,7 +31,7 @@ class StellarByteBlock(nn.Module):
         head_dim (int): 每个注意力头的维度
         attention (StellarByteAttention): 自注意力机制实例
         enabled_moe (bool): 是否启用混合专家模式
-        feed_forward (Union[StellarByteMLP, StellarByteMOEFeedForward]): 前馈网络
+        feed_forward (Union[StellarByteFeedForward, StellarByteMOEFeedForward]): 前馈网络
         layer_id (int): 当前层的ID标识
         attention_norm (StellarByteRMSNorm): 注意力前的归一化层
         ffn_norm (StellarByteRMSNorm): 前馈前的归一化层
@@ -62,7 +62,7 @@ class StellarByteBlock(nn.Module):
         if args.enabled_moe:
             self.feed_forward = StellarByteMOEFeedForward(args)
         else:
-            self.feed_forward = StellarByteMLP(
+            self.feed_forward = StellarByteFeedForward(
                 dim=args.dim,  # 输入维度
                 hidden_dim=4 * args.dim,  # 隐藏层维度（通常为4倍输入维度）
                 multiple_of=args.multiple_of,  # 确保维度是该值的倍数

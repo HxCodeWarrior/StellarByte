@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
-class StellarByteRotaryPositionEmbedding(nn.Module):
+class StellarByteRoPE(nn.Module):
     """
     旋转位置编码 (Rotary Position Embedding, RoPE) 实现类
     
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     head_dim = 64
     
     # 创建RoPE实例
-    rope = StellarByteRotaryPositionEmbedding(dim=head_dim, max_seq_len=512)
+    rope = StellarByteRoPE(dim=head_dim, max_seq_len=512)
     
     # 创建随机查询和键张量
     xq = torch.randn(batch_size, seq_len, n_heads, head_dim)

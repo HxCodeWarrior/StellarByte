@@ -15,7 +15,7 @@ from typing import Optional
 
 try:
     from .config import StellarByteModelArgs
-    from .PositionEmbedding import StellarByteRotaryPositionEmbedding
+    from .PositionEmbedding import StellarByteRoPE
 except:
     from config import StellarByteModelArgs
 
@@ -34,7 +34,7 @@ class StellarByteAttention(nn.Module):
         head_dim (int): 每个注意力头的维度
         scale (float): 注意力分数缩放因子
         enabled_flash_attn (bool): 是否启用FlashAttention
-        rope (StellarByteRotaryPositionEmbedding): 旋转位置编码实例
+        rope (StellarByteRoPE): 旋转位置编码实例
         wq (ColumnParallelLinear): 查询投影层
         wk (ColumnParallelLinear): 键投影层
         wv (ColumnParallelLinear): 值投影层
@@ -78,7 +78,7 @@ class StellarByteAttention(nn.Module):
             print("FlashAttention is not available, using regular attention")
 
         # 初始化旋转位置编码
-        self.rope = StellarByteRotaryPositionEmbedding(
+        self.rope = StellarByteRoPE(
             args.dim,  # 模型维度
             args.max_seq_len,  # 最大序列长度
             args.rope_theta,  # RoPE的theta参数

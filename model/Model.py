@@ -12,13 +12,13 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 try:
     from .config import StellarByteModelArgs
     from .RMSNorm import StellarByteRMSNorm
-    from .PositionEmbedding import StellarByteRotaryPositionEmbedding
+    from .PositionEmbedding import StellarByteRoPE
     from .TransformerBlock import StellarByteBlock
     from .MoE import StellarByteMOEFeedForward
 except:
     from config import StellarByteModelArgs
     from RMSNorm import StellarByteRMSNorm
-    from PositionEmbedding import StellarByteRotaryPositionEmbedding
+    from PositionEmbedding import StellarByteRoPE
     from TransformerBlock import StellarByteBlock
     from MoE import StellarByteMOEFeedForward
 
@@ -60,7 +60,7 @@ class StellarByteModel(nn.Module):
         )
 
         # 预计算旋转位置编码的频率矩阵
-        self.freqs_cis = StellarByteRotaryPositionEmbedding.precompute_freqs_cis(
+        self.freqs_cis = StellarByteRoPE.precompute_freqs_cis(
             params.dim // params.n_heads,  # 每个头的维度
             params.max_seq_len * 2,  # 最大序列长度（乘以2可能是为了缓存）
             params.rope_theta,  # RoPE的theta参数
