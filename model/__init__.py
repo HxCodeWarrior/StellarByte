@@ -16,7 +16,7 @@ from .Attention import StellarByteAttention
 from .FeedForward import StellarByteFeedForward
 from .MoE import StellarByteMOEFeedForward
 from .TransformerBlock import StellarByteBlock
-from .Model import StellarByteModel, StellarByteForCausalLM
+from .Model import StellarByteModel
 
 # 导出工具模块
 from .utils.KVCache import ByteKVCache
@@ -24,7 +24,6 @@ from .utils.LoRA import LoRALinear
 
 __all__ = [
     "StellarByteModel",
-    "StellarByteForCausalLM",
     "StellarByteBlock",
     "StellarByteModelArgs",
     "StellarByteRMSNorm",

@@ -56,19 +56,13 @@ class StellarByteFeedForward(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         # 门控分支线性层 (输入dim -> 隐藏层hidden_dim)
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        ) 
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False) 
 
         # 值分支线性层 (输入dim -> 隐藏层hidden_dim)
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
         # 输出投影层 (隐藏层hidden_dim -> 输出dim)
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
 
         # 使用 RMSNorm 进行归一化，更快且数值稳定
         self.norm = StellarByteRMSNorm(dim, eps)

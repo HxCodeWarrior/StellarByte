@@ -10,7 +10,7 @@ from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from typing import Optional
+from typing import Optional, Tuple
 
 
 try:
@@ -18,6 +18,7 @@ try:
     from .PositionEmbedding import StellarByteRoPE
 except:
     from config import StellarByteModelArgs
+    from PositionEmbedding import StellarByteRoPE
 
 
 class StellarByteAttention(nn.Module):
@@ -28,8 +29,8 @@ class StellarByteAttention(nn.Module):
     
     Attributes:
         num_kv_heads (int): 键值头的数量
-        n_local_heads (int): 本地查询头数量
-        n_local_kv_heads (int): 本地键值头数量
+        num_local_heads (int): 本地查询头数量
+        num_local_kv_heads (int): 本地键值头数量
         n_rep (int): 每个键值头需要重复的次数
         head_dim (int): 每个注意力头的维度
         scale (float): 注意力分数缩放因子
@@ -58,13 +59,13 @@ class StellarByteAttention(nn.Module):
         # 设置键值头的数量，如果没有单独指定，则使用与查询头相同的数量
         self.num_kv_heads = args.num_heads if args.num_kv_heads is None else args.num_kv_heads
         # 获取模型并行组的大小（GPU数量）
-        model_parallel_size = fs_init.get_model_parallel_world_size()
+        model_parallel_size = args.model_parallel_size
         # 计算每个GPU上的本地查询头数量
-        self.n_local_heads = args.num_heads // model_parallel_size
+        self.num_local_heads = args.num_heads // model_parallel_size
         # 计算每个GPU上的本地键值头数量
-        self.n_local_kv_heads = self.num_kv_heads // model_parallel_size
+        self.num_local_kv_heads = self.num_kv_heads // model_parallel_size
         # 计算每个键值头需要重复的次数以匹配查询头数量
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.num_rep = self.num_local_heads // self.num_local_kv_heads
         # 计算每个注意力头的维度
         self.head_dim = args.dim // args.num_heads
         # 设置缩放因子，用于缩放注意力分数
@@ -84,43 +85,32 @@ class StellarByteAttention(nn.Module):
             args.rope_theta,  # RoPE的theta参数
         )
 
-        # 使用Xavier均匀分布初始化权重
-        init_method = nn.init.xavier_uniform_
-
-        # 初始化查询投影层（列并行）
-        self.wq = ColumnParallelLinear(
+        # 初始化查询投影层
+        self.wq = nn.Linear(
             args.dim,  # 输入维度
             args.num_heads * self.head_dim,  # 输出维度（所有查询头的总维度）
             bias=False,  # 不使用偏置
-            gather_output=False,  # 不收集输出（保持并行）
-            init_method=init_method,  # 初始化方法
         )
         
-        # 初始化键投影层（列并行）
-        self.wk = ColumnParallelLinear(
+        # 初始化键投影层
+        self.wk = nn.Linear(
             args.dim,  # 输入维度
             self.num_kv_heads * self.head_dim,  # 输出维度（所有键头的总维度）
             bias=False,  # 不使用偏置
-            gather_output=False,  # 不收集输出
-            init_method=init_method,  # 初始化方法
         )
         
-        # 初始化值投影层（列并行）
-        self.wv = ColumnParallelLinear(
+        # 初始化值投影层
+        self.wv = nn.Linear(
             args.dim,  # 输入维度
             self.num_kv_heads * self.head_dim,  # 输出维度（所有值头的总维度）
             bias=False,  # 不使用偏置
-            gather_output=False,  # 不收集输出
-            init_method=init_method,  # 初始化方法
         )
         
-        # 初始化输出投影层（行并行）
-        self.wo = RowParallelLinear(
+        # 初始化输出投影层
+        self.wo = nn.Linear(
             args.num_heads * self.head_dim,  # 输入维度（所有头的总维度）
             args.dim,  # 输出维度（模型维度）
             bias=False,  # 不使用偏置
-            input_is_parallel=True,  # 输入已经是并行的
-            init_method=init_method,  # 初始化方法
         )
 
         # 设置是否使用KV缓存
@@ -133,7 +123,7 @@ class StellarByteAttention(nn.Module):
             self.register_buffer('cache_k', torch.zeros(
                 args.max_batch_size,  # 最大批处理大小
                 args.max_seq_len,  # 最大序列长度
-                self.n_local_kv_heads,  # 本地键头数量
+                self.num_local_kv_heads,  # 本地键头数量
                 self.head_dim,  # 头维度
             ), persistent=False)
 
@@ -141,7 +131,7 @@ class StellarByteAttention(nn.Module):
             self.register_buffer('cache_v', torch.zeros(
                 args.max_batch_size,  # 最大批处理大小
                 args.max_seq_len,  # 最大序列长度
-                self.n_local_kv_heads,  # 本地值头数量
+                self.num_local_kv_heads,  # 本地值头数量
                 self.head_dim,  # 头维度
             ), persistent=False)
         
@@ -261,10 +251,10 @@ class StellarByteAttention(nn.Module):
         output = torch.matmul(attn_weights, values)
         
         # 转置回 (bs, seq_len, n_heads, head_dim) 并确保内存连续
-        return output.transpose(1, 2).contiguous()
+        return output
 
     def _compute_attention_flash(self, xq: torch.Tensor, keys: torch.Tensor, 
-                          values: torch.Tensor) -> torch.Tensor:
+                          values: torch.tensor) -> torch.Tensor:
         """使用FlashAttention计算注意力（如果可用）。
         
         该方法使用PyTorch内置的scaled_dot_product_attention函数，
@@ -289,23 +279,26 @@ class StellarByteAttention(nn.Module):
             dropout_p=self.attn_dropout.p if self.training else 0.0  # 训练时使用dropout
         )
         # 转置回 (bs, n_heads, seq_len, head_dim) 并确保内存连续
-        return output.transpose(1, 2).contiguous()
+        return output
 
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         """前向传播函数。
         
         Args:
             x: 输入张量，形状为 (batch_size, seq_len, dim)
-            start_pos: 当前序列在缓存中的起始位置
-            freqs_cis: 预先计算的频率张量，用于旋转位置编码
+            freqs_cos: 预计算的余弦频率张量
+            freqs_sin: 预计算的正弦频率张量
+            past_key_value: 包含过去键和值的元组，形状为(batch_size, seq_len, n_local_kv_heads, head_dim)
             
         Returns:
             注意力输出张量，形状为 (batch_size, seq_len, dim)
+            更新后的键值缓存元组（如果使用缓存）
         """
         # 获取输入张量的形状信息
         batch_size, seqlen, _ = x.shape
@@ -319,12 +312,12 @@ class StellarByteAttention(nn.Module):
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         # 重塑张量形状: (batch_size, seqlen, n_heads, head_dim)
-        xq = xq.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(batch_size, seqlen, self.num_local_heads, self.head_dim)
+        xk = xk.view(batch_size, seqlen, self.num_local_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seqlen, self.num_local_kv_heads, self.head_dim)
 
         # 应用旋转位置编码到查询和键
-        xq, xk = self.rope(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = self.rope(xq, xk, freqs_cos, freqs_sin)
 
         # 处理KV缓存
         if self.enabled_kv_cache:
@@ -332,23 +325,48 @@ class StellarByteAttention(nn.Module):
             self.cache_k = self.cache_k.to(xq)
             self.cache_v = self.cache_v.to(xq)
             
-            # 更新键值缓存（将当前序列插入缓存中的指定位置）
-            self.cache_k[:batch_size, start_pos : start_pos + seqlen] = xk
-            self.cache_v[:batch_size, start_pos : start_pos + seqlen] = xv
-
+            # 如果提供了过去的键值，使用它们
+            if past_key_value is not None:
+                past_key, past_value = past_key_value
+                # 更新键值缓存（将当前序列插入缓存中的指定位置）
+                start_pos = past_key.size(1)
+                self.cache_k[:batch_size, :start_pos] = past_key
+                self.cache_v[:batch_size, :start_pos] = past_value
+                self.cache_k[:batch_size, start_pos : start_pos + seqlen] = xk
+                self.cache_v[:batch_size, start_pos : start_pos + seqlen] = xv
+            else:
+                # 没有过去的键值，从头开始
+                start_pos = 0
+                self.cache_k[:batch_size, :seqlen] = xk
+                self.cache_v[:batch_size, :seqlen] = xv
+            
             # 获取完整的键值缓存（从开始到当前位置+序列长度）
             keys = self.cache_k[:batch_size, : start_pos + seqlen]
             values = self.cache_v[:batch_size, : start_pos + seqlen]
+            cache_len = start_pos
         else:
             # 不使用缓存，直接使用当前键值
             keys, values = xk, xv
+            cache_len = 0
+        
+        # 如果启用了KV缓存，则返回当前缓存的状态
+        # 否则返回None
+        if self.enabled_kv_cache:
+            # 返回当前缓存的状态
+            current_cache_len = cache_len + seqlen
+            past_key_value = (
+                self.cache_k[:batch_size, :current_cache_len],
+                self.cache_v[:batch_size, :current_cache_len]
+            )
+        else:
+            past_key_value = None
 
         # 重复k/v头以匹配查询头的数量（分组查询注意力）
-        keys = self.rope.repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = self.rope.repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = self.rope.repeat_kv(keys, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
+        values = self.rope.repeat_kv(values, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
 
         # 创建因果掩码，防止关注未来信息
-        mask = self._create_causal_mask(seqlen, start_pos, xq.device)
+        mask = self._create_causal_mask(seqlen, cache_len, xq.device)
 
         # 转置以获得正确的形状 (bs, n_heads, seq_len, head_dim)
         xq = xq.transpose(1, 2)
@@ -357,8 +375,6 @@ class StellarByteAttention(nn.Module):
 
         # 根据配置选择使用FlashAttention或常规注意力
         if self.enabled_flash_attn:
-            # 对于FlashAttention，需要确定是否使用因果掩码
-            is_causal = self.enabled_kv_cache or (start_pos == 0)  # 如果使用缓存或从头开始，则使用因果掩码
             output = self._compute_attention_flash(xq, keys, values)
         else:
             output = self._compute_attention(xq, keys, values, mask)
@@ -370,6 +386,66 @@ class StellarByteAttention(nn.Module):
         output = self.resid_dropout(output)
         
         # 应用输出投影
-        output = self.wo(output)
+        output = self.wo(output) # (batch_size, seqlen, dim)
 
-        return output  # (batch_size, seqlen, dim)
+        return output, past_key_value
+
+
+if __name__ == "__main__":
+    # 创建测试配置
+    class StellarByteModelArgs:
+        vocab_size = 32000
+        dim = 512
+        num_heads = 8
+        num_kv_heads = 4
+        max_batch_size = 2
+        max_seq_len = 1024
+        rope_theta = 10000.0
+        enabled_flash_attn = False
+        enabled_kv_cache = True
+        attention_dropout = 0.1
+        resid_dropout = 0.1
+        model_parallel_size = 1
+
+    args = StellarByteModelArgs()
+    
+    # 初始化注意力模块
+    attention = StellarByteAttention(args)
+
+    print("="*50)
+    print("多头自注意力(StellarByteAttention)测试")
+    print("="*50)
+
+    # 测试输入输出形状
+    batch_size = 2
+    seq_len = 64
+    dim = args.dim
+    
+    # 创建随机输入
+    x = torch.randn(batch_size, seq_len, dim)
+    
+    # 创建位置编码频率
+    rope = StellarByteRoPE(dim=args.dim, max_seq_len=args.max_seq_len, theta=args.rope_theta)
+    # 注意：传入的dim是总的dim，不是每个头的dim，所以需要除以num_heads
+    freqs_cos, freqs_sin = rope.precompute_freqs_cis(args.dim//args.num_heads, args.max_seq_len, args.rope_theta)
+    
+    # 测试不同起始位置
+    for cache_len in [0, 32]:
+        print(f"\n测试 start_pos = {cache_len}")
+        
+        # 前向传播
+        output = attention(x, freqs_cos, freqs_sin, cache_len)
+        
+        # 检查输出形状
+        expected_shape = (batch_size, seq_len, dim)
+        actual_shape = output.shape
+        print(f"输入形状: {x.shape}")
+        print(f"期望输出形状: {expected_shape}")
+        print(f"实际输出形状: {actual_shape}")
+        
+        # 验证形状是否正确
+        assert actual_shape == expected_shape, f"形状不匹配! 期望: {expected_shape}, 实际: {actual_shape}"
+        print("✓ 形状验证通过!")
+    
+    print("\n✅ 所有测试通过：旋转位置编码实现正确")
+    print("="*50)

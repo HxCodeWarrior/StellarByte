@@ -8,7 +8,7 @@ class StellarByteModelArgs(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 32768,
-        dim: int = 4096,
+        dim: int = 768,
         num_layers: int = 32,
         num_heads: int = 32,
         num_kv_heads: Optional[int] = None,
@@ -20,9 +20,10 @@ class StellarByteModelArgs(PretrainedConfig):
         max_seq_len: int = 2048,
         enabled_flash_attn: bool = False,
         enabled_kv_cache: bool = False,
-        atttention_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
         resid_dropout: float = 0.0,
         ffn_dropout: float = 0.0,
+        rms_norm_eps: float = 1e-6,
 
         enabled_moe: bool = False,
         num_experts_per_tok: int = 2,
@@ -32,6 +33,9 @@ class StellarByteModelArgs(PretrainedConfig):
         aux_loss_alpha: float = 0.1,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
+        gating_dim: int = 768,
+
+        model_parallel_size: int = 1,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -47,9 +51,10 @@ class StellarByteModelArgs(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.enabled_flash_attn = enabled_flash_attn
         self.enabled_kv_cache = enabled_kv_cache
-        self.attention_dropout = atttention_dropout
+        self.attention_dropout = attention_dropout
         self.resid_dropout = resid_dropout
         self.ffn_dropout = ffn_dropout
+        self.rms_norm_eps = rms_norm_eps
         
         # ========== MoELayer ==========
         self.enabled_moe = enabled_moe,
@@ -60,6 +65,10 @@ class StellarByteModelArgs(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha,
         self.seq_aux = seq_aux,
         self.norm_topk_prob = norm_topk_prob,
+        self.gating_dim = gating_dim,
+
+        # ========== Model Parallel ==========
+        self.model_parallel_size = model_parallel_size
         
         super().__init__(
             **kwargs
