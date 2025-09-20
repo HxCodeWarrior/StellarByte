@@ -257,9 +257,9 @@ class StellarByteAttention(nn.Module):
         # FlashAttention期望输入形状: (batch_size, seq_len, n_heads, head_dim)
         # 并且会自动处理因果掩码
         output = F.scaled_dot_product_attention(
-            xq.transpose(1, 2),  # 转置为 (bs, seq_len, n_heads, head_dim)
-            keys.transpose(1, 2),
-            values.transpose(1, 2),
+            xq,
+            keys,
+            values,
             attn_mask=None,  # FlashAttention自动处理因果掩码
             is_causal=True,  # 启用因果掩码
             dropout_p=self.attn_dropout.p if self.training else 0.0  # 训练时使用dropout
