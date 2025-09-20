@@ -123,25 +123,35 @@ class StellarByteAttention(nn.Module):
             init_method=init_method,  # 初始化方法
         )
 
-        # 延迟缓存初始化，减少内存使用
-        # 注册键缓存缓冲区（不持久化，不保存到检查点）
-        self.register_buffer('cache_k', torch.zeros(
-            args.max_batch_size,  # 最大批处理大小
-            args.max_seq_len,  # 最大序列长度
-            self.n_local_kv_heads,  # 本地键头数量
-            self.head_dim,  # 头维度
-        ), persistent=False)
+        # 设置是否使用KV缓存
+        self.enabled_kv_cache = args.enabled_kv_cache
+
+        # 只有在使用KV缓存时才初始化缓存
+        if self.enabled_kv_cache:
+            # 延迟缓存初始化，减少内存使用
+            # 注册键缓存缓冲区（不持久化，不保存到检查点）
+            self.register_buffer('cache_k', torch.zeros(
+                args.max_batch_size,  # 最大批处理大小
+                args.max_seq_len,  # 最大序列长度
+                self.n_local_kv_heads,  # 本地键头数量
+                self.head_dim,  # 头维度
+            ), persistent=False)
+
+            # 注册值缓存缓冲区
+            self.register_buffer('cache_v', torch.zeros(
+                args.max_batch_size,  # 最大批处理大小
+                args.max_seq_len,  # 最大序列长度
+                self.n_local_kv_heads,  # 本地值头数量
+                self.head_dim,  # 头维度
+            ), persistent=False)
         
-        # 注册值缓存缓冲区
-        self.register_buffer('cache_v', torch.zeros(
-            args.max_batch_size,  # 最大批处理大小
-            args.max_seq_len,  # 最大序列长度
-            self.n_local_kv_heads,  # 本地值头数量
-            self.head_dim,  # 头维度
-        ), persistent=False)
-        
-        # 标记缓存是否已初始化
-        self.cache_initialized = False
+            # 标记缓存是否已初始化
+            self.cache_initialized = False
+        else:
+            # 不使用缓存时，设置为None
+            self.register_buffer('cache_k', None, persistent=False)
+            self.register_buffer('cache_v', None, persistent=False)
+            self.cache_initialized = True  # 设置为已初始化，避免后续检查
 
         # 注册因果掩码缓冲区
         self.register_buffer('causal_mask', None, persistent=False)
@@ -167,6 +177,16 @@ class StellarByteAttention(nn.Module):
             self.cache_v = self.cache_v.to(device=device, dtype=dtype)
             self.cache_initialized = True  # 标记缓存已初始化
 
+    def reset_cache(self) -> None:
+        """重置KV缓存。
+        
+        该方法用于在需要时重置缓存状态，例如在处理新序列时。
+        """
+        if self.enabled_kv_cache and self.cache_initialized:
+            # 将缓存重置为零
+            self.cache_k.zero_()
+            self.cache_v.zero_()
+
     def _create_causal_mask(self, seq_len: int, start_pos: int, device: torch.device) -> torch.Tensor:
         """更新或创建因果掩码，使用缓冲区避免重复分配。
         
@@ -180,8 +200,12 @@ class StellarByteAttention(nn.Module):
         Returns:
             适当大小的因果掩码张量
         """
-        # 计算总长度（当前位置 + 序列长度）
-        total_len = start_pos + seq_len
+        # 如果不使用缓存，则总长度就是当前序列长度
+        if not self.enabled_kv_cache:
+            total_len = seq_len
+        else:
+            # 计算总长度（当前位置 + 序列长度）
+            total_len = start_pos + seq_len
         
         # 如果已有足够大的掩码，直接使用
         if (self.causal_mask is not None and 
@@ -288,7 +312,8 @@ class StellarByteAttention(nn.Module):
         device, dtype = x.device, x.dtype
         
         # 延迟初始化缓存（减少初始内存使用）
-        self._initialize_cache(device, dtype)
+        if self.enabled_kv_cache:
+            self._initialize_cache(device, dtype)
 
         # 并行计算查询、键、值投影
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -301,17 +326,22 @@ class StellarByteAttention(nn.Module):
         # 应用旋转位置编码到查询和键
         xq, xk = self.rope(xq, xk, freqs_cis=freqs_cis)
 
-        # 确保缓存与当前张量在同一设备上
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-        
-        # 更新键值缓存（将当前序列插入缓存中的指定位置）
-        self.cache_k[:batch_size, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seqlen] = xv
+        # 处理KV缓存
+        if self.enabled_kv_cache:
+            # 确保缓存与当前张量在同一设备上
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+            
+            # 更新键值缓存（将当前序列插入缓存中的指定位置）
+            self.cache_k[:batch_size, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:batch_size, start_pos : start_pos + seqlen] = xv
 
-        # 获取完整的键值缓存（从开始到当前位置+序列长度）
-        keys = self.cache_k[:batch_size, : start_pos + seqlen]
-        values = self.cache_v[:batch_size, : start_pos + seqlen]
+            # 获取完整的键值缓存（从开始到当前位置+序列长度）
+            keys = self.cache_k[:batch_size, : start_pos + seqlen]
+            values = self.cache_v[:batch_size, : start_pos + seqlen]
+        else:
+            # 不使用缓存，直接使用当前键值
+            keys, values = xk, xv
 
         # 重复k/v头以匹配查询头的数量（分组查询注意力）
         keys = self.rope.repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -327,6 +357,8 @@ class StellarByteAttention(nn.Module):
 
         # 根据配置选择使用FlashAttention或常规注意力
         if self.enabled_flash_attn:
+            # 对于FlashAttention，需要确定是否使用因果掩码
+            is_causal = self.enabled_kv_cache or (start_pos == 0)  # 如果使用缓存或从头开始，则使用因果掩码
             output = self._compute_attention_flash(xq, keys, values)
         else:
             output = self._compute_attention(xq, keys, values, mask)

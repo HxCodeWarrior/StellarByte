@@ -19,6 +19,7 @@ class StellarByteModelArgs(PretrainedConfig):
         max_batch_size: int = 32,
         max_seq_len: int = 2048,
         enabled_flash_attn: bool = False,
+        enabled_kv_cache: bool = False,
         atttention_dropout: float = 0.0,
         resid_dropout: float = 0.0,
         ffn_dropout: float = 0.0,
@@ -45,6 +46,7 @@ class StellarByteModelArgs(PretrainedConfig):
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.enabled_flash_attn = enabled_flash_attn
+        self.enabled_kv_cache = enabled_kv_cache
         self.attention_dropout = atttention_dropout
         self.resid_dropout = resid_dropout
         self.ffn_dropout = ffn_dropout
