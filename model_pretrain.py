@@ -29,8 +29,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from utils.logger import setup_logger
 from utils.checkpoint import CheckpointManager 
-from model.Model import ByteModel
-from model.config import ByteModelConfig
+from model.Model import StellarByteModel
+from model.config import StellarByteModelArgs
 from datasets.datasets import PretrainDataset, StreamingPretrainDataset
 
 # nltk需要下载必要资源
@@ -348,42 +348,36 @@ def init_model(config, device):
     """
     # ===== 1. 模型配置 =====
     # 从config中提取需要的参数，而不是直接传递整个config对象
-    model_config = ByteModelConfig(
-        vocab_size               = config.vocab_size,
-        model_dim                = config.model_dim,
-        num_layers               = config.num_layers,
-        num_attention_heads      = config.num_heads,
-        num_kv_heads             = config.num_kv_heads,
-        hidden_dim               = config.hidden_dim,
-        dim_multiplier           = config.dim_multiplier,
-        max_seq_len              = config.max_seq_len,
-        drop_path_prob           = config.drop_path_prob,
-        hidden_dropout_prob      = config.hidden_dropout_prob,
-        attention_dropout_prob   = config.attention_dropout_prob,
-        residual_dropout_prob    = config.residual_dropout_prob,
-        layer_norm_eps           = float(config.layer_norm_eps),
-        base_theta               = config.base_theta,
-        ntk_alpha                = config.ntk_alpha,
-        use_flash_attention      = config.use_flash_attention,
-        use_cache                = config.use_kvcache,
-        cache_dtype              = torch.float16 if config.cache_dtype == 'float16' else torch.float32,
-        attention_window_size    = config.attention_window_size,
-        parallel_residual        = config.parallel_residual,
-        tensor_parallel_size     = config.tensor_parallel_size,
-        tensor_parallel_groups   = config.tensor_parallel_groups,
-        layerscale_init          = float(config.layerscale_init),
-        initializer_range        = config.initializer_range,
-        moe_enabled              = config.moe_enabled,
-        moe_num_experts          = config.moe_num_experts,
-        moe_k                    = config.moe_k,
-        moe_capacity_factor      = config.moe_capacity_factor,
-        moe_loss_coefficient     = config.moe_loss_coefficient,
-        moe_world_size           = config.moe_world_size,
-        moe_rank                 = config.moe_rank
+    model_config = StellarByteModelArgs(
+        vocab_size          = config.vocab_size,
+        dim                 = config.dim,
+        num_layers          = config.num_layers,
+        num_heads           = config.num_heads,
+        num_kv_heads        = config.num_kv_heads,
+        multiple_of         = config.multiple_of,
+        ffn_dim_multiplier  = config.ffn_dim_multiplier,
+        norm_eps            = config.norm_eps,
+        rope_theta          = config.rope_theta,
+        max_batch_size      = config.max_batch_size,
+        max_seq_len         = config.max_seq_len,
+        enabled_flash_attn  = config.enabled_flash_attn,
+        attention_dropout   = config.attention_dropout,
+        resid_dropout       = config.resid_dropout,
+        ffn_dropout         = config.ffn_dropout,
+        
+        # ========== MoELayer ==========
+        enabled_moe         = config.enabled_moe,
+        num_experts_per_tok = config.num_experts_per_tok,
+        num_routed_experts  = config.num_routed_experts,
+        num_shared_experts  = config.num_shared_experts,
+        scoring_func        = config.scoring_func,
+        aux_loss_alpha      = config.aux_loss_alpha,
+        seq_aux             = config.seq_aux,
+        norm_topk_prob      = config.norm_topk_prob,
     )
 
     # ===== 2. 初始化模型 =====
-    model = ByteModel(model_config)
+    model = StellarByteModel(model_config)
 
     # ===== 3. 初始化Tokenizer =====
     # config.model.tokenizer_path 应指向已有的 tokenizer 路径或预训练模型名
@@ -661,11 +655,11 @@ def train_epoch(
         # 2.3 混合精度前向传播
         with amp_ctx: # 进入混合精度上下文（自动管理FP16计算）
             outputs = model(
-                input_ids      = input_ids, 
-                labels         = labels
+                input_ids   = input_ids, 
+                targets     = labels
             ) # 模型前向传播
             # 计算损失并除以累积步数（用于梯度累积）
-            loss      = outputs.loss / accumulation_steps  # 梯度累积损失缩放
+            loss      = outputs.last_loss / accumulation_steps  # 梯度累积损失缩放
             # 将loss_mask展平为一维
             loss_mask = loss_mask.view(-1)
             # 应用掩码计算有效损失（忽略padding位置）
