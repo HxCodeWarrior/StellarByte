@@ -58,15 +58,15 @@ class StellarByteModelArgs(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         
         # ========== MoELayer ==========
-        self.enabled_moe = enabled_moe,
-        self.num_experts_per_tok = num_experts_per_tok,
-        self.num_routed_experts = num_routed_experts,
-        self.num_shared_experts = num_shared_experts,
-        self.scoring_func = scoring_func,
-        self.aux_loss_alpha = aux_loss_alpha,
-        self.seq_aux = seq_aux,
-        self.norm_topk_prob = norm_topk_prob,
-        self.gating_dim = gating_dim,
+        self.enabled_moe = enabled_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_routed_experts = num_routed_experts
+        self.num_shared_experts = num_shared_experts
+        self.scoring_func = scoring_func
+        self.aux_loss_alpha = aux_loss_alpha
+        self.seq_aux = seq_aux
+        self.norm_topk_prob = norm_topk_prob
+        self.gating_dim = gating_dim
 
         # ========== Model Parallel ==========
         self.model_parallel_size = model_parallel_size
