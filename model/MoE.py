@@ -93,6 +93,7 @@ class StellarByteMOEFeedForward(nn.Module):
         self.args = args
         self.num_routed_experts = args.num_routed_experts
         self.num_shared_experts = args.num_shared_experts
+        self.num_experts_per_tok = args.num_experts_per_tok
         
         # 路由专家
         self.experts = nn.ModuleList([
@@ -154,7 +155,7 @@ class StellarByteMOEFeedForward(nn.Module):
                   topk_weight: torch.Tensor) -> torch.Tensor:
         """训练模式下的MoE计算"""
         # 扩展输入以匹配top_k专家
-        x_repeated = x.repeat_interleave(self.args.num_experts_per_tok, dim=0)
+        x_repeated = x.repeat_interleave(self.num_experts_per_tok, dim=0)
         
         # 预分配输出张量
         y = torch.zeros(x_repeated.shape[0], x.shape[-1], 
@@ -191,7 +192,7 @@ class StellarByteMOEFeedForward(nn.Module):
         # 对专家索引进行排序以提高缓存效率
         sorted_indices = flat_expert_indices.argsort()
         sorted_expert_indices = flat_expert_indices[sorted_indices]
-        sorted_token_indices = sorted_indices // self.args.num_experts_per_tok
+        sorted_token_indices = sorted_indices // self.num_experts_per_tok
         
         # 计算每个专家处理的token范围
         unique_experts, expert_counts = torch.unique_consecutive(
