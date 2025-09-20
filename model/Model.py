@@ -65,8 +65,6 @@ class StellarByteModel(nn.Module):
             params.rope_theta,  # RoPE的theta参数
         )
 
-    # 使用推理模式（不计算梯度，提高推理速度）
-    @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         # 获取输入tokens的批次大小和序列长度
         _bsz, seqlen = tokens.shape
@@ -77,26 +75,9 @@ class StellarByteModel(nn.Module):
         # 获取从start_pos开始到start_pos+seqlen的位置编码
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        # 初始化注意力掩码为None
-        mask = None
-        # 如果序列长度大于1，需要创建注意力掩码
-        if seqlen > 1:
-            # 创建一个全为负无穷的矩阵，用于掩码
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-            # 将上三角部分（不包括对角线）设置为负无穷，防止看到未来信息
-            mask = torch.triu(mask, diagonal=1)
-
-            # 当使用键值缓存时，我们只计算新序列的注意力分数
-            # 因此分数矩阵的大小为(seqlen, cache_len + seqlen)
-            # 掩码条目(i, j)对于j > cache_len + i被屏蔽，因为行i对应的是token cache_len + i
-            # 水平拼接零矩阵和上三角掩码矩阵
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)  # 确保掩码与h的数据类型一致
-
         # 逐层处理输入
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis)
         # 应用层归一化
         h = self.norm(h)
         # 通过输出层获取预测结果，并转换为float类型

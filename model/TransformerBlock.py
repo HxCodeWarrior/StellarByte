@@ -45,11 +45,10 @@ class StellarByteBlock(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        freqs_cis: torch.Tensor
     ):
         # 注意力层
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis)
         
         # 前馈层 (可能是MoE或普通MLP)
         ffn_input = self.ffn_norm(h)
