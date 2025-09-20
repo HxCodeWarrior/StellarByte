@@ -659,11 +659,18 @@ def train_epoch(
                 targets     = labels
             ) # 模型前向传播
             # 计算损失并除以累积步数（用于梯度累积）
-            loss      = outputs.last_loss / accumulation_steps  # 梯度累积损失缩放
+            main_loss      = outputs.last_loss / accumulation_steps  # 梯度累积损失缩放
             # 将loss_mask展平为一维
             loss_mask = loss_mask.view(-1)
             # 应用掩码计算有效损失（忽略padding位置）
-            loss      = torch.sum(loss * loss_mask) / loss_mask.sum()
+            main_loss      = torch.sum(main_loss * loss_mask) / loss_mask.sum()
+
+            # 获取辅助损失（来自MoE层）
+            aux_loss = outputs.aux_loss
+            # 设置辅助损失权重（可根据需要调整）
+            aux_loss_weight = 0.06
+            # 计算总损失（主损失 + 加权辅助损失）
+            loss = main_loss + aux_loss_weight * aux_loss
 
         # 2.4 反向传播
         scaler.scale(loss).backward()
