@@ -38,6 +38,7 @@ class StellarByteModelArgs(PretrainedConfig):
         model_parallel_size: int = 1,
         **kwargs
     ):
+        super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.dim = dim
         self.num_layers = num_layers
@@ -69,7 +70,3 @@ class StellarByteModelArgs(PretrainedConfig):
 
         # ========== Model Parallel ==========
         self.model_parallel_size = model_parallel_size
-        
-        super().__init__(
-            **kwargs
-        )
