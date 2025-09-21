@@ -70,13 +70,6 @@ class StellarByteAttention(nn.Module):
         self.head_dim = args.dim // args.num_heads
         # 设置缩放因子，用于缩放注意力分数
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        
-        # 检查是否支持FlashAttention（PyTorch 2.0+）
-        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            self.enabled_flash_attn = args.enabled_flash_attn
-        else:
-            self.enabled_flash_attn = False
-            print("FlashAttention is not available, using regular attention")
 
         # 初始化旋转位置编码
         self.rope = StellarByteRoPE(
@@ -115,108 +108,42 @@ class StellarByteAttention(nn.Module):
 
         # 设置是否使用KV缓存
         self.enabled_kv_cache = args.enabled_kv_cache
-
-        # 只有在使用KV缓存时才初始化缓存
-        if self.enabled_kv_cache:
-            # 延迟缓存初始化，减少内存使用
-            # 注册键缓存缓冲区（不持久化，不保存到检查点）
-            self.register_buffer('cache_k', torch.zeros(
-                args.max_batch_size,  # 最大批处理大小
-                args.max_seq_len,  # 最大序列长度
-                self.num_local_kv_heads,  # 本地键头数量
-                self.head_dim,  # 头维度
-            ), persistent=False)
-
-            # 注册值缓存缓冲区
-            self.register_buffer('cache_v', torch.zeros(
-                args.max_batch_size,  # 最大批处理大小
-                args.max_seq_len,  # 最大序列长度
-                self.num_local_kv_heads,  # 本地值头数量
-                self.head_dim,  # 头维度
-            ), persistent=False)
         
-            # 标记缓存是否已初始化
-            self.cache_initialized = False
+        # 检查是否支持FlashAttention（PyTorch 2.0+）
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            self.enabled_flash_attn = args.enabled_flash_attn
         else:
-            # 不使用缓存时，设置为None
-            self.register_buffer('cache_k', None, persistent=False)
-            self.register_buffer('cache_v', None, persistent=False)
-            self.cache_initialized = True  # 设置为已初始化，避免后续检查
-
-        # 注册因果掩码缓冲区
-        self.register_buffer('causal_mask', None, persistent=False)
-        # 跟踪当前掩码大小
-        self.current_mask_size = 0
+            self.enabled_flash_attn = False
+            print("FlashAttention is not available, using regular attention")
 
         # 初始化注意力dropout和残差dropout
         self.attn_dropout = nn.Dropout(args.attention_dropout)
         self.resid_dropout = nn.Dropout(args.resid_dropout)
 
-    def _initialize_cache(self, device, dtype):
-        """延迟初始化缓存，减少初始内存使用。
-        
-        该方法在第一次前向传播时被调用，将缓存移动到正确的设备和数据类型。
-        
-        Args:
-            device: 目标设备
-            dtype: 目标数据类型
-        """
-        if not self.cache_initialized:
-            # 将缓存移动到指定设备和数据类型
-            self.cache_k = self.cache_k.to(device=device, dtype=dtype)
-            self.cache_v = self.cache_v.to(device=device, dtype=dtype)
-            self.cache_initialized = True  # 标记缓存已初始化
+    def _create_causal_mask(self, seq_len: int, cache_len: int, device: torch.device) -> torch.Tensor:
+        """使用torch.triu创建因果掩码，支持KV缓存。
 
-    def reset_cache(self) -> None:
-        """重置KV缓存。
-        
-        该方法用于在需要时重置缓存状态，例如在处理新序列时。
-        """
-        if self.enabled_kv_cache and self.cache_initialized:
-            # 将缓存重置为零
-            self.cache_k.zero_()
-            self.cache_v.zero_()
-
-    def _create_causal_mask(self, seq_len: int, start_pos: int, device: torch.device) -> torch.Tensor:
-        """更新或创建因果掩码，使用缓冲区避免重复分配。
-        
-        该方法创建或复用因果掩码，防止模型关注未来的位置信息。
-        
         Args:
             seq_len: 当前序列长度
-            start_pos: 当前序列在缓存中的起始位置
-            device: 掩码所在的设备
-            
+            cache_len: 缓存序列长度
+            device: 设备
+
         Returns:
-            适当大小的因果掩码张量
+            因果掩码张量，形状为 (1, 1, seq_len, cache_len + seq_len)
         """
-        # 如果不使用缓存，则总长度就是当前序列长度
-        if not self.enabled_kv_cache:
-            total_len = seq_len
-        else:
-            # 计算总长度（当前位置 + 序列长度）
-            total_len = start_pos + seq_len
-        
-        # 如果已有足够大的掩码，直接使用
-        if (self.causal_mask is not None and 
-            self.causal_mask.size(2) >= seq_len and 
-            self.causal_mask.size(3) >= total_len):
-            # 返回适当切片
-            return self.causal_mask[:, :, :seq_len, :total_len]
-        
-        # 否则创建新掩码并缓存
-        self.current_mask_size = max(self.current_mask_size, total_len)
-        
-        # 创建完整的因果掩码（上三角为负无穷）
-        mask = torch.full((total_len, total_len), float("-inf"), device=device)
-        mask = torch.triu(mask, diagonal=1)  # 保留主对角线上方的元素
-        
-        # 注册为缓冲区以便在不同设备间正确移动
-        # 添加批次和头维度 (1, 1, seq_len, total_len)
-        self.register_buffer('causal_mask', mask.unsqueeze(0).unsqueeze(0), persistent=False)
-        
-        # 返回适当大小的切片
-        return self.causal_mask[:, :, :seq_len, :total_len]
+        # 创建全0矩阵，形状为 (seq_len, cache_len + seq_len)
+        mask = torch.zeros((seq_len, cache_len + seq_len), device=device)
+
+        # 创建上三角矩阵（对角线以上为1），形状为 (seq_len, seq_len)
+        triu_mask = torch.triu(
+            torch.ones((seq_len, seq_len), device=device),
+            diagonal=1
+        )
+
+        # 将上三角部分设置为负无穷
+        mask[:, cache_len:] = triu_mask * float("-inf")
+
+        return mask.unsqueeze(0).unsqueeze(0)  # 扩展为 (1, 1, seq_len, cache_len + seq_len)
 
     def _compute_attention(self, xq: torch.Tensor, keys: torch.Tensor, 
                           values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -238,7 +165,8 @@ class StellarByteAttention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(2, 3)) * self.scale
         
         # 应用掩码: (bs, n_heads, seq_len, cache_len + seq_len)
-        scores = scores + mask
+        if mask is not None:
+            scores = scores + mask
             
         # 计算注意力权重: 沿最后一个维度softmax
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -254,7 +182,7 @@ class StellarByteAttention(nn.Module):
         return output
 
     def _compute_attention_flash(self, xq: torch.Tensor, keys: torch.Tensor, 
-                          values: torch.tensor) -> torch.Tensor:
+                          values: torch.tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """使用FlashAttention计算注意力（如果可用）。
         
         该方法使用PyTorch内置的scaled_dot_product_attention函数，
@@ -262,23 +190,33 @@ class StellarByteAttention(nn.Module):
         
         Args:
             xq: 查询张量，形状为 (bs, n_heads, seq_len, head_dim)
-            keys: 键张量，形状为 (bs, n_heads, cache_len+seq_len, head_dim)
-            values: 值张量，形状为 (bs, n_heads, cache_len+seq_len, head_dim)
+            keys: 键张量，形状为 (bs, n_heads, total_len, head_dim)
+            values: 值张量，形状为 (bs, n_heads, total_len, head_dim)
+            mask: 因果掩码张量，形状为 (1, 1, seq_len, total_len)
             
         Returns:
             注意力输出张量，形状为 (bs, n_heads, seq_len, head_dim)
         """
-        # FlashAttention期望输入形状: (batch_size, seq_len, n_heads, head_dim)
-        # 并且会自动处理因果掩码
-        output = F.scaled_dot_product_attention(
-            xq,
-            keys,
-            values,
-            attn_mask=None,  # FlashAttention自动处理因果掩码
-            is_causal=True,  # 启用因果掩码
-            dropout_p=self.attn_dropout.p if self.training else 0.0  # 训练时使用dropout
-        )
-        # 转置回 (bs, n_heads, seq_len, head_dim) 并确保内存连续
+        # 如果有缓存（total_len > seq_len），需要提供显式掩码
+        if keys.size(2) > xq.size(2):
+            # 使用提供的掩码
+            output = F.scaled_dot_product_attention(
+                xq,
+                keys,
+                values,
+                attn_mask=mask,  # 使用显式掩码
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        else:
+            # 没有缓存时，可以使用内置因果掩码
+            output = F.scaled_dot_product_attention(
+                xq,
+                keys,
+                values,
+                attn_mask=None,
+                is_causal=True,  # 启用内置因果掩码
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
         return output
 
     def forward(
@@ -303,10 +241,6 @@ class StellarByteAttention(nn.Module):
         # 获取输入张量的形状信息
         batch_size, seqlen, _ = x.shape
         device, dtype = x.device, x.dtype
-        
-        # 延迟初始化缓存（减少初始内存使用）
-        if self.enabled_kv_cache:
-            self._initialize_cache(device, dtype)
 
         # 并行计算查询、键、值投影
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -320,62 +254,40 @@ class StellarByteAttention(nn.Module):
         xq, xk = self.rope(xq, xk, freqs_cos, freqs_sin)
 
         # 处理KV缓存
-        if self.enabled_kv_cache:
-            # 确保缓存与当前张量在同一设备上
-            self.cache_k = self.cache_k.to(xq)
-            self.cache_v = self.cache_v.to(xq)
-            
-            # 如果提供了过去的键值，使用它们
-            if past_key_value is not None:
-                past_key, past_value = past_key_value
-                # 更新键值缓存（将当前序列插入缓存中的指定位置）
-                start_pos = past_key.size(1)
-                self.cache_k[:batch_size, :start_pos] = past_key
-                self.cache_v[:batch_size, :start_pos] = past_value
-                self.cache_k[:batch_size, start_pos : start_pos + seqlen] = xk
-                self.cache_v[:batch_size, start_pos : start_pos + seqlen] = xv
-            else:
-                # 没有过去的键值，从头开始
-                start_pos = 0
-                self.cache_k[:batch_size, :seqlen] = xk
-                self.cache_v[:batch_size, :seqlen] = xv
-            
-            # 获取完整的键值缓存（从开始到当前位置+序列长度）
-            keys = self.cache_k[:batch_size, : start_pos + seqlen]
-            values = self.cache_v[:batch_size, : start_pos + seqlen]
-            cache_len = start_pos
-        else:
-            # 不使用缓存，直接使用当前键值
-            keys, values = xk, xv
-            cache_len = 0
+        cache_len = 0
+        if self.enabled_kv_cache and past_key_value is not None:
+            # 动态拼接过去的键值
+            past_key, past_value = past_key_value
+            cache_len = past_key.size(1)  # 缓存长度
+
+            # 动态拼接过去的键值
+            xk = torch.cat([past_key, xk], dim=1)
+            xv = torch.cat([past_value, xv], dim=1)
         
-        # 如果启用了KV缓存，则返回当前缓存的状态
-        # 否则返回None
+        # 更新past_key_value - 使用原始的xk和xv
         if self.enabled_kv_cache:
-            # 返回当前缓存的状态
-            current_cache_len = cache_len + seqlen
-            past_key_value = (
-                self.cache_k[:batch_size, :current_cache_len],
-                self.cache_v[:batch_size, :current_cache_len]
-            )
+            past_key_value = (xk, xv)
         else:
             past_key_value = None
 
         # 重复k/v头以匹配查询头的数量（分组查询注意力）
-        keys = self.rope.repeat_kv(keys, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
-        values = self.rope.repeat_kv(values, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
-
-        # 创建因果掩码，防止关注未来信息
-        mask = self._create_causal_mask(seqlen, cache_len, xq.device)
+        keys = self.rope.repeat_kv(xk, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
+        values = self.rope.repeat_kv(xv, self.num_rep)  # (bs, cache_len + seqlen, num_local_heads, head_dim)
 
         # 转置以获得正确的形状 (bs, n_heads, seq_len, head_dim)
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
 
+        # 计算总长度
+        total_len = keys.size(2)  # 总长度 = 缓存长度 + 当前序列长度
+
+        # 计算注意力掩码
+        mask = self._create_causal_mask(seqlen, cache_len, device) if not self.enabled_flash_attn or total_len > seqlen else None
+
         # 根据配置选择使用FlashAttention或常规注意力
         if self.enabled_flash_attn:
-            output = self._compute_attention_flash(xq, keys, values)
+            output = self._compute_attention_flash(xq, keys, values, mask)
         else:
             output = self._compute_attention(xq, keys, values, mask)
 
@@ -433,8 +345,27 @@ if __name__ == "__main__":
     for cache_len in [0, 32]:
         print(f"\n测试 start_pos = {cache_len}")
         
+        # 创建模拟的过去键值缓存
+        if cache_len > 0:
+            # 创建形状正确的模拟缓存
+            past_key = torch.zeros(
+                batch_size, 
+                cache_len, 
+                args.num_kv_heads // args.model_parallel_size,  # num_local_kv_heads
+                args.dim // args.num_heads  # head_dim
+            )
+            past_value = torch.zeros(
+                batch_size, 
+                cache_len, 
+                args.num_kv_heads // args.model_parallel_size,  # num_local_kv_heads
+                args.dim // args.num_heads  # head_dim
+            )
+            past_key_value = (past_key, past_value)
+        else:
+            past_key_value = None
+        
         # 前向传播
-        output = attention(x, freqs_cos, freqs_sin, cache_len)
+        output, new_past_key_value = attention(x, freqs_cos, freqs_sin, past_key_value)
         
         # 检查输出形状
         expected_shape = (batch_size, seq_len, dim)
@@ -446,6 +377,20 @@ if __name__ == "__main__":
         # 验证形状是否正确
         assert actual_shape == expected_shape, f"形状不匹配! 期望: {expected_shape}, 实际: {actual_shape}"
         print("✓ 形状验证通过!")
+        
+        # 检查缓存形状（如果启用了缓存）
+        if args.enabled_kv_cache:
+            if cache_len > 0:
+                # 新缓存应该包含旧缓存和新内容
+                expected_cache_shape = (batch_size, cache_len + seq_len, args.num_kv_heads // args.model_parallel_size, args.dim // args.num_heads)
+            else:
+                # 没有旧缓存时，新缓存应该只包含当前内容
+                expected_cache_shape = (batch_size, seq_len, args.num_kv_heads // args.model_parallel_size, args.dim // args.num_heads)
+            
+            cache_k, cache_v = new_past_key_value
+            assert cache_k.shape == expected_cache_shape, f"键缓存形状错误! 期望: {expected_cache_shape}, 实际: {cache_k.shape}"
+            assert cache_v.shape == expected_cache_shape, f"值缓存形状错误! 期望: {expected_cache_shape}, 实际: {cache_v.shape}"
+            print("✓ 缓存形状验证通过!")
     
-    print("\n✅ 所有测试通过：旋转位置编码实现正确")
+    print("\n✅ 所有测试通过：注意力机制实现正确")
     print("="*50)
