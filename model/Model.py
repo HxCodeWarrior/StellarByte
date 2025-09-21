@@ -87,7 +87,7 @@ class StellarByteModel(nn.Module):
 
     def forward(self, 
                 input_ids: torch.Tensor, 
-                targets: Optional[torch.Tensor] = None, 
+                labels: Optional[torch.Tensor] = None, 
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None):
         # 获取输入input_ids的批次大小和序列长度
         _bsz, seqlen = input_ids.shape
@@ -134,21 +134,21 @@ class StellarByteModel(nn.Module):
         # 通过输出层获取预测结果，并转换为float类型
         output = self.output(hidden_states).float()
         
-        # 根据是否提供targets决定输出计算方式
-        if targets is not None:
+        # 根据是否提供labels决定输出计算方式
+        if labels is not None:
             # 训练模式：计算全部位置的logits和损失
             logits = self.output(hidden_states)
             # 计算交叉熵损失，忽略索引0（padding），保持每个位置的损失值
-            last_loss = F.cross_entropy(
+            loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), 
-                targets.view(-1), 
+                labels.view(-1), 
                 ignore_index=-100, 
                 reduction='none'
             )
         else:
             # 推理模式：只计算最后一个位置的输出
             logits = self.output(hidden_states[:, [-1], :]) 
-            last_loss = None
+            loss = None
 
         # 计算所有MoE层的辅助损失之和（用于负载平衡）
         aux_loss = sum(
@@ -160,7 +160,7 @@ class StellarByteModel(nn.Module):
         # 返回输出和辅助损失
         self.OUT.__setitem__('output', output)
         self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('last_loss', last_loss)
+        self.OUT.__setitem__('loss', loss)
         self.OUT.__setitem__('aux_loss', aux_loss)
         return self.OUT
 
@@ -211,19 +211,19 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"模型总参数量: {total_params:,}")
     
-    # 测试1: 训练模式（带targets）
+    # 测试1: 训练模式（带labels）
     print("\n=== 测试1: 训练模式 ===")
     batch_size, seq_len = 2, 16
     input_ids = torch.randint(0, args.vocab_size, (batch_size, seq_len))
-    targets = torch.randint(0, args.vocab_size, (batch_size, seq_len))
+    labels = torch.randint(0, args.vocab_size, (batch_size, seq_len))
     
     # 前向传播
     with torch.no_grad():
-        outputs = model(input_ids, targets=targets)
+        outputs = model(input_ids, labels=labels)
     
     # 验证输出形状
     print(f"输入形状: {input_ids.shape}")
-    print(f"目标形状: {targets.shape}")
+    print(f"目标形状: {labels.shape}")
     print(f"Logits形状: {outputs.logits.shape}")
     print(f"Loss值: {outputs.loss.item() if outputs.loss is not None else 'None'}")
     print(f"Aux Loss值: {outputs.aux_loss if hasattr(outputs, 'aux_loss') else 'None'}")
@@ -232,7 +232,7 @@ if __name__ == "__main__":
     assert outputs.logits.shape == (batch_size, seq_len, args.vocab_size), \
         f"Logits形状错误: 期望({batch_size}, {seq_len}, {args.vocab_size}), 实际{outputs.logits.shape}"
     
-    # 测试2: 推理模式（不带targets）
+    # 测试2: 推理模式（不带labels）
     print("\n=== 测试2: 推理模式 ===")
     with torch.no_grad():
         outputs = model(input_ids)
