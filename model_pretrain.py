@@ -467,19 +467,22 @@ def evaluate(
             loss = outputs.loss
             logits = outputs.logits
 
+            # 创建mask用于忽略padding或-100标记
+            mask = labels != -100
+            mask_flat = mask.view(-1)
+            
+            # 计算有效损失（忽略padding位置）
+            loss = (loss * mask_flat).sum() / mask_flat.sum()
+
             # 计算预测值（取最大概率位置作为预测token）
             predictions = torch.argmax(logits, dim=-1)
 
-            # 创建mask用于忽略padding或-100标记
-            mask = labels != -100
-            
             # 计算预测的token数量
-            num_tokens   = mask.sum().item()
-            total_loss   += loss.item() * num_tokens  # 按token加权
+            num_tokens = mask_flat.sum().item()
+            total_loss += loss.item() * num_tokens  # 按token加权
             total_tokens += num_tokens
 
             # 计算准确率
-            predictions = torch.argmax(logits, dim=-1)
             correct = (predictions == labels) & mask
             correct_predictions += correct.sum().item()
             total_predictions += num_tokens
@@ -656,10 +659,10 @@ def train_epoch(
         with amp_ctx: # 进入混合精度上下文（自动管理FP16计算）
             outputs = model(
                 input_ids   = input_ids, 
-                targets     = labels
+                labels      = labels
             ) # 模型前向传播
             # 计算损失并除以累积步数（用于梯度累积）
-            main_loss      = outputs.last_loss / accumulation_steps  # 梯度累积损失缩放
+            main_loss      = outputs.loss / accumulation_steps  # 梯度累积损失缩放
             # 将loss_mask展平为一维
             loss_mask = loss_mask.view(-1)
             # 应用掩码计算有效损失（忽略padding位置）
