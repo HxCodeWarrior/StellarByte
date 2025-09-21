@@ -5,6 +5,7 @@ torchvision
 torchaudio
 torch_scatter
 transformers>=4.40.0
+fairscale>=0.4.13
 
 # Tokenizer
 sentencepiece
