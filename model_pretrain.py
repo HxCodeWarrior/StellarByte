@@ -374,6 +374,7 @@ def init_model(config, device):
         aux_loss_alpha      = config.aux_loss_alpha,
         seq_aux             = config.seq_aux,
         norm_topk_prob      = config.norm_topk_prob,
+        gating_dim          = config.gating_dim
     )
 
     # ===== 2. 初始化模型 =====
