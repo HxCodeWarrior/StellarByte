@@ -1,0 +1,44 @@
+# 数据配置
+data_path: "./datasets/test/test_train.jsonl"
+tokenizer_path: "./tokenizer"
+max_length: 512
+
+# 优化器配置
+learning_rate: 1e-4
+weight_decay: 0.1
+adam_epsilon: 1e-8
+max_grad_norm: 1.0
+
+# 调度器配置
+warmup_steps: 1000
+total_steps: 100000
+scheduler_type: "cosine"
+
+# 训练配置
+epochs: 1
+batch_size: 1
+gradient_accumulation_steps: 1
+save_steps: 1000
+log_steps: 100
+eval_steps: 2000
+seed: 42
+
+# 模型配置
+hidden_size: 512
+num_hidden_layers: 8
+num_attention_heads: 8
+use_moe: false
+vocab_size: 64000
+
+# 系统配置
+checkpoint_dir: "E:/StellarByte/checkpoints"
+log_file: "./logs/pretrain.log"
+device: "cpu"
+mixed_precision: true
+resume_training: false
+
+# SwanLab配置
+use_swanlab: false
+api_key: "<KEY>"
+project: "StellarByteLLM-Pretrain"
+workspace: "ByteWyrm"
