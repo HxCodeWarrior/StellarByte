@@ -135,10 +135,7 @@ def init_swanlab(project: str, config: Dict,
     """
     try:
         # 设置API密钥（优先使用参数，其次环境变量）
-        if api_key:
-            os.environ['SWANLAB_API_KEY'] = api_key
-        elif 'SWANLAB_API_KEY' not in os.environ:
-            swanlab.login()  # 如果没有设置API密钥，尝试交互式登录
+        swanlab.login(api_key=api_key, save=True)
         
         # 初始化SwanLab
         swanlab_run = swanlab.init(
