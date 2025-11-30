@@ -90,7 +90,8 @@ if __name__ == "__main__":
         aux_loss_alpha=0.01,
         seq_aux=False,
         norm_topk_prob=True,
-        flash_attn=False
+        flash_attn=False,
+        verbose_init=False
     )
     
     # 初始化语言模型
