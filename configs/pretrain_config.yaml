@@ -57,6 +57,7 @@ norm_topk_prob: true                           # 是否对topk概率进行归一
 
 # 初始化配置
 initializer_range: 0.02                        # 参数初始化范围
+verbose_init: false                            # 是否打印初始化信息
 use_cache: true                                # 是否使用KV缓存加速推理
 
 # 其他超参数配置
