@@ -49,9 +49,13 @@ class StellarByteConfig(PretrainedConfig):
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
         
+        # ==================== KV缓存配置 ====================
+        use_cache: bool = True,
+        dtype: str = "bfloat16",
+
         # ==================== 初始化配置 ====================
         initializer_range: float = 0.02,
-        use_cache: bool = True,
+        verbose_init: bool = False,
         
         # ==================== 其他超参数配置 ====================
         pad_token_id: int = None,
@@ -94,10 +98,13 @@ class StellarByteConfig(PretrainedConfig):
             aux_loss_alpha (float): 辅助损失系数，用于平衡专家负载均衡
             seq_aux (bool): 是否在序列级别计算辅助损失
             norm_topk_prob (bool): 是否对top-k专家概率进行归一化
-            
+
+            # ==================== KV缓存配置 ====================
+            use_cache (bool): 是否使用KV缓存，推理时可显著提升速度
+            dtype (str): 模型参数的数据类型，'bfloat16'或'float32'
+
             # ==================== 初始化配置 ====================
             initializer_range (float): 参数初始化范围，用于权重矩阵的初始化
-            use_cache (bool): 是否使用KV缓存，推理时可显著提升速度
             
             # ==================== 其他超参数配置 ====================
             pad_token_id (int): 填充token的ID，用于序列填充
@@ -162,9 +169,13 @@ class StellarByteConfig(PretrainedConfig):
         self.seq_aux = seq_aux
         self.norm_topk_prob = norm_topk_prob
         
+        # ==================== KV缓存配置 ====================
+        self.use_cache = use_cache
+        self.dtype = dtype
+
         # ==================== 初始化配置 ====================
         self.initializer_range = initializer_range
-        self.use_cache = use_cache
+        self.verbose_init = verbose_init
         
         # ==================== 计算派生参数 ====================
         # 计算每个注意力头的维度

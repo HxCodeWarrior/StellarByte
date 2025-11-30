@@ -50,7 +50,7 @@ class PretrainTrainer:
         
         # 设置混合精度
         self.dtype = torch.bfloat16 if self.config.get('dtype', 'bfloat16') == "bfloat16" else torch.float16
-        self.autocast_ctx = nullcontext() if self.device.type == "cpu" else torch.cuda.amp.autocast(dtype=self.dtype)
+        self.autocast_ctx = nullcontext() if self.device.type == "cpu" else torch.amp.autocast(dtype=self.dtype)
         self.scaler = torch.amp.GradScaler(enabled=(self.dtype == torch.float16))
         
         # 训练状态
