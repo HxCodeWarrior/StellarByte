@@ -103,14 +103,32 @@ class PretrainTrainer:
         
         # 创建模型配置
         model_config = StellarByteConfig(
-            hidden_size=self.config['hidden_size'],
-            num_hidden_layers=self.config['num_hidden_layers'],
-            num_attention_heads=self.config['num_attention_heads'],
             vocab_size=self.config['vocab_size'],
+            hidden_size=self.config['hidden_size'],
+            hidden_act=self.config['hidden_act'],
+            num_hidden_layers=self.config['num_hidden_layers'],
+            intermediate_size=self.config['intermediate_size'],
+            num_attention_heads=self.config['num_attention_heads'],
+            num_key_value_heads=self.config['num_key_value_heads'],
+            flash_attn=self.config['flash_attn'],
             max_position_embeddings=self.config['max_length'],
+            inference_rope_scaling=self.config['inference_rope_scaling'],
+            dropout=float(self.config['dropout']),
+            rms_norm_eps=float(self.config['rms_norm_eps']),
             use_moe=self.config['use_moe'],
-            n_routed_experts=8 if self.config['use_moe'] else 0,
-            num_experts_per_tok=2 if self.config['use_moe'] else 0,
+            num_experts_per_tok=self.config['num_experts_per_tok'] if self.config['use_moe'] else 0,
+            n_routed_experts=self.config['num_router_experts'] if self.config['use_moe'] else 0,
+            n_shared_experts=self.config['num_shared_experts'] if self.config['use_moe'] else 0,
+            scoring_func=self.config['scoring_func'] if self.config['use_moe'] else None,
+            aux_loss_alpha=float(self.config['aux_loss_alpha']),
+            seq_au=self.config['seq_au'] if self.config['use_moe'] else None,
+            norm_topk_prob=self.config['norm_topk_prob'] if self.config['use_moe'] else True,
+            initializer_range=float(self.config['initializer_range']),
+            use_cache=self.config['use_cache'],
+            pad_token_id=self.config['pad_token_id'],
+            bos_token_id=self.config['bos_token_id'],
+            eos_token_id=self.config['eos_token_id'],
+            tie_word_embeddings=self.config['tie_word_embeddings'],
         )
         
         # 加载模型和分词器
@@ -441,7 +459,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="StellarByte LLM 预训练")
     parser.add_argument("--config", type=str, required=True, help="配置文件路径")
-    parser.add_argument("--resume", action="store_true", help="恢复训练")
+    parser.add_argument("--resume_training", action="store_true", help="恢复训练")
     args = parser.parse_args()
     
     # 加载配置文件
