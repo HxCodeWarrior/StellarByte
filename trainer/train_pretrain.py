@@ -85,16 +85,17 @@ class PretrainTrainer:
 
         # 初始化SwanLab
         self.use_swanlab = self.config['use_swanlab']
-        swanlab = None
+        self.swanlab = None
         if self.config['use_swanlab'] and is_main_process():
-            swanlab = init_swanlab(
+            self.swanlab = init_swanlab(
                 project=self.config['project'],
-                config=config,
                 workspace=self.config['workspace'],
-                api_key=self.config['api_key']
+                experiment_name=self.config['experiment_name'],
+                api_key=self.config['api_key'],
+                config=config,
             )
 
-            if swanlab is None and self.config['use_swanlab']:
+            if self.swanlab is None and self.config['use_swanlab']:
                 print("警告: SwanLab初始化失败，将继续训练但不记录指标")
     
     def _init_model_and_tokenizer(self):

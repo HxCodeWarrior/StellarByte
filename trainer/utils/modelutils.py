@@ -119,9 +119,11 @@ import os
 import swanlab
 from typing import Dict, Optional
 
-def init_swanlab(project: str, config: Dict, 
+def init_swanlab(project: str,
                  workspace: Optional[str] = None, 
-                 api_key: Optional[str] = None) -> Optional[swanlab.Run]:
+                 experiment_name: Optional[str] = None,
+                 api_key: Optional[str] = None,
+                 config: Dict = None, ) -> Optional[swanlab.Run]:
     """初始化 Swanlab 可视化工具
     
     Args:
@@ -141,10 +143,9 @@ def init_swanlab(project: str, config: Dict,
         swanlab_run = swanlab.init(
             project=project,
             workspace=workspace,
+            experiment_name=experiment_name,
             config=config,
         )
-        
-        print(f"SwanLab初始化成功! 项目: {project}, 运行ID: {swanlab_run.id}")
         return swanlab_run
         
     except Exception as e:

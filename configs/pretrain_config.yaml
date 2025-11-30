@@ -74,7 +74,8 @@ mixed_precision: true                          # 是否使用混合精度训练
 resume_training: false                         # 是否从检查点恢复训练
 
 # ==================== SwanLab配置 ====================
-use_swanlab: false                             # 是否使用SwanLab进行实验跟踪
-api_key: "<KEY>"                              # SwanLab API密钥
-project: "StellarByteLLM-Pretrain"             # SwanLab项目名称
-workspace: "ByteWyrm"                          # SwanLab工作空间名称
+use_swanlab: true                              # 是否使用SwanLab进行实验跟踪
+api_key: "your_swanlab_api_key"                # SwanLab API密钥
+project: ""                                    # SwanLab项目名称
+workspace: ""                                  # SwanLab工作空间名称
+experiment_name: "test-pretrain"               # SwanLab实验名称
