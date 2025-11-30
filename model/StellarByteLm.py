@@ -26,8 +26,11 @@ class StellarByteForCausalLM(PreTrainedModel, GenerationMixin):
         self.model = StellarByteModel(self.config)
         # lm_head（将隐藏态投影到 vocab 空间），无 bias
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        # 权重共享（embedding 与 lm_head 共享同一权重）
-        self.model.embed_tokens.weight = self.lm_head.weight
+        
+        # 权重绑定
+        if config.tie_word_embeddings:
+            # 权重共享（embedding 与 lm_head 共享同一权重）
+            self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(
         self,
