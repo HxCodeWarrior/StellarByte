@@ -1,7 +1,8 @@
 # ==================== 数据配置 ====================
-data_path: "./datasets/test/test_train.jsonl"  # 训练数据文件路径
-tokenizer_path: "./tokenizer"                  # 分词器路径
-max_length: 512                                # 输入序列最大长度
+train_data_path: "./datasets/test/test_pre_train.jsonl"  # 训练数据文件路径
+eval_data_path: ""                                       # 测试数据文件路径
+tokenizer_path: "./tokenizer"                            # 分词器路径
+max_length: 512                                          # 输入序列最大长度
 
 # ==================== 优化器配置 ====================
 learning_rate: 1e-4                            # 学习率
@@ -72,6 +73,10 @@ log_file: "./logs/pretrain.log"                # 日志文件路径
 device: "cpu"                                  # 训练设备(cpu/cuda)
 mixed_precision: true                          # 是否使用混合精度训练
 resume_training: false                         # 是否从检查点恢复训练
+num_workers: 4                                 # 数据加载器工作线程数
+pin_memory: true                               # 是否将数据加载到固定内存中
+drop_last: true                                # 是否丢弃最后一个不完整批次
+
 
 # ==================== SwanLab配置 ====================
 use_swanlab: true                              # 是否使用SwanLab进行实验跟踪
