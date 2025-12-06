@@ -29,7 +29,7 @@ from contextlib import nullcontext
 
 from model.config import StellarByteConfig
 from model.StellarByteLm import StellarByteForCausalLM
-from trainer.datasets import DatasetConfig, DatasetFactory
+from trainer.datasets import DatasetConfig, PretrainDataset
 from trainer.utils.modelutils import build_optimizer, build_scheduler, init_model_and_tokenizer, init_swanlab, count_parameters
 from trainer.utils.checkpoint import CheckpointManager
 from trainer.utils.logger import Logger, is_main_process
@@ -50,7 +50,7 @@ class PretrainTrainer:
         
         # 设置混合精度
         self.dtype = torch.bfloat16 if self.config.get('dtype', 'bfloat16') == "bfloat16" else torch.float16
-        self.autocast_ctx = nullcontext() if self.device.type == "cpu" else torch.amp.autocast(dtype=self.dtype)
+        self.autocast_ctx = nullcontext() if self.device.type == "cpu" else torch.amp.autocast(device_type=self.device.type, dtype=self.dtype)
         self.scaler = torch.amp.GradScaler(enabled=(self.dtype == torch.float16))
         
         # 训练状态
@@ -189,19 +189,35 @@ class PretrainTrainer:
         # 数据集配置
         dataset_config = DatasetConfig(
             max_length=self.config['max_length'],
+            num_workers=self.config['num_workers'],
             shuffle=True,
-            seed=self.config['seed'] + get_rank()
+            seed=self.config['seed'] + get_rank(),
         )
         
         # 训练数据集
-        self.train_dataset = DatasetFactory.create_dataset(
-            'pretrain',
-            self.config['data_path'],
-            self.tokenizer,
+        self.train_dataset = PretrainDataset(
+            data_path=self.config['train_data_path'],
+            tokenizer=self.tokenizer,
             config=dataset_config
         )
-        
-        self.logger.info(f"训练数据集大小: {len(self.train_dataset):,}")
+
+        # 验证数据集（可选）
+        eval_data_path = self.config.get('eval_data_path', '')
+        if eval_data_path and os.path.exists(eval_data_path):
+            self.eval_dataset = PretrainDataset(
+                data_path=eval_data_path,
+                tokenizer=self.tokenizer,
+                config=dataset_config
+            )
+            self.logger.info(f"验证数据集大小: {len(self.eval_dataset)}")
+        else:
+            self.eval_dataset = None
+            if eval_data_path:
+                self.logger.warning(f"验证数据路径不存在: {eval_data_path}")
+            else:
+                self.logger.info("未配置验证数据集，跳过验证")
+
+            self.logger.info(f"训练数据集大小: {len(self.train_dataset):,}")
         
         # 数据加载器
         if get_world_size() > 1:
@@ -224,14 +240,27 @@ class PretrainTrainer:
             skip_batches=self.global_step // self.config['gradient_accumulation_steps']
         )
         
-        self.train_loader = DatasetFactory.create_dataloader(
-            self.train_dataset,
+        self.train_loader = DataLoader(
+            dataset=self.train_dataset,
             batch_size=self.config['batch_size'],
             sampler=self.train_sampler,
             num_workers=4,
-            pin_memory=True,
-            drop_last=True
+            pin_memory=self.config['pin_memory'],
+            drop_last=self.config['drop_last']
         )
+
+        # 如果有验证集，创建验证loader
+        if self.eval_dataset is not None:
+            self.eval_loader = DataLoader(
+                self.eval_dataset,
+                batch_size=self.config['batch_size'],
+                shuffle=False,
+                num_workers=4,
+                pin_memory=self.config['pin_memory'],
+                drop_last=self.config['drop_last']
+            )
+        else:
+            self.eval_loader = None
     
     def _resume_training(self):
         """恢复训练状态"""
@@ -279,7 +308,12 @@ class PretrainTrainer:
         else:
             pbar = None
         
-        for batch_idx, (X, Y, loss_mask) in enumerate(self.train_loader):
+        for batch_idx, batch in enumerate(self.train_loader):
+            # 从字典获取数据
+            X = batch['input_ids']
+            Y = batch['labels']
+            loss_mask = batch['loss_mask']
+
             # 移动到设备
             X = X.to(self.device, non_blocking=True)
             Y = Y.to(self.device, non_blocking=True)
