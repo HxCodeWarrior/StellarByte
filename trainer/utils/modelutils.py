@@ -110,6 +110,342 @@ def init_model_and_tokenizer(lm_config, tokenizer_path: str, model_class, from_w
     return model, tokenizer
 
 ###############################################################################
+# Validation Functions
+###############################################################################
+"""\
+通用验证和评估工具函数
+"""
+
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Tuple, Callable, Any
+import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
+import time
+
+
+def validate_model(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    criterion: Optional[Callable] = None,
+    metrics: Optional[Dict[str, Callable]] = None,
+    num_batches: Optional[int] = None,
+    desc: str = "Validating",
+    disable_progress: bool = False,
+    use_amp: bool = False,
+    distributed: bool = False
+) -> Dict[str, float]:
+    """通用模型验证函数
+    
+    Args:
+        model: 要验证的模型
+        dataloader: 验证数据加载器
+        device: 设备
+        criterion: 损失函数，如果为None则只计算指标
+        metrics: 额外指标函数字典 {name: function}
+        num_batches: 最大批次数，如果为None则使用整个验证集
+        desc: 进度条描述
+        disable_progress: 是否禁用进度条
+        use_amp: 是否使用自动混合精度
+        distributed: 是否在分布式训练中
+    
+    Returns:
+        包含所有指标结果的字典
+    """
+    model.eval()
+    
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+    
+    if metrics is None:
+        metrics = {}
+    
+    total_loss = 0.0
+    batch_count = 0
+    results = defaultdict(float)
+    
+    # 初始化所有指标
+    for metric_name in metrics.keys():
+        results[metric_name] = 0.0
+    
+    with torch.no_grad():
+        # 创建进度条
+        pbar = tqdm(
+            dataloader, 
+            desc=desc, 
+            disable=disable_progress or not disable_progress and distributed and torch.distributed.get_rank() != 0
+        )
+        
+        for batch_idx, batch in enumerate(pbar):
+            if num_batches is not None and batch_idx >= num_batches:
+                break
+            
+            # 处理不同类型的batch格式
+            if isinstance(batch, dict):
+                inputs = batch.get('input_ids')
+                labels = batch.get('labels')
+                
+                # 对于语言模型，通常input_ids和labels相同但错位
+                if labels is None and 'input_ids' in batch:
+                    labels = batch['input_ids'].clone()
+                    if inputs is not None:
+                        labels = labels[:, 1:].contiguous()
+                        inputs = inputs[:, :-1].contiguous()
+            elif isinstance(batch, (list, tuple)):
+                inputs, labels = batch[0], batch[1]
+            else:
+                raise ValueError(f"Unsupported batch type: {type(batch)}")
+            
+            # 移动到设备
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            # 前向传播
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    outputs = model(inputs) if labels is None else model(inputs, labels=labels)
+            else:
+                outputs = model(inputs) if labels is None else model(inputs, labels=labels)
+            
+            # 计算损失
+            if criterion is not None and labels is not None:
+                # 首先尝试从模型输出中获取损失
+                if hasattr(outputs, 'loss') and outputs.loss is not None:
+                    loss = outputs.loss
+                else:
+                    # 如果没有现成的损失，自己计算
+                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+                    if logits is not None:
+                        # 正确展平logits和labels
+                        loss = criterion(
+                            logits.reshape(-1, logits.size(-1)),  # [batch_size * seq_len, vocab_size]
+                            labels.reshape(-1)                     # [batch_size * seq_len]
+                        )
+                    else:
+                        loss = torch.tensor(0.0, device=device)
+                
+                total_loss += loss.item()
+            
+            # 计算额外指标
+            for metric_name, metric_fn in metrics.items():
+                try:
+                    metric_value = metric_fn(outputs, labels)
+                    results[metric_name] += metric_value
+                except Exception as e:
+                    print(f"计算指标 {metric_name} 时出错: {e}")
+                    continue
+            
+            batch_count += 1
+            
+            # 更新进度条
+            if criterion is not None and labels is not None and batch_count > 0:
+                current_loss = total_loss / batch_count
+                pbar.set_postfix({'loss': f'{current_loss:.4f}'})
+    
+    # 计算平均值
+    if batch_count > 0:
+        if criterion is not None and labels is not None:
+            results['loss'] = total_loss / batch_count
+        
+        for metric_name in metrics.keys():
+            results[metric_name] /= batch_count
+    
+    # 如果是分布式训练，同步所有进程的结果
+    if distributed and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        
+        # 创建所有结果的张量
+        keys = list(results.keys())
+        local_results = torch.tensor([results[k] for k in keys], device=device, dtype=torch.float32)
+        global_results = torch.zeros_like(local_results)
+        
+        # 同步所有进程
+        torch.distributed.all_reduce(local_results, op=torch.distributed.ReduceOp.SUM)
+        global_results = local_results / world_size
+        
+        # 更新结果字典
+        for i, key in enumerate(keys):
+            results[key] = global_results[i].item()
+    
+    model.train()
+    return dict(results)
+
+
+def calculate_perplexity(loss: float) -> float:
+    """根据损失计算困惑度
+    
+    Args:
+        loss: 交叉熵损失值
+    
+    Returns:
+        困惑度
+    """
+    return np.exp(loss)
+
+
+def calculate_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    """计算分类准确率
+    
+    Args:
+        logits: 模型输出logits [batch_size, seq_len, vocab_size]
+        labels: 真实标签 [batch_size, seq_len]
+    
+    Returns:
+        准确率 (0-1)
+    """
+    predictions = logits.argmax(dim=-1)
+    correct = (predictions == labels).float()
+    
+    # 忽略padding token (id为-100)
+    mask = labels != -100
+    if mask.any():
+        correct = correct[mask]
+        return correct.mean().item()
+    return correct.mean().item()
+
+
+def calculate_token_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_tokens: List[int] = None) -> Dict[str, float]:
+    """计算token级别的准确率（忽略特定token）
+    
+    Args:
+        logits: 模型输出logits
+        labels: 真实标签
+        ignore_tokens: 要忽略的token ID列表
+    
+    Returns:
+        包含准确率和详细统计的字典
+    """
+    if ignore_tokens is None:
+        ignore_tokens = [-100]  # 默认忽略padding token
+    
+    predictions = logits.argmax(dim=-1)
+    mask = torch.ones_like(labels, dtype=torch.bool)
+    
+    for token_id in ignore_tokens:
+        mask = mask & (labels != token_id)
+    
+    if mask.any():
+        correct = (predictions[mask] == labels[mask]).float()
+        accuracy = correct.mean().item()
+        total_tokens = mask.sum().item()
+        correct_tokens = correct.sum().item()
+    else:
+        accuracy = 0.0
+        total_tokens = 0
+        correct_tokens = 0
+    
+    return {
+        'accuracy': accuracy,
+        'total_tokens': total_tokens,
+        'correct_tokens': correct_tokens
+    }
+
+
+def validate_with_gradient_accumulation(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    gradient_accumulation_steps: int = 1,
+    **kwargs
+) -> Dict[str, float]:
+    """使用梯度累积进行验证（适用于内存不足的情况）
+    
+    Args:
+        model: 要验证的模型
+        dataloader: 验证数据加载器
+        device: 设备
+        gradient_accumulation_steps: 梯度累积步数
+        **kwargs: 传递给validate_model的其他参数
+    
+    Returns:
+        验证结果
+    """
+    original_batch_size = dataloader.batch_size
+    effective_batch_size = original_batch_size * gradient_accumulation_steps
+    
+    # 这里简化处理，实际使用时可能需要更复杂的逻辑
+    return validate_model(model, dataloader, device, **kwargs)
+
+
+def get_validation_summary(results: Dict[str, float], epoch: int = None, step: int = None) -> str:
+    """生成验证结果摘要字符串
+    
+    Args:
+        results: 验证结果字典
+        epoch: 当前epoch（可选）
+        step: 当前训练步数（可选）
+    
+    Returns:
+        格式化的摘要字符串
+    """
+    summary_parts = []
+    
+    if epoch is not None:
+        summary_parts.append(f"Epoch {epoch}")
+    if step is not None:
+        summary_parts.append(f"Step {step}")
+    
+    summary_parts.append("Validation Results:")
+    
+    for metric_name, value in results.items():
+        if isinstance(value, float):
+            summary_parts.append(f"  {metric_name}: {value:.6f}")
+        else:
+            summary_parts.append(f"  {metric_name}: {value}")
+    
+    return "\n".join(summary_parts)
+
+
+def create_validation_metrics_for_lm(
+    tokenizer = None,
+    ignore_token_ids: List[int] = None
+) -> Dict[str, Callable]:
+    """为语言模型创建标准验证指标集合
+    
+    Args:
+        tokenizer: 分词器（用于解码示例）
+        ignore_token_ids: 要忽略的token ID列表
+    
+    Returns:
+        指标函数字典
+    """
+    if ignore_token_ids is None:
+        ignore_token_ids = [-100]
+    
+    def perplexity_metric(outputs, labels):
+        """计算困惑度指标"""
+        if isinstance(outputs, dict) and 'loss' in outputs:
+            loss = outputs['loss'].item()
+        else:
+            # 如果没有损失，使用交叉熵计算
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            criterion = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1)).item()
+        
+        return calculate_perplexity(loss)
+    
+    def accuracy_metric(outputs, labels):
+        """计算准确率指标"""
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+        return calculate_accuracy(logits, labels)
+    
+    def token_accuracy_metric(outputs, labels):
+        """计算token准确率（忽略特定token）"""
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+        token_acc = calculate_token_accuracy(logits, labels, ignore_token_ids)
+        return token_acc['accuracy']
+    
+    metrics = {
+        'perplexity': perplexity_metric,
+        'accuracy': accuracy_metric,
+        'token_accuracy': token_accuracy_metric,
+    }
+    
+    return metrics
+    
+###############################################################################
 # Init Swanlab
 ###############################################################################
 """

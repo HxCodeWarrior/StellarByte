@@ -63,6 +63,29 @@ class CheckpointManager:
         os.replace(tmp_resume, resume_path)
         if self.logger and hasattr(self.logger, 'info'):
             self.logger.info(f"Saved checkpoint to {resume_path}")
+    
+    def save_best_model(self, prefix: str, lm_config, model: torch.nn.Module):
+        """保存当前最佳模型权重（仅模型参数，不包含优化器状态）。
+
+        Args:
+            prefix: 权重前缀，例如 'pretrain' 或 'sft'
+            lm_config: 模型配置对象（需包含 hidden_size、use_moe）
+            model: 要保存的模型（可能被 DDP 包装）
+        """
+        moe_suffix = '_moe' if lm_config.use_moe else ''
+        best_path = os.path.join(self.save_dir, f"{prefix}_{lm_config.hidden_size}{moe_suffix}_best.pth")
+        
+        # 获取 state_dict（若为 DDP，则取 module）
+        from torch.nn.parallel import DistributedDataParallel
+        state_dict = model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict()
+        
+        # 半精度存储节省空间
+        tmp_best = best_path + '.tmp'
+        torch.save({k: v.half() if isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in state_dict.items()}, tmp_best)
+        os.replace(tmp_best, best_path)
+        
+        if self.logger and hasattr(self.logger, 'info'):
+            self.logger.info(f"Saved best model to {best_path}")
 
     def load(self, prefix: str, lm_config, device: str = 'cpu') -> Optional[dict]:
         """加载检查点（resume 版本）并返回内容。

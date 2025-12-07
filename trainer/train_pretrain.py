@@ -30,7 +30,16 @@ from contextlib import nullcontext
 from model.config import StellarByteConfig
 from model.StellarByteLm import StellarByteForCausalLM
 from trainer.datasets import DatasetConfig, PretrainDataset
-from trainer.utils.modelutils import build_optimizer, build_scheduler, init_model_and_tokenizer, init_swanlab, count_parameters
+from trainer.utils.modelutils import (
+    build_optimizer, 
+    build_scheduler, 
+    init_model_and_tokenizer, 
+    init_swanlab, 
+    count_parameters,
+    validate_model, 
+    create_validation_metrics_for_lm,
+    get_validation_summary
+)
 from trainer.utils.checkpoint import CheckpointManager
 from trainer.utils.logger import Logger, is_main_process
 from trainer.utils.distributed import init_distributed_mode, get_rank, get_world_size, broadcast_object
@@ -97,6 +106,8 @@ class PretrainTrainer:
 
             if self.swanlab is None and self.config['use_swanlab']:
                 print("警告: SwanLab初始化失败，将继续训练但不记录指标")
+    
+        self.best_val_loss = float('inf') 
     
     def _init_model_and_tokenizer(self):
         """初始化模型和分词器"""
@@ -242,11 +253,9 @@ class PretrainTrainer:
         
         self.train_loader = DataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config['batch_size'],
-            sampler=self.train_sampler,
+            batch_sampler=self.train_sampler,
             num_workers=4,
-            pin_memory=self.config['pin_memory'],
-            drop_last=self.config['drop_last']
+            pin_memory=self.config['pin_memory']
         )
 
         # 如果有验证集，创建验证loader
@@ -293,7 +302,76 @@ class PretrainTrainer:
             self.logger.info(f"恢复训练成功: epoch={self.current_epoch}, step={self.global_step}")
         else:
             self.logger.info("未找到检查点，从头开始训练")
-    
+
+    def validate(self, epoch: int = None, step: int = None) -> Dict[str, float]:
+         """执行验证
+         
+         Args:
+             epoch: 当前epoch
+             step: 当前训练步数
+         
+         Returns:
+             验证指标字典
+         """
+         if self.eval_loader is None:
+             self.logger.info("未配置验证数据集，跳过验证")
+             return {}
+         
+         self.logger.info(f"开始验证 (epoch={epoch}, step={step})...")
+         start_time = time.time()
+         
+         # 创建语言模型专用指标
+         metrics = create_validation_metrics_for_lm(
+             tokenizer=self.tokenizer,
+             ignore_token_ids=[self.tokenizer.pad_token_id]
+         )
+         
+         # 执行验证
+         val_results = validate_model(
+             model=self.model,
+             dataloader=self.eval_loader,
+             device=self.device,
+             criterion=nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id),
+             metrics=metrics,
+             num_batches=self.config['batch_size'],
+             desc=f"验证 Epoch {epoch}" if epoch else "验证",
+             disable_progress=not is_main_process(),
+             use_amp=self.dtype != torch.float32,
+             distributed=get_world_size() > 1
+         )
+         
+         # 记录验证时间
+         val_time = time.time() - start_time
+         
+         # 生成并记录摘要
+         summary = get_validation_summary(val_results, epoch, step)
+         self.logger.info(f"验证完成，耗时 {val_time:.2f}s")
+         self.logger.info(summary)
+         
+         # 记录到SwanLab
+         if self.use_swanlab and self.swanlab and is_main_process():
+             for metric_name, value in val_results.items():
+                 self.swanlab.log({
+                     f"validation/{metric_name}": value,
+                     "validation/epoch": epoch if epoch is not None else self.current_epoch,
+                     "validation/step": step if step is not None else self.global_step
+                 })
+         
+         # 更新最佳验证损失
+         if 'loss' in val_results and val_results['loss'] < self.best_val_loss:
+             self.best_val_loss = val_results['loss']
+             self.logger.info(f"新的最佳验证损失: {self.best_val_loss:.6f}")
+             
+             # 保存最佳模型
+             if is_main_process():
+                 self.checkpoint_manager.save_best_model(
+                     prefix="pretrain",
+                     lm_config=self.model.module.config if hasattr(self.model, 'module') else self.model.config,
+                     model=self.model
+                 )
+         
+         return val_results
+
     def train_epoch(self):
         """训练一个epoch"""
         self.model.train()
@@ -384,7 +462,12 @@ class PretrainTrainer:
                 # 保存检查点
                 if self.global_step % self.config['save_steps'] == 0 and get_rank() == 0:
                     self._save_checkpoint()
-            
+                
+                # 每隔eval_steps添加验证
+                if self.eval_dataset is not None and self.global_step % self.config['eval_steps'] == 0:
+                    # 执行验证
+                    self.validate(epoch=self.current_epoch, step=self.global_step)
+                    
             # 统计信息
             total_loss += loss.item() * self.config['gradient_accumulation_steps']
             total_tokens += X.numel()
